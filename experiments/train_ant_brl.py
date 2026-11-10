@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import replace
 import json
 from pathlib import Path
 import random
 import sys
 import time
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 import warnings
 
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="gymnasium.*")
@@ -128,6 +129,55 @@ def evaluate_benchmark_suite(
     return results
 
 
+def count_agent_parameters(
+    agent: LatentActionMCTSAgent,
+    tweaker: StochasticTweakerActorCritic,
+    balancer: DDPGBalancer,
+) -> int:
+    """Counts total trainable parameters across Agent, Tweaker, and Balancer."""
+    modules = [
+        agent.backbone,
+        agent.actor_head,
+        agent.critic_head,
+        agent.rep_trainer,
+        tweaker,
+        balancer,
+    ]
+    return int(
+        sum(
+            p.numel()
+            for m in modules
+            for p in m.parameters()
+            if p.requires_grad
+        )
+    )
+
+
+def compute_composite_benchmark_score(
+    bench_results: Dict[str, Dict[str, float]],
+    objective_mode: str = "mixed",
+) -> float:
+    """Computes scalar benchmark score from evaluate_benchmark_suite output.
+
+    Args:
+        bench_results: Mapping from creature suite name to metrics dict.
+        objective_mode: 'mixed' (0.5 * Standard-Ant-v4 + 0.5 * mean OOD),
+                        'standard' (Standard-Ant-v4 only), or 'ood' (mean OOD only).
+    """
+    std_ret = float(bench_results.get("Standard-Ant-v4", {}).get("return", 0.0))
+    ood_keys = [k for k in bench_results.keys() if k != "Standard-Ant-v4"]
+    ood_ret = (
+        float(np.mean([bench_results[k]["return"] for k in ood_keys]))
+        if ood_keys
+        else std_ret
+    )
+    if objective_mode == "standard":
+        return std_ret
+    if objective_mode == "ood":
+        return ood_ret
+    return 0.5 * std_ret + 0.5 * ood_ret
+
+
 def run_single_seed(
     seed: int,
     cfg: SystemConfig,
@@ -138,10 +188,30 @@ def run_single_seed(
     seed_idx: int = 0,
     total_seeds: int = 1,
     verbose: bool = True,
+    eval_callback: Optional[
+        Callable[[int, Dict[str, Dict[str, float]], Dict[str, Any]], bool]
+    ] = None,
+    max_gpu_mem_gb: float = 0.0,
 ) -> Dict[str, Any]:
-    """Runs the 3-phase BRL + LA-MCTS training pipeline for a single random seed."""
+    """Runs the 3-phase BRL + LA-MCTS training pipeline for a single random seed.
+
+    If eval_callback is provided, it is invoked after each benchmark evaluation as
+    `should_prune = eval_callback(ep, benchmark_evals[ep], telemetry)` and stops early
+    when it returns True.
+    """
     set_global_seed(seed)
     seed_start_time = time.time()
+
+    use_cuda = str(device).startswith("cuda") and torch.cuda.is_available()
+    if use_cuda:
+        torch.cuda.reset_peak_memory_stats()
+        if cfg.run.gpu_mem_fraction > 0.0:
+            try:
+                torch.cuda.set_per_process_memory_fraction(
+                    min(0.95, float(cfg.run.gpu_mem_fraction))
+                )
+            except Exception:
+                pass
 
     if verbose:
         print("\n" + "=" * 80)
@@ -193,6 +263,7 @@ def run_single_seed(
     agent = LatentActionMCTSAgent(config=sys_cfg.la_mcts, device=device)
     tweaker = StochasticTweakerActorCritic(config=sys_cfg.brl, device=device)
     balancer = DDPGBalancer(config=sys_cfg.brl, device=device)
+    param_count = count_agent_parameters(agent, tweaker, balancer)
 
     orchestrator = BRLTrainingOrchestrator(
         env=env,
@@ -202,8 +273,17 @@ def run_single_seed(
         config=sys_cfg,
     )
 
+    train_every = (
+        int(sys_cfg.la_mcts.train_every_steps)
+        if int(sys_cfg.la_mcts.train_every_steps) > 0
+        else max(1, max_steps // 2)
+    )
+
     episode_logs: List[Dict[str, Any]] = []
     benchmark_evals: Dict[int, Dict[str, Dict[str, float]]] = {}
+    total_env_steps = 0
+    pruned = False
+    mem_exceeded = False
 
     for ep in range(1, episodes + 1):
         ep_start_time = time.time()
@@ -224,16 +304,24 @@ def run_single_seed(
         summary = orchestrator.run_episode(
             episode_idx=ep,
             max_steps=max_steps,
-            train_agent_every=max(1, max_steps // 2),
+            train_agent_every=train_every,
             step_callback=step_callback if verbose else None,
         )
         episode_logs.append(summary)
+        total_env_steps += int(summary.get("steps", 0))
 
         ep_duration = time.time() - ep_start_time
         seed_elapsed = time.time() - seed_start_time
         avg_ep_duration = seed_elapsed / ep
         remaining_eps = episodes - ep
         seed_eta = remaining_eps * avg_ep_duration
+
+        if use_cuda and max_gpu_mem_gb > 0.0:
+            peak_gb = torch.cuda.max_memory_allocated() / (1024.0**3)
+            if peak_gb > max_gpu_mem_gb:
+                mem_exceeded = True
+                pruned = True
+                break
 
         if verbose:
             win_tag = "WIN " if summary["win_indicator"] else "LOSS"
@@ -264,9 +352,36 @@ def run_single_seed(
             if verbose:
                 print(f"  " + "-" * 50, flush=True)
 
+            if eval_callback is not None:
+                elapsed_now = max(1e-6, time.time() - seed_start_time)
+                peak_mb_now = (
+                    float(torch.cuda.max_memory_allocated() / (1024.0**2))
+                    if use_cuda
+                    else 0.0
+                )
+                telemetry = {
+                    "episode": ep,
+                    "total_env_steps": total_env_steps,
+                    "elapsed_sec": elapsed_now,
+                    "sec_per_step": elapsed_now / max(1, total_env_steps),
+                    "param_count": param_count,
+                    "peak_gpu_mem_mb": peak_mb_now,
+                    "ema_win_rate": orchestrator.win_evaluator.ema_win_rate,
+                }
+                if eval_callback(ep, benchmark_evals[ep], telemetry):
+                    pruned = True
+                    break
+
     env.close()
+    total_wall_sec = max(1e-6, time.time() - seed_start_time)
+    peak_gpu_mem_mb = (
+        float(torch.cuda.max_memory_allocated() / (1024.0**2))
+        if use_cuda
+        else 0.0
+    )
+
     if verbose:
-        total_seed_dur = format_time_duration(time.time() - seed_start_time)
+        total_seed_dur = format_time_duration(total_wall_sec)
         print(
             f"\n>>> Seed {seed_idx + 1}/{total_seeds} (Seed {seed}) finished in {total_seed_dur}! "
             f"Final EMA Win Rate: {orchestrator.win_evaluator.ema_win_rate:.1%}\n",
@@ -278,7 +393,24 @@ def run_single_seed(
         "episodes": episode_logs,
         "benchmarks": benchmark_evals,
         "final_ema_win_rate": orchestrator.win_evaluator.ema_win_rate,
+        "param_count": param_count,
+        "peak_gpu_mem_mb": peak_gpu_mem_mb,
+        "total_env_steps": total_env_steps,
+        "total_wall_sec": total_wall_sec,
+        "sec_per_step": total_wall_sec / max(1, total_env_steps),
+        "pruned": pruned,
+        "mem_exceeded": mem_exceeded,
     }
+
+
+def _parallel_seed_worker(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Top-level helper for ProcessPoolExecutor parallel seed execution."""
+    import os
+
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    torch.set_num_threads(1)
+    return run_single_seed(**kwargs)
 
 
 def main(argv: List[str] | None = None) -> Dict[str, Any]:
@@ -294,8 +426,8 @@ def main(argv: List[str] | None = None) -> Dict[str, Any]:
     parser.add_argument(
         "--seeds",
         type=int,
-        default=3,
-        help="Number of random seeds to run.",
+        default=None,
+        help="Number of random seeds to run (defaults to config run.seeds or 3).",
     )
     parser.add_argument(
         "--episodes",
@@ -318,8 +450,14 @@ def main(argv: List[str] | None = None) -> Dict[str, Any]:
     parser.add_argument(
         "--device",
         type=str,
-        default="cpu",
-        help="Compute device (cpu or cuda).",
+        default=None,
+        help="Compute device (cpu or cuda; defaults to config run.device).",
+    )
+    parser.add_argument(
+        "--parallel-seeds",
+        type=int,
+        default=None,
+        help="Number of seeds to execute concurrently (defaults to config run.parallel_seeds).",
     )
     parser.add_argument(
         "--output-dir",
@@ -336,21 +474,48 @@ def main(argv: List[str] | None = None) -> Dict[str, Any]:
             la_mcts=replace(cfg.la_mcts, n_sim=args.n_sim, n_sim_eval=args.n_sim),
         )
 
+    num_seeds = (
+        args.seeds
+        if args.seeds is not None
+        else (cfg.run.seeds if cfg.run.seeds > 0 else 3)
+    )
+    seed_offset = cfg.run.seed_offset if cfg.run.seed_offset > 0 else 42
     num_episodes = (
-        args.episodes if args.episodes is not None else cfg.brl.total_episodes
+        args.episodes
+        if args.episodes is not None
+        else (
+            cfg.run.episodes
+            if cfg.run.episodes > 0
+            else cfg.brl.total_episodes
+        )
     )
     max_steps = (
         args.max_steps
         if args.max_steps is not None
-        else cfg.ant_morph.max_episode_steps
+        else (
+            cfg.run.max_steps
+            if cfg.run.max_steps > 0
+            else cfg.ant_morph.max_episode_steps
+        )
     )
-    eval_interval = max(1, min(10, num_episodes))
+    device = args.device if args.device is not None else (cfg.run.device or "cpu")
+    parallel_seeds = (
+        args.parallel_seeds
+        if args.parallel_seeds is not None
+        else max(1, int(cfg.run.parallel_seeds))
+    )
+    eval_interval = (
+        cfg.run.eval_interval
+        if cfg.run.eval_interval > 0 and args.episodes is None
+        else max(1, min(10, num_episodes))
+    )
 
     global_start_time = time.time()
     print("=" * 80)
     print("  LA-MCTS + BRL Training Pipeline")
-    print(f"  Device        : {args.device}")
-    print(f"  Seeds         : {args.seeds} (42 .. {42 + args.seeds - 1})")
+    print(f"  Config        : {args.config}")
+    print(f"  Device        : {device}")
+    print(f"  Seeds         : {num_seeds} ({seed_offset} .. {seed_offset + num_seeds - 1}) [parallel={parallel_seeds}]")
     print(f"  Episodes/Seed : {num_episodes}")
     print(f"  Max Steps/Ep  : {max_steps}")
     print(f"  MCTS Sims/Step: {cfg.la_mcts.n_sim}")
@@ -358,21 +523,47 @@ def main(argv: List[str] | None = None) -> Dict[str, Any]:
     print(f"  Output Dir    : {args.output_dir}")
     print("=" * 80, flush=True)
 
-    all_seed_results = []
-    for s_idx in range(args.seeds):
-        seed_val = 42 + s_idx
-        res = run_single_seed(
-            seed=seed_val,
-            cfg=cfg,
-            episodes=num_episodes,
-            max_steps=max_steps,
-            eval_interval=eval_interval,
-            device=args.device,
-            seed_idx=s_idx,
-            total_seeds=args.seeds,
-            verbose=True,
-        )
-        all_seed_results.append(res)
+    all_seed_results: List[Dict[str, Any]] = []
+    if parallel_seeds <= 1 or num_seeds <= 1:
+        for s_idx in range(num_seeds):
+            seed_val = seed_offset + s_idx
+            res = run_single_seed(
+                seed=seed_val,
+                cfg=cfg,
+                episodes=num_episodes,
+                max_steps=max_steps,
+                eval_interval=eval_interval,
+                device=device,
+                seed_idx=s_idx,
+                total_seeds=num_seeds,
+                verbose=True,
+            )
+            all_seed_results.append(res)
+    else:
+        worker_jobs = [
+            {
+                "seed": seed_offset + s_idx,
+                "cfg": cfg,
+                "episodes": num_episodes,
+                "max_steps": max_steps,
+                "eval_interval": eval_interval,
+                "device": device,
+                "seed_idx": s_idx,
+                "total_seeds": num_seeds,
+                "verbose": (s_idx == 0),
+            }
+            for s_idx in range(num_seeds)
+        ]
+        results_by_idx: Dict[int, Dict[str, Any]] = {}
+        with ProcessPoolExecutor(max_workers=min(parallel_seeds, num_seeds)) as pool:
+            fut_to_idx = {
+                pool.submit(_parallel_seed_worker, job): job["seed_idx"]
+                for job in worker_jobs
+            }
+            for fut in as_completed(fut_to_idx):
+                idx = fut_to_idx[fut]
+                results_by_idx[idx] = fut.result()
+        all_seed_results = [results_by_idx[i] for i in range(num_seeds)]
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -382,7 +573,7 @@ def main(argv: List[str] | None = None) -> Dict[str, Any]:
 
     total_time_str = format_time_duration(time.time() - global_start_time)
     print("=" * 80)
-    print(f"  All {args.seeds} seeds completed in {total_time_str}!")
+    print(f"  All {num_seeds} seeds completed in {total_time_str}!")
     print(f"  Summary saved to: {summary_path}")
     print("=" * 80, flush=True)
 

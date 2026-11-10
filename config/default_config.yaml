@@ -39,6 +39,9 @@ la_mcts:
   context_dim: 12
   history_len: 8
   reanalyze_ratio: 0.25
+  train_every_steps: 0      # agent update every N env steps (0 = auto: max_steps // 2)
+  reanalyze_every: 2        # Reanalyze every N episodes (0 = off)
+  reanalyze_states: 4       # states refreshed per Reanalyze pass
 
 brl:
   num_params: 12
@@ -78,3 +81,14 @@ ant_morph:
   healthy_z_range: [0.2, 1.0]
   max_action_capacity: 12
   default_num_legs: 4
+
+# Run protocol defaults for experiments/train_ant_brl.py (CLI flags override; 0 = automatic)
+run:
+  seeds: 3
+  seed_offset: 42
+  episodes: 0          # 0 = brl.total_episodes
+  max_steps: 0         # 0 = ant_morph.max_episode_steps
+  device: "cpu"
+  eval_interval: 0     # 0 = min(10, episodes)
+  parallel_seeds: 1
+  gpu_mem_fraction: 0.0

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
+import warnings
 import yaml
 
 
@@ -52,6 +53,11 @@ class LAMCTSConfig:
     context_dim: int = 12
     history_len: int = 8
     reanalyze_ratio: float = 0.25
+    # Agent gradient update every N env steps (0 = auto: max_steps // 2, the original behaviour)
+    train_every_steps: int = 0
+    # MuZero Reanalyze every N episodes (0 = disabled) and number of states per Reanalyze pass
+    reanalyze_every: int = 2
+    reanalyze_states: int = 4
 
 
 @dataclass
@@ -102,12 +108,76 @@ class AntMorphConfig:
 
 
 @dataclass
+class RunConfig:
+    """Run protocol defaults for experiments/train_ant_brl.py (CLI flags override these).
+
+    A value of 0 means "derive automatically" (see train_ant_brl.main).
+    """
+
+    seeds: int = 3
+    seed_offset: int = 42
+    episodes: int = 0  # 0 = brl.total_episodes
+    max_steps: int = 0  # 0 = ant_morph.max_episode_steps
+    device: str = "cpu"
+    eval_interval: int = 0  # 0 = min(10, episodes)
+    parallel_seeds: int = 1
+    gpu_mem_fraction: float = 0.0  # per-process CUDA memory cap (0 = no cap)
+
+
+@dataclass
 class SystemConfig:
     """Aggregated system configuration."""
 
     la_mcts: LAMCTSConfig = field(default_factory=LAMCTSConfig)
     brl: BRLConfig = field(default_factory=BRLConfig)
     ant_morph: AntMorphConfig = field(default_factory=AntMorphConfig)
+    run: RunConfig = field(default_factory=RunConfig)
+
+
+def _filter_known(cls: type, raw: Dict[str, Any], section: str) -> Dict[str, Any]:
+    """Drops (with a warning) keys that the dataclass does not define."""
+    known = {f.name for f in fields(cls)}
+    unknown = sorted(set(raw) - known)
+    if unknown:
+        warnings.warn(f"Ignoring unknown config keys in [{section}]: {unknown}")
+    return {k: v for k, v in raw.items() if k in known}
+
+
+def config_from_dict(raw: Dict[str, Any]) -> SystemConfig:
+    """Builds a SystemConfig from a (YAML-style) nested dictionary."""
+    la_raw = _filter_known(LAMCTSConfig, dict(raw.get("la_mcts", {}) or {}), "la_mcts")
+    if "log_std_bounds" in la_raw:
+        la_raw["log_std_bounds"] = tuple(la_raw["log_std_bounds"])
+
+    brl_raw = _filter_known(BRLConfig, dict(raw.get("brl", {}) or {}), "brl")
+
+    ant_raw = _filter_known(AntMorphConfig, dict(raw.get("ant_morph", {}) or {}), "ant_morph")
+    if "healthy_z_range" in ant_raw:
+        ant_raw["healthy_z_range"] = tuple(ant_raw["healthy_z_range"])
+
+    run_raw = _filter_known(RunConfig, dict(raw.get("run", {}) or {}), "run")
+
+    return SystemConfig(
+        la_mcts=LAMCTSConfig(**la_raw),
+        brl=BRLConfig(**brl_raw),
+        ant_morph=AntMorphConfig(**ant_raw),
+        run=RunConfig(**run_raw),
+    )
+
+
+def config_to_dict(cfg: SystemConfig) -> Dict[str, Any]:
+    """Converts a SystemConfig into a plain, YAML-serializable nested dictionary."""
+
+    def _plain(v: Any) -> Any:
+        if isinstance(v, tuple):
+            return [_plain(x) for x in v]
+        if isinstance(v, dict):
+            return {k: _plain(x) for k, x in v.items()}
+        if hasattr(v, "item"):  # numpy scalars
+            return v.item()
+        return v
+
+    return {k: _plain(v) for k, v in asdict(cfg).items()}
 
 
 def load_config(path: str | Path = "config/default_config.yaml") -> SystemConfig:
@@ -117,19 +187,19 @@ def load_config(path: str | Path = "config/default_config.yaml") -> SystemConfig
         return SystemConfig()
     with cfg_path.open("r", encoding="utf-8") as f:
         raw: Dict[str, Any] = yaml.safe_load(f) or {}
+    return config_from_dict(raw)
 
-    la_raw = dict(raw.get("la_mcts", {}))
-    if "log_std_bounds" in la_raw:
-        la_raw["log_std_bounds"] = tuple(la_raw["log_std_bounds"])
 
-    brl_raw = dict(raw.get("brl", {}))
-
-    ant_raw = dict(raw.get("ant_morph", {}))
-    if "healthy_z_range" in ant_raw:
-        ant_raw["healthy_z_range"] = tuple(ant_raw["healthy_z_range"])
-
-    return SystemConfig(
-        la_mcts=LAMCTSConfig(**la_raw),
-        brl=BRLConfig(**brl_raw),
-        ant_morph=AntMorphConfig(**ant_raw),
-    )
+def save_config(
+    cfg: SystemConfig, path: str | Path, header_comment: Optional[str] = None
+) -> Path:
+    """Writes a SystemConfig to YAML, optionally prefixed by a '#' comment header."""
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    body = yaml.safe_dump(config_to_dict(cfg), sort_keys=False, default_flow_style=None)
+    header = ""
+    if header_comment:
+        header = "".join(f"# {line}".rstrip() + "\n" for line in header_comment.splitlines())
+        header += "\n"
+    out_path.write_text(header + body, encoding="utf-8")
+    return out_path

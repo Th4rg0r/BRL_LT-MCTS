@@ -15,6 +15,9 @@ dependencies = [
     "mujoco>=3.1.0",
     "pyyaml>=6.0",
     "pytest>=8.0.0",
+    "optuna>=4.0.0",
+    "cmaes>=0.10.0",
+    "scipy>=1.11.0",
 ]
 
 [tool.setuptools.packages.find]

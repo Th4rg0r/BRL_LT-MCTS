@@ -126,12 +126,17 @@ class BRLTrainingOrchestrator:
             if terminated or truncated:
                 break
 
-        # Final episode agent update & Reanalyze
+        # Final episode agent update & Reanalyze (frequency/size configurable; 0 = disabled)
         agent_metrics = self.agent.train_step()
-        if hasattr(self.agent, "reanalyze_batch") and (
-            is_consolidation or episode_idx % 2 == 0
+        reanalyze_every = int(getattr(self.cfg.la_mcts, "reanalyze_every", 2))
+        reanalyze_states = int(getattr(self.cfg.la_mcts, "reanalyze_states", 4))
+        if (
+            hasattr(self.agent, "reanalyze_batch")
+            and reanalyze_every > 0
+            and reanalyze_states > 0
+            and (is_consolidation or episode_idx % reanalyze_every == 0)
         ):
-            self.agent.reanalyze_batch(num_states=4)
+            self.agent.reanalyze_batch(num_states=reanalyze_states)
 
         # 5. Evaluate duel outcome via WinEvaluator
         brl_info = last_info.get("brl_metrics", {})
