@@ -1,0 +1,80 @@
+la_mcts:
+  obs_dim: 27
+  max_action_dim: 8
+  k_tok: 8
+  d_model: 256
+  n_heads: 4
+  l_enc: 3
+  latent_dim: 256
+  num_peaks: 5
+  log_std_bounds: [-5.0, 2.0]
+  use_categorical_critic: true
+  support_min: -300
+  support_max: 300
+  num_bins: 601
+  gamma: 0.99
+  td_steps: 5
+  l_dyn: 3
+  proj_dim: 512
+  pred_dim: 256
+  unroll_steps: 5
+  lambda_rep: 4.0
+  beta_mse: 1.0
+  lambda_v: 0.5
+  lambda_r: 1.0
+  lambda_p: 1.0
+  c_reg: 0.0001
+  n_sim: 50
+  n_sim_eval: 100
+  k_act: 16
+  c_1: 1.25
+  c_2: 19652.0
+  root_tau_beta: 1.25
+  inner_tau_beta: 1.0
+  tau_act_train: 1.0
+  tau_act_eval: 0.05
+  lr: 0.0003
+  batch_size: 64
+  buffer_capacity: 50000
+  context_dim: 12
+  history_len: 8
+  reanalyze_ratio: 0.25
+
+brl:
+  num_params: 12
+  param_max: 1000.0
+  budget_max: 12000.0
+  cost_min: 0.1
+  cost_max: 10.0
+  target_win_rate: 0.50
+  ema_beta_w: 0.05
+  tau_s: 500.0
+  initial_r_ref: 1000.0
+  benchmark_r_ref: 6169.54
+  window_k_w: 20
+  alpha_eq: 10.0
+  alpha_inst: 2.0
+  alpha_prog: 5.0
+  sigma_zpd: 0.15
+  lambda_entropy: 0.5
+  balancer_lr: 0.0001
+  balancer_tau: 0.005
+  balancer_noise_std: 0.05
+  tweaker_lr: 0.0003
+  beta_score: 1.0
+  eta_viol: 2.0
+  beta_ent: 0.01
+  warmup_episodes: 50
+  brl_episodes: 2500
+  total_episodes: 3000
+  warmup_limit: 50.0
+  warmup_budget: 100.0
+
+ant_morph:
+  env_id: "Ant-v4"
+  use_contact_forces: false
+  max_episode_steps: 1000
+  xml_rebuild_threshold: 1.0
+  healthy_z_range: [0.2, 1.0]
+  max_action_capacity: 12
+  default_num_legs: 4

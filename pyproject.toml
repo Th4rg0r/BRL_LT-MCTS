@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rl_ant"
+version = "0.1.0"
+description = "Latent-Action MCTS and Balanced Reinforcement Learning for Continuous Control Systems"
+readme = "task.md"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.2.0",
+    "numpy>=1.26.0",
+    "gymnasium[mujoco]>=1.0.0",
+    "mujoco>=3.1.0",
+    "pyyaml>=6.0",
+    "pytest>=8.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["config*", "la_mcts*", "brl_core*", "ant_morph_env*", "experiments*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
