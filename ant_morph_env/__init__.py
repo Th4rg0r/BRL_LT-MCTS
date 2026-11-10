@@ -1,4 +1,4 @@
-"""Morphological Ant-v4 MuJoCo Environment Package for BRL."""
+"""Morphological Ant MuJoCo Environment Package for BRL (Ant-v5)."""
 
 from ant_morph_env.xml_gen import ProceduralAntXMLGenerator
 from ant_morph_env.wrapper import MorphologicalAntBRLWrapper

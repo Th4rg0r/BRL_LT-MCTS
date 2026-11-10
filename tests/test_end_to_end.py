@@ -104,7 +104,7 @@ def test_gate4_end_to_end_multi_seed_pipeline(tmp_path) -> None:
         ema_w = seed_res["final_ema_win_rate"]
         assert 0.40 <= ema_w <= 0.60, f"Balancer EMA win rate {ema_w} drifted out of bounds"
         final_bench = seed_res["benchmarks"][4]
-        assert "Standard-Ant-v4" in final_bench
+        assert ("Standard-Ant-v5" in final_bench or "Standard-Ant-v4" in final_bench)
         assert "Tripod-Ant" in final_bench
         assert "Spider-Ant" in final_bench
         assert "Heavy-Ice-Ant" in final_bench

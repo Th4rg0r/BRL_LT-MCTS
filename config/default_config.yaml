@@ -74,7 +74,7 @@ brl:
   warmup_budget: 100.0
 
 ant_morph:
-  env_id: "Ant-v4"
+  env_id: "Ant-v5"
   use_contact_forces: false
   max_episode_steps: 1000
   xml_rebuild_threshold: 1.0

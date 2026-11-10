@@ -96,9 +96,9 @@ class BRLConfig:
 
 @dataclass
 class AntMorphConfig:
-    """Configuration for Morphological Ant-v4 Environment."""
+    """Configuration for Morphological Ant Environment (Ant-v5)."""
 
-    env_id: str = "Ant-v4"
+    env_id: str = "Ant-v5"
     use_contact_forces: bool = False
     max_episode_steps: int = 1000
     xml_rebuild_threshold: float = 1.0

@@ -135,6 +135,7 @@ def test_hpo_config_roundtrip_and_end_to_end_smoke(tmp_path: Path) -> None:
     assert loaded_opt.brl.warmup_episodes == 50
     assert loaded_opt.brl.brl_episodes == 2500
     assert loaded_opt.ant_morph.max_episode_steps == 1000
+    assert loaded_opt.ant_morph.env_id == "Ant-v5"
     assert loaded_opt.la_mcts.train_every_steps >= 5
 
     # Verify --resume reuses completed trials from JournalFileStorage without error

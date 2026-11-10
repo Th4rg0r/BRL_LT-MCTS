@@ -416,7 +416,7 @@ def compute_final_run_protocol(
     """Computes the optimal `RunConfig` for `optimal_config.yaml`.
 
     By default (`final_episodes=3000`, `final_max_steps=1000`), this sets the full
-    Ant-v4 reference benchmark protocol from Section 4.2 of `task.md`:
+    Ant reference benchmark protocol from Section 4.2 of `task.md`:
     3,000 episodes x 1,000 steps = 3,000,000 environment steps per seed
     (30,000,000 steps across 10 seeds). If `final_episodes <= 0`, episodes are
     calibrated automatically from `final_hours`.
@@ -543,7 +543,7 @@ def write_hpo_report(
 
 ## Stage 4 Multi-Seed Finalist Leaderboard
 
-| Rank | Candidate | Robust LCB ($\\mu - 0.5\\sigma$) | Raw Composite ($\\mu \\pm \\sigma$) | Standard-Ant-v4 | OOD Suite Mean | Params | Step Time |
+| Rank | Candidate | Robust LCB ($\\mu - 0.5\\sigma$) | Raw Composite ($\\mu \\pm \\sigma$) | Standard-Ant | OOD Suite Mean | Params | Step Time |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 {lb_rows}
 
@@ -650,7 +650,7 @@ def main(argv: Optional[List[str]] = None) -> Dict[str, Any]:
         type=int,
         default=3000,
         help=(
-            "Episodes per seed in optimal_config.yaml matching the Ant-v4 reference protocol "
+            "Episodes per seed in optimal_config.yaml matching the Ant reference protocol "
             "(default: 3000 -> 3,000,000 steps/seed; pass 0 to auto-scale from --final-hours)."
         ),
     )

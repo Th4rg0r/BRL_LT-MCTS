@@ -1,4 +1,4 @@
-"""Morphological Ant-v4 Gymnasium Wrapper applying the 12D BRL Tweak Vector."""
+"""Morphological Ant Gymnasium Wrapper (Ant-v5) applying the 12D BRL Tweak Vector."""
 
 from __future__ import annotations
 
@@ -14,17 +14,19 @@ from brl_core.interfaces import WinEvaluator
 
 
 class MorphologicalAntBRLWrapper(gym.Wrapper):
-    """Wraps Gymnasium Ant-v4 to apply the 12D physical and morphological tweak vector w_e.
+    """Wraps Gymnasium Ant-v5 (or Ant-v4) to apply the 12D physical and morphological tweak vector w_e.
 
     Supports 3-, 4-, and 6-legged morphologies, recompiles MJCF XML when morphological
     parameters (w_1..w_4 or num_legs) change by > xml_rebuild_threshold, updates runtime
     MuJoCo arrays (body_mass, geom_friction, dof_damping, actuator_gainprm, hfield_data),
     calls mujoco.mj_setConst(model, data), and injects OU wind forces and sensor noise.
+    Produces canonical aligned observations across all creature morphologies.
     """
 
     def __init__(
         self,
         env: Optional[gym.Env] = None,
+        env_id: str = "Ant-v5",
         use_contact_forces: bool = False,
         xml_rebuild_threshold: float = 1.0,
         max_action_capacity: int = 12,
@@ -32,12 +34,21 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         default_num_legs: int = 4,
         healthy_z_range: Tuple[float, float] = (0.2, 1.0),
     ) -> None:
+        self.env_id = env_id
         if env is None:
-            env = gym.make(
-                "Ant-v4",
-                use_contact_forces=use_contact_forces,
-                healthy_z_range=healthy_z_range,
-            )
+            if str(env_id).startswith("Ant-v5"):
+                env = gym.make(
+                    env_id,
+                    include_cfrc_ext_in_observation=use_contact_forces,
+                    contact_cost_weight=(5e-4 if use_contact_forces else 0.0),
+                    healthy_z_range=healthy_z_range,
+                )
+            else:
+                env = gym.make(
+                    env_id,
+                    use_contact_forces=use_contact_forces,
+                    healthy_z_range=healthy_z_range,
+                )
         super().__init__(env)
 
         self.use_contact_forces = use_contact_forces
@@ -46,6 +57,7 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         self.fixed_action_space = bool(fixed_action_space)
         self.default_num_legs = int(default_num_legs)
         self.base_healthy_z_range = healthy_z_range
+        self.canonical_obs_dim = 105 if self.use_contact_forces else 27
 
         self.xml_gen = ProceduralAntXMLGenerator()
         self.win_evaluator = WinEvaluator()
@@ -69,6 +81,13 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         self._ep_energy = 0.0
         self._start_x = 0.0
         self._healthy_steps = 0
+
+        self.observation_space = spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(self.canonical_obs_dim,),
+            dtype=np.float32,
+        )
 
         if self.fixed_action_space:
             self.action_space = spaces.Box(
@@ -124,6 +143,17 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         if hasattr(self.unwrapped, "_healthy_z_range"):
             self.unwrapped._healthy_z_range = (min_z, max_z)
 
+        # Update underlying Gymnasium wrapper hierarchy observation_space so PassiveEnvChecker matches
+        obs_size = (new_model.nq - 2) + new_model.nv
+        if self.use_contact_forces:
+            obs_size += (new_model.nbody - 1) * 6
+        inner_space = spaces.Box(-np.inf, np.inf, shape=(obs_size,), dtype=np.float64)
+        curr = self.env
+        while curr is not None:
+            if hasattr(curr, "observation_space"):
+                curr.observation_space = inner_space
+            curr = getattr(curr, "env", None)
+
         self.last_xml_tweak = tweak.copy()
         self.last_xml_num_legs = num_legs
         self._capture_nominal_physics()
@@ -133,6 +163,47 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
             self.action_space = spaces.Box(
                 low=-1.0, high=1.0, shape=(n_act,), dtype=np.float32
             )
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, shape=(self.canonical_obs_dim,), dtype=np.float32
+        )
+
+    def _get_canonical_obs(self) -> np.ndarray:
+        """Constructs aligned observation vector matching canonical 4-legged Ant slot layout.
+
+        For 4 legs (standard): 5 torso pos + 8 leg angles + 6 torso vel + 8 leg vels = 27 dims.
+        For 3 legs: legs 1..3 fill slots 0..5, missing leg 4 fills slots 6..7 with 0.0.
+        For 6 legs: legs 1..4 fill primary slots; torso velocities remain at slots 13..18.
+        """
+        qpos = self.mj_data.qpos.ravel()
+        qvel = self.mj_data.qvel.ravel()
+
+        torso_pos = qpos[2:7]
+        torso_vel = qvel[0:6]
+
+        leg_angles = np.zeros(8, dtype=np.float32)
+        leg_vels = np.zeros(8, dtype=np.float32)
+
+        n_legs = self.current_num_legs
+        n_copy = min(n_legs, 4)
+        leg_angles[: 2 * n_copy] = qpos[7 : 7 + 2 * n_copy]
+        leg_vels[: 2 * n_copy] = qvel[6 : 6 + 2 * n_copy]
+
+        parts = [torso_pos, leg_angles, torso_vel, leg_vels]
+
+        if self.use_contact_forces:
+            cfrc_raw = np.clip(self.mj_data.cfrc_ext, -1.0, 1.0)
+            torso_cfrc = (
+                cfrc_raw[1].flatten() if len(cfrc_raw) > 1 else np.zeros(6, dtype=np.float32)
+            )
+            legs_cfrc = np.zeros(4 * 3 * 6, dtype=np.float32)
+            for leg_idx in range(n_copy):
+                start_b = 2 + leg_idx * 3
+                end_b = start_b + 3
+                if end_b <= len(cfrc_raw):
+                    legs_cfrc[leg_idx * 18 : (leg_idx + 1) * 18] = cfrc_raw[start_b:end_b].flatten()
+            parts.extend([torso_cfrc, legs_cfrc])
+
+        return np.concatenate(parts).astype(np.float32)
 
     def get_morphology_mask(self) -> np.ndarray:
         """Returns binary action/attention mask in {0, 1}^max_action_capacity."""
@@ -280,7 +351,8 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         self._healthy_steps = 0
         self._start_x = float(self.mj_data.qpos[0])
 
-        obs_noisy = self._add_sensor_noise(obs)
+        canonical_obs = self._get_canonical_obs()
+        obs_noisy = self._add_sensor_noise(canonical_obs)
         morph_mask = self.get_morphology_mask()
         info["morphology_mask"] = morph_mask
         info["tweak_vector"] = self.current_tweak.astype(np.float32)
@@ -323,17 +395,18 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         else:
             self.mj_data.xfrc_applied[torso_id, :3] = 0.0
 
-        obs, reward, terminated, truncated, info = self.env.step(act_env)
+        _, reward, terminated, truncated, info = self.env.step(act_env)
 
+        canonical_obs = self._get_canonical_obs()
         # Guard against non-finite physics states under extreme combined disturbances
-        if not np.all(np.isfinite(obs)) or not math.isfinite(float(reward)):
-            obs = np.nan_to_num(obs, nan=0.0, posinf=10.0, neginf=-10.0).astype(
-                np.float32
-            )
+        if not np.all(np.isfinite(canonical_obs)) or not math.isfinite(float(reward)):
+            canonical_obs = np.nan_to_num(
+                canonical_obs, nan=0.0, posinf=10.0, neginf=-10.0
+            ).astype(np.float32)
             reward = -10.0
             terminated = True
 
-        obs_noisy = self._add_sensor_noise(obs)
+        obs_noisy = self._add_sensor_noise(canonical_obs)
 
         self._ep_steps += 1
         self._ep_return += float(reward)

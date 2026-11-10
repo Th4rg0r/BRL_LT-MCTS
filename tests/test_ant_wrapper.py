@@ -17,6 +17,8 @@ def test_gate3_50_extreme_episodes_and_morphologies() -> None:
         fixed_action_space=True,
         default_num_legs=4,
     )
+    assert "Ant-v5" in wrapper.env_id
+    assert wrapper.observation_space.shape == (27,)
 
     num_episodes = 50
     steps_per_episode = 25
@@ -55,6 +57,7 @@ def test_gate3_50_extreme_episodes_and_morphologies() -> None:
             options={"tweak_vector": tweak, "num_legs": num_legs},
         )
         assert np.all(np.isfinite(obs))
+        assert obs.shape == (27,), f"Expected canonical obs shape (27,), got {obs.shape}"
         morph_mask = info["morphology_mask"]
         assert morph_mask.shape == (12,)
 

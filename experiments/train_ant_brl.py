@@ -1,4 +1,4 @@
-"""End-to-End Training and Benchmark Verification Script for LA-MCTS + BRL on Ant-v4."""
+"""End-to-End Training and Benchmark Verification Script for LA-MCTS + BRL on Ant-v5."""
 
 from __future__ import annotations
 
@@ -52,9 +52,14 @@ def evaluate_benchmark_suite(
     max_steps: int = 200,
     verbose: bool = True,
 ) -> Dict[str, Dict[str, float]]:
-    """Evaluates the agent deterministically on Standard Ant-v4 and the OOD Creature Suite."""
+    """Evaluates the agent deterministically on Standard Ant (v5/v4) and the OOD Creature Suite."""
+    std_name = (
+        "Standard-Ant-v5"
+        if getattr(env, "env_id", "Ant-v5").startswith("Ant-v5")
+        else "Standard-Ant-v4"
+    )
     suite_specs: Dict[str, Dict[str, Any]] = {
-        "Standard-Ant-v4": {
+        std_name: {
             "tweak": np.zeros(12, dtype=np.float32),
             "num_legs": 4,
         },
@@ -162,11 +167,19 @@ def compute_composite_benchmark_score(
 
     Args:
         bench_results: Mapping from creature suite name to metrics dict.
-        objective_mode: 'mixed' (0.5 * Standard-Ant-v4 + 0.5 * mean OOD),
-                        'standard' (Standard-Ant-v4 only), or 'ood' (mean OOD only).
+        objective_mode: 'mixed' (0.5 * Standard-Ant + 0.5 * mean OOD),
+                        'standard' (Standard-Ant only), or 'ood' (mean OOD only).
     """
-    std_ret = float(bench_results.get("Standard-Ant-v4", {}).get("return", 0.0))
-    ood_keys = [k for k in bench_results.keys() if k != "Standard-Ant-v4"]
+    std_key = next(
+        (k for k in ("Standard-Ant-v5", "Standard-Ant-v4", "Standard-Ant") if k in bench_results),
+        "Standard-Ant-v5",
+    )
+    std_ret = float(bench_results.get(std_key, {}).get("return", 0.0))
+    ood_keys = [
+        k
+        for k in bench_results.keys()
+        if k not in ("Standard-Ant-v5", "Standard-Ant-v4", "Standard-Ant")
+    ]
     ood_ret = (
         float(np.mean([bench_results[k]["return"] for k in ood_keys]))
         if ood_keys
@@ -347,6 +360,7 @@ def run_single_seed(
     sys_cfg = replace(cfg, la_mcts=la_cfg, brl=brl_cfg)
 
     env = MorphologicalAntBRLWrapper(
+        env_id=sys_cfg.ant_morph.env_id,
         use_contact_forces=sys_cfg.ant_morph.use_contact_forces,
         xml_rebuild_threshold=sys_cfg.ant_morph.xml_rebuild_threshold,
         max_action_capacity=sys_cfg.ant_morph.max_action_capacity,
@@ -620,7 +634,7 @@ def _parallel_seed_worker(kwargs: Dict[str, Any]) -> Dict[str, Any]:
 
 def main(argv: List[str] | None = None) -> Dict[str, Any]:
     parser = argparse.ArgumentParser(
-        description="Train and verify LA-MCTS + BRL on Morphological Ant-v4."
+        description="Train and verify LA-MCTS + BRL on Morphological Ant-v5."
     )
     parser.add_argument(
         "--config",
