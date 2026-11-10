@@ -33,11 +33,12 @@ import optuna
 from optuna.pruners import HyperbandPruner, MedianPruner
 from optuna.samplers import CmaEsSampler, QMCSampler, TPESampler
 from optuna.storages import JournalStorage
-from optuna.storages.journal import JournalFileBackend
+from optuna.storages.journal import JournalFileBackend, JournalFileOpenLock
 from optuna.trial import TrialState
 import torch
 
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="gymnasium.*")
+warnings.filterwarnings("ignore", category=FutureWarning, module="optuna.*")
 if hasattr(optuna, "exceptions") and hasattr(optuna.exceptions, "ExperimentalWarning"):
     warnings.filterwarnings("ignore", category=optuna.exceptions.ExperimentalWarning)
 
@@ -800,7 +801,8 @@ def main(argv: Optional[List[str]] = None) -> Dict[str, Any]:
     journal_path = out_dir / "optuna_journal.log"
     if not args.resume and journal_path.exists():
         journal_path.unlink()
-    storage = JournalStorage(JournalFileBackend(str(journal_path)))
+    lock_obj = JournalFileOpenLock(str(journal_path))
+    storage = JournalStorage(JournalFileBackend(str(journal_path), lock_obj=lock_obj))
 
     base_cfg = load_config(args.base_config)
     base_defaults = default_param_dict(base_cfg)
