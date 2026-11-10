@@ -20,6 +20,12 @@ from experiments.hpo.trial_worker import (
     TrialEvalResult,
     evaluate_config_at_fidelity,
 )
+from experiments.hpo.progress_monitor import (
+    BaselineStats,
+    HPOProgressMonitor,
+    ascii_progress_bar,
+    format_time_duration,
+)
 
 __all__ = [
     "HyperparamSpec",
@@ -36,4 +42,8 @@ __all__ = [
     "FidelityStage",
     "TrialEvalResult",
     "evaluate_config_at_fidelity",
+    "BaselineStats",
+    "HPOProgressMonitor",
+    "ascii_progress_bar",
+    "format_time_duration",
 ]

@@ -64,6 +64,9 @@ def evaluate_config_at_fidelity(
     max_slowdown_factor: float = 3.5,
     gpu_mem_fraction_per_worker: float = 0.30,
     pruning_callback: Optional[Callable[[int, float], bool]] = None,
+    heartbeat_callback: Optional[
+        Callable[[int, int, int, int, float, float, float], None]
+    ] = None,
 ) -> TrialEvalResult:
     """Evaluates `cfg` across `stage.seeds` with single-thread pinning and cost/VRAM guards.
 
@@ -149,8 +152,20 @@ def evaluate_config_at_fidelity(
             # Trailing-2 checkpoint average for lower noise
             trailing = float(np.mean(checkpoint_scores[-2:]))
 
-            # Check hard slowdown limit after warmup episodes
             sec_step = float(telemetry.get("sec_per_step", 0.0))
+            if heartbeat_callback is not None:
+                peak_mb = float(telemetry.get("peak_gpu_mem_mb", 0.0))
+                heartbeat_callback(
+                    ep,
+                    stage.episodes,
+                    s_idx + 1,
+                    len(stage.seeds),
+                    score_ep,
+                    sec_step,
+                    peak_mb,
+                )
+
+            # Check hard slowdown limit after warmup episodes
             if (
                 baseline_sec_per_step > 0.0
                 and ep >= max(2, stage.eval_interval)

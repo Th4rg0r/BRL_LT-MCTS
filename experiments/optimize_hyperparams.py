@@ -42,6 +42,7 @@ if hasattr(optuna, "exceptions") and hasattr(optuna.exceptions, "ExperimentalWar
     warnings.filterwarnings("ignore", category=optuna.exceptions.ExperimentalWarning)
 
 from config import RunConfig, SystemConfig, load_config, save_config
+from experiments.hpo import BaselineStats, HPOProgressMonitor
 from experiments.hpo.importance import (
     ImportanceResult,
     compute_blended_importances,
@@ -239,6 +240,45 @@ def extract_top_param_dicts(
     return out
 
 
+def extract_top_candidates_summary(
+    study: optuna.Study,
+    base_defaults: Dict[str, Any],
+    top_k: int = 3,
+) -> List[Dict[str, Any]]:
+    """Returns candidate summary dicts (params, score, std_ant, ood) for the top trials in `study`."""
+    completed = [
+        t
+        for t in study.trials
+        if t.state == TrialState.COMPLETE and t.value is not None
+    ]
+    feasible = [t for t in completed if bool(t.user_attrs.get("feasible", True))]
+    pool = feasible if feasible else completed
+    pool.sort(key=lambda t: float(t.value), reverse=True)
+
+    summaries: List[Dict[str, Any]] = []
+    seen_keys: set[str] = set()
+    for t in pool:
+        full_p = dict(base_defaults)
+        if "full_params" in t.user_attrs:
+            full_p.update(t.user_attrs["full_params"])
+        full_p.update(t.params)
+        sig = json.dumps(full_p, sort_keys=True)
+        if sig not in seen_keys:
+            seen_keys.add(sig)
+            summaries.append(
+                {
+                    "params": full_p,
+                    "score": float(t.value),
+                    "standard_ant_mean": float(t.user_attrs.get("standard_ant_mean", 0.0)),
+                    "ood_suite_mean": float(t.user_attrs.get("ood_suite_mean", 0.0)),
+                }
+            )
+        if len(summaries) >= top_k:
+            break
+
+    return summaries
+
+
 def create_stage_study(
     study_name: str,
     storage: Optional[JournalStorage],
@@ -276,6 +316,7 @@ def run_stage_optimization(
     cma_continuous_only: bool = False,
     qmc_warmup_trials: int = 0,
     verbose: bool = True,
+    monitor: Optional[HPOProgressMonitor] = None,
 ) -> None:
     """Runs trials on `study` up to `target_trials` or `stage_timeout_sec`."""
     existing_done = len(
@@ -287,7 +328,7 @@ def run_stage_optimization(
     )
     remaining_trials = max(0, target_trials - existing_done)
     if remaining_trials == 0:
-        if verbose:
+        if verbose and (monitor is None or not monitor.quiet):
             print(
                 f"  [{stage.name}] Already has {existing_done}/{target_trials} finished trials (resumed).",
                 flush=True,
@@ -310,6 +351,27 @@ def run_stage_optimization(
             trial.report(running_score, step=ep)
             return trial.should_prune()
 
+        def _heartbeat_cb(
+            ep: int,
+            ep_total: int,
+            seed_idx: int,
+            total_seeds: int,
+            intermediate_score: float,
+            sec_per_step: float,
+            peak_mb: float,
+        ) -> None:
+            if monitor is not None:
+                monitor.record_trial_heartbeat(
+                    trial_num=trial.number,
+                    ep=ep,
+                    ep_total=ep_total,
+                    seed_idx=seed_idx,
+                    total_seeds=total_seeds,
+                    intermediate_score=intermediate_score,
+                    sec_per_step=sec_per_step,
+                    peak_mb=peak_mb,
+                )
+
         eval_res = evaluate_config_at_fidelity(
             cfg=cfg,
             stage=stage,
@@ -321,6 +383,7 @@ def run_stage_optimization(
             max_gpu_mem_gb=max_gpu_mem_gb,
             gpu_mem_fraction_per_worker=gpu_mem_fraction_per_worker,
             pruning_callback=_prune_cb,
+            heartbeat_callback=_heartbeat_cb if monitor is not None and monitor.debug else None,
         )
 
         # Store rich diagnostics and constraint values on the trial
@@ -339,7 +402,23 @@ def run_stage_optimization(
             [0.0 if eval_res.feasible else 1.0],
         )
 
-        if verbose:
+        cfg_summary = {
+            "n_sim": cfg.la_mcts.n_sim,
+            "d_model": cfg.la_mcts.d_model,
+            "train_every_steps": cfg.la_mcts.train_every_steps,
+            "lr": cfg.la_mcts.lr,
+            "gamma": cfg.la_mcts.gamma,
+            "c_1": cfg.la_mcts.c_1,
+        }
+
+        if monitor is not None:
+            monitor.record_trial_result(
+                trial_num=trial.number,
+                eval_res=eval_res,
+                params=params,
+                cfg_summary=cfg_summary,
+            )
+        elif verbose:
             elapsed_stage = format_time_duration(time.time() - stage_start)
             status_tag = "OK" if eval_res.feasible else f"INFEASIBLE({eval_res.infeasibility_reason})"
             if eval_res.pruned and eval_res.feasible:
@@ -676,6 +755,18 @@ def main(argv: Optional[List[str]] = None) -> Dict[str, Any]:
         action="store_true",
         help="Run a fast end-to-end smoke test of all 5 stages with tiny fidelities.",
     )
+    parser.add_argument(
+        "--debug",
+        "--verbose-trials",
+        action="store_true",
+        dest="debug",
+        help="Print detailed progress heartbeats inside each trial (at each evaluation interval).",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress progress outputs and stage dashboards (only output final summaries and errors).",
+    )
     args = parser.parse_args(argv)
 
     # Resolve device
@@ -717,20 +808,29 @@ def main(argv: Optional[List[str]] = None) -> Dict[str, Any]:
     total_budget_sec = max(20.0, float(args.budget_hours) * 3600.0)
     hpo_start_time = time.time()
 
-    print("=" * 88)
-    print("  LA-MCTS + BRL Multi-Fidelity Hyperparameter Optimizer")
-    print(f"  Device & Hardware : {device} | {cpu_cores} CPUs | {ram_gb:.1f} GB RAM | GPU ~{gpu_total_gb:.1f} GB")
-    print(f"  Parallel Workers  : {workers} (VRAM Cap: {args.max_gpu_mem_gb:.1f} GB total, {gpu_fraction * 100:.0f}%/worker)")
-    print(f"  Time Budget       : {args.budget_hours:.2f} hours ({format_time_duration(total_budget_sec)})")
-    print(f"  Objective Mode    : {args.objective} (Cost Penalty lambda={args.cost_penalty_lambda})")
-    print(f"  Output Config     : {final_cfg_path}")
-    print("=" * 88, flush=True)
+    monitor = HPOProgressMonitor(
+        total_budget_sec=total_budget_sec,
+        total_stages=5,
+        debug=args.debug,
+        quiet=args.quiet,
+    )
+
+    if not args.quiet:
+        print("=" * 88)
+        print("  LA-MCTS + BRL Multi-Fidelity Hyperparameter Optimizer")
+        print(f"  Device & Hardware : {device} | {cpu_cores} CPUs | {ram_gb:.1f} GB RAM | GPU ~{gpu_total_gb:.1f} GB")
+        print(f"  Parallel Workers  : {workers} (VRAM Cap: {args.max_gpu_mem_gb:.1f} GB total, {gpu_fraction * 100:.0f}%/worker)")
+        print(f"  Time Budget       : {args.budget_hours:.2f} hours ({format_time_duration(total_budget_sec)})")
+        print(f"  Objective Mode    : {args.objective} (Cost Penalty lambda={args.cost_penalty_lambda})")
+        print(f"  Output Config     : {final_cfg_path}")
+        print("=" * 88, flush=True)
 
     # =========================================================================
     # STAGE 0: Baseline Calibration
     # =========================================================================
     s0 = schedule["stage0_calib"]
-    print(f"\n>>> [Stage 0: Baseline Calibration] ({s0.episodes} eps x {s0.max_steps} steps, {len(s0.seeds)} seeds)", flush=True)
+    if not args.quiet:
+        print(f"\n>>> [Stage 0: Baseline Calibration] ({s0.episodes} eps x {s0.max_steps} steps, {len(s0.seeds)} seeds)", flush=True)
     baseline_cfg = apply_params_to_config(base_cfg, base_defaults)
     calib_res = evaluate_config_at_fidelity(
         cfg=baseline_cfg,
@@ -745,11 +845,18 @@ def main(argv: Optional[List[str]] = None) -> Dict[str, Any]:
     )
     baseline_sec_per_step = max(1e-4, calib_res.sec_per_step)
     baseline_seed_std = max(2.0, calib_res.raw_score_std if calib_res.raw_score_std > 0 else abs(calib_res.raw_score_mean) * 0.1 + 5.0)
-    print(
-        f"  [Stage 0 Done] Baseline Score: {calib_res.raw_score_mean:+.2f} (+/- {calib_res.raw_score_std:.2f}) | "
-        f"Step Time: {baseline_sec_per_step * 1000:.2f} ms | Params: {calib_res.param_count:,}",
-        flush=True,
+
+    baseline_stats = BaselineStats(
+        raw_mean=calib_res.raw_score_mean,
+        raw_std=calib_res.raw_score_std,
+        lcb_score=float(calib_res.penalized_objective - 0.5 * calib_res.raw_score_std),
+        sec_per_step=baseline_sec_per_step,
+        param_count=calib_res.param_count,
+        peak_vram_mb=calib_res.peak_gpu_mem_mb,
+        standard_ant_mean=calib_res.standard_ant_mean,
+        ood_suite_mean=calib_res.ood_suite_mean,
     )
+    monitor.set_baseline(baseline_stats)
 
     # =========================================================================
     # STAGE 1: Broad Screening (Sobol QMC + Multivariate TPE + Hyperband ASHA)
@@ -763,10 +870,17 @@ def main(argv: Optional[List[str]] = None) -> Dict[str, Any]:
         else int(np.clip((s1_budget_sec * workers * 1.4) / est_s1_trial_sec, 36, 360))
     )
     qmc_warmup = max(2, s1_target_trials // 3)
-    print(
-        f"\n>>> [Stage 1: Broad Screening] Target={s1_target_trials} trials "
-        f"({s1.episodes} eps x {s1.max_steps} steps, budget={format_time_duration(s1_budget_sec)})",
-        flush=True,
+
+    all_param_names = [s.name for s in HYPERPARAM_SPECS]
+    monitor.start_stage(
+        stage_idx=1,
+        stage_name=s1.name,
+        target_trials=s1_target_trials,
+        timeout_sec=s1_budget_sec,
+        episodes=s1.episodes,
+        max_steps=s1.max_steps,
+        seeds_count=len(s1.seeds),
+        active_params_count=len(all_param_names),
     )
 
     s1_sampler = TPESampler(
@@ -786,7 +900,6 @@ def main(argv: Optional[List[str]] = None) -> Dict[str, Any]:
     if len(study_s1.trials) == 0:
         study_s1.enqueue_trial(dict(base_defaults))
 
-    all_param_names = [s.name for s in HYPERPARAM_SPECS]
     run_stage_optimization(
         study=study_s1,
         stage=s1,
@@ -806,7 +919,11 @@ def main(argv: Optional[List[str]] = None) -> Dict[str, Any]:
         gpu_mem_fraction_per_worker=gpu_fraction,
         qmc_warmup_trials=qmc_warmup,
         verbose=True,
+        monitor=monitor,
     )
+
+    s1_cand_summaries = extract_top_candidates_summary(study_s1, base_defaults, top_k=3)
+    monitor.print_stage_dashboard(s1_cand_summaries)
 
     # =========================================================================
     # IMPORTANCE ANALYSIS & SEARCH SPACE NARROWING
@@ -843,10 +960,16 @@ def main(argv: Optional[List[str]] = None) -> Dict[str, Any]:
         if args.smoke
         else int(np.clip((s2_budget_sec * workers * 1.3) / est_s2_trial_sec, 16, 90))
     )
-    print(
-        f"\n>>> [Stage 2: Focused BO] Target={s2_target_trials} trials on {len(focused_names)} key parameters "
-        f"({s2.episodes} eps x {s2.max_steps} steps, {len(s2.seeds)} seeds)",
-        flush=True,
+
+    monitor.start_stage(
+        stage_idx=2,
+        stage_name=s2.name,
+        target_trials=s2_target_trials,
+        timeout_sec=s2_budget_sec,
+        episodes=s2.episodes,
+        max_steps=s2.max_steps,
+        seeds_count=len(s2.seeds),
+        active_params_count=len(focused_names),
     )
 
     s2_sampler = TPESampler(
@@ -885,7 +1008,11 @@ def main(argv: Optional[List[str]] = None) -> Dict[str, Any]:
         max_gpu_mem_gb=args.max_gpu_mem_gb,
         gpu_mem_fraction_per_worker=gpu_fraction,
         verbose=True,
+        monitor=monitor,
     )
+
+    s2_cand_summaries = extract_top_candidates_summary(study_s2, s1_best_params, top_k=3)
+    monitor.print_stage_dashboard(s2_cand_summaries)
 
     s2_top_dicts = extract_top_param_dicts(study_s2, s1_best_params, top_k=5)
     s2_best_params = dict(s2_top_dicts[0])
@@ -910,11 +1037,17 @@ def main(argv: Optional[List[str]] = None) -> Dict[str, Any]:
     s3a_trials = max(2, int(round(0.70 * s3_total_trials)))
     s3b_trials = max(2, s3_total_trials - s3a_trials)
 
-    print(
-        f"\n>>> [Stage 3a: High-Fidelity Core Fine-Tuning] Target={s3a_trials} trials "
-        f"({s3.episodes} eps x {s3.max_steps} steps, {len(s3.seeds)} seeds)",
-        flush=True,
+    monitor.start_stage(
+        stage_idx=3,
+        stage_name="stage3a_cma_core",
+        target_trials=s3a_trials,
+        timeout_sec=s3_budget_sec * 0.70,
+        episodes=s3.episodes,
+        max_steps=s3.max_steps,
+        seeds_count=len(s3.seeds),
+        active_params_count=len(cma_names),
     )
+
     # Use warm-started CMA-ES when enough trials exist, else tight multivariate TPE
     if s3a_trials >= 6 and not args.smoke:
         s3a_sampler: optuna.samplers.BaseSampler = CmaEsSampler(
@@ -954,15 +1087,26 @@ def main(argv: Optional[List[str]] = None) -> Dict[str, Any]:
         gpu_mem_fraction_per_worker=gpu_fraction,
         cma_continuous_only=True,
         verbose=True,
+        monitor=monitor,
     )
+
+    s3a_cand_summaries = extract_top_candidates_summary(study_s3a, s2_best_params, top_k=3)
+    monitor.print_stage_dashboard(s3a_cand_summaries)
 
     s3a_top_dicts = extract_top_param_dicts(study_s3a, s2_best_params, top_k=3)
     s3a_best_params = dict(s3a_top_dicts[0])
 
-    print(
-        f"\n>>> [Stage 3b: Minor Parameter Refinement] Target={s3b_trials} trials on {len(minor_names)} secondary/Tier-C parameters",
-        flush=True,
+    monitor.start_stage(
+        stage_idx=3,
+        stage_name="stage3b_minor_refine",
+        target_trials=s3b_trials,
+        timeout_sec=s3_budget_sec * 0.30,
+        episodes=s3.episodes,
+        max_steps=s3.max_steps,
+        seeds_count=len(s3.seeds),
+        active_params_count=len(minor_names),
     )
+
     s3b_sampler = TPESampler(
         multivariate=True,
         group=True,
@@ -992,17 +1136,17 @@ def main(argv: Optional[List[str]] = None) -> Dict[str, Any]:
         max_gpu_mem_gb=args.max_gpu_mem_gb,
         gpu_mem_fraction_per_worker=gpu_fraction,
         verbose=True,
+        monitor=monitor,
     )
+
+    s3b_cand_summaries = extract_top_candidates_summary(study_s3b, s3a_best_params, top_k=3)
+    monitor.print_stage_dashboard(s3b_cand_summaries)
 
     # =========================================================================
     # STAGE 4: Robust Multi-Seed Holdout Evaluation & Winner Selection
     # =========================================================================
     s4 = schedule["stage4_select"]
-    print(
-        f"\n>>> [Stage 4: Robust Multi-Seed Verification] ({s4.episodes} eps x {s4.max_steps} steps, "
-        f"{len(s4.seeds)} fresh holdout seeds: {s4.seeds})",
-        flush=True,
-    )
+    s4_budget_sec = max(6.0, total_budget_sec * s4.budget_fraction)
 
     s3b_top_dicts = extract_top_param_dicts(study_s3b, s3a_best_params, top_k=2)
     candidate_pool: List[Tuple[str, Dict[str, Any]]] = [
@@ -1023,11 +1167,44 @@ def main(argv: Optional[List[str]] = None) -> Dict[str, Any]:
             seen_cands.add(sig)
             unique_candidates.append((label, p_dict))
 
+    monitor.start_stage(
+        stage_idx=4,
+        stage_name=s4.name,
+        target_trials=len(unique_candidates),
+        timeout_sec=s4_budget_sec,
+        episodes=s4.episodes,
+        max_steps=s4.max_steps,
+        seeds_count=len(s4.seeds),
+        active_params_count=0,
+    )
+
     leaderboard: List[Dict[str, Any]] = []
     baseline_s4_summary: Optional[Dict[str, Any]] = None
 
-    for label, p_dict in unique_candidates:
+    for cand_idx, (label, p_dict) in enumerate(unique_candidates):
         cand_cfg = apply_params_to_config(base_cfg, p_dict)
+
+        def _heartbeat_cb_s4(
+            ep: int,
+            ep_total: int,
+            seed_idx: int,
+            total_seeds: int,
+            intermediate_score: float,
+            sec_per_step: float,
+            peak_mb: float,
+        ) -> None:
+            if monitor is not None:
+                monitor.record_trial_heartbeat(
+                    trial_num=cand_idx + 1,
+                    ep=ep,
+                    ep_total=ep_total,
+                    seed_idx=seed_idx,
+                    total_seeds=total_seeds,
+                    intermediate_score=intermediate_score,
+                    sec_per_step=sec_per_step,
+                    peak_mb=peak_mb,
+                )
+
         res = evaluate_config_at_fidelity(
             cfg=cand_cfg,
             stage=s4,
@@ -1038,6 +1215,7 @@ def main(argv: Optional[List[str]] = None) -> Dict[str, Any]:
             cost_penalty_lambda=args.cost_penalty_lambda,
             max_gpu_mem_gb=args.max_gpu_mem_gb,
             gpu_mem_fraction_per_worker=gpu_fraction,
+            heartbeat_callback=_heartbeat_cb_s4 if monitor is not None and monitor.debug else None,
         )
         lcb_score = float(res.penalized_objective - 0.5 * res.raw_score_std)
         entry = {
@@ -1058,10 +1236,18 @@ def main(argv: Optional[List[str]] = None) -> Dict[str, Any]:
         leaderboard.append(entry)
         if label == "Baseline-Default":
             baseline_s4_summary = entry
-        print(
-            f"  * {label:<18}: LCB = {lcb_score:+7.2f} | Raw = {res.raw_score_mean:+7.2f} +/- {res.raw_score_std:5.2f} "
-            f"| Params = {res.param_count / 1e6:.2f}M | Step = {res.sec_per_step * 1000:.1f} ms",
-            flush=True,
+
+        monitor.record_trial_result(
+            trial_num=cand_idx + 1,
+            eval_res=res,
+            params=p_dict,
+            cfg_summary={
+                "label": label,
+                "n_sim": cand_cfg.la_mcts.n_sim,
+                "d_model": cand_cfg.la_mcts.d_model,
+                "train_every_steps": cand_cfg.la_mcts.train_every_steps,
+                "lr": cand_cfg.la_mcts.lr,
+            },
         )
 
     feasible_lb = [e for e in leaderboard if e["feasible"]]
@@ -1073,6 +1259,8 @@ def main(argv: Optional[List[str]] = None) -> Dict[str, Any]:
     winner = ranked_lb[0]
     if baseline_s4_summary is None:
         baseline_s4_summary = ranked_lb[-1]
+
+    monitor.print_stage_dashboard(ranked_lb)
 
     # Build final SystemConfig with the full 3M-steps/seed reference protocol (3000 ep x 1000 steps)
     winning_cfg = apply_params_to_config(base_cfg, winner["params"])
@@ -1120,6 +1308,11 @@ def main(argv: Optional[List[str]] = None) -> Dict[str, Any]:
         run_cfg=final_run_cfg,
     )
     save_config(winning_cfg, final_cfg_path, header_comment=header)
+
+    monitor.print_final_head_to_head(
+        winner_summary=winner,
+        baseline_summary=baseline_s4_summary,
+    )
 
     total_hpo_sec = time.time() - hpo_start_time
     report_md_path, summary_json_path = write_hpo_report(

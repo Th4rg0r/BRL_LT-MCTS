@@ -93,6 +93,132 @@ def test_hpo_importance_blending_and_partitioning() -> None:
     assert len(minor_names) >= 1
 
 
+def test_hpo_progress_monitor_and_diagnostics(capsys) -> None:
+    """Verifies that HPOProgressMonitor formats and prints heartbeats, trial stats, and dashboards."""
+    from experiments.hpo import (
+        BaselineStats,
+        HPOProgressMonitor,
+        TrialEvalResult,
+        ascii_progress_bar,
+        format_time_duration,
+    )
+
+    assert format_time_duration(45.0) == "45s"
+    assert format_time_duration(125.0) == "2m 05s"
+    assert format_time_duration(3665.0) == "1h 01m"
+
+    bar = ascii_progress_bar(0.5, width=10)
+    assert len(bar) == 10
+    assert "█" in bar and "░" in bar
+
+    mon = HPOProgressMonitor(total_budget_sec=100.0, total_stages=5, debug=True, quiet=False)
+    b_stats = BaselineStats(
+        raw_mean=50.0,
+        raw_std=5.0,
+        lcb_score=47.5,
+        sec_per_step=0.015,
+        param_count=100_000,
+        peak_vram_mb=500.0,
+        standard_ant_mean=60.0,
+        ood_suite_mean=40.0,
+    )
+    mon.set_baseline(b_stats)
+    mon.start_stage(
+        stage_idx=1,
+        stage_name="stage1_screen",
+        target_trials=4,
+        timeout_sec=20.0,
+        episodes=10,
+        max_steps=50,
+        seeds_count=1,
+    )
+
+    # Test heartbeat output
+    mon.record_trial_heartbeat(
+        trial_num=1,
+        ep=5,
+        ep_total=10,
+        seed_idx=1,
+        total_seeds=1,
+        intermediate_score=55.0,
+        sec_per_step=0.015,
+        peak_mb=512.0,
+    )
+    captured = capsys.readouterr()
+    assert "[Trial # 1" in captured.out
+    assert "Eval Score:  +55.00" in captured.out
+
+    # Test trial result output and NEW BEST detection
+    res = TrialEvalResult(
+        raw_score_mean=80.0,
+        raw_score_std=4.0,
+        standard_ant_mean=85.0,
+        ood_suite_mean=75.0,
+        penalized_objective=78.0,
+        cost_penalty=2.0,
+        sec_per_step=0.016,
+        total_env_steps=500,
+        param_count=120_000,
+        peak_gpu_mem_mb=520.0,
+        total_wall_sec=10.0,
+        ema_win_rate=0.75,
+        feasible=True,
+        pruned=False,
+    )
+    mon.record_trial_result(
+        trial_num=1,
+        eval_res=res,
+        params={"lr": 3e-4},
+        cfg_summary={"lr": 3e-4, "n_sim": 12},
+    )
+    captured = capsys.readouterr()
+    assert "NEW BEST" in captured.out
+    assert "stage1_screen" in captured.out
+    assert "Obj =  +78.00" in captured.out
+
+    # Test stage dashboard
+    mon.print_stage_dashboard(
+        [
+            {
+                "params": {"lr": 3e-4, "n_sim": 12},
+                "score": 78.0,
+                "standard_ant_mean": 85.0,
+                "ood_suite_mean": 75.0,
+            }
+        ]
+    )
+    captured = capsys.readouterr()
+    assert "STAGE 1 SUMMARY" in captured.out
+    assert "Throughput" in captured.out
+
+    # Test final head-to-head table
+    winner = {
+        "label": "Winner-Model",
+        "lcb_score": 76.0,
+        "raw_mean": 80.0,
+        "standard_ant_mean": 85.0,
+        "ood_suite_mean": 75.0,
+        "sec_per_step": 0.016,
+        "param_count": 120_000,
+        "peak_gpu_mem_mb": 520.0,
+    }
+    baseline_s4 = {
+        "label": "Baseline-Default",
+        "lcb_score": 47.5,
+        "raw_mean": 50.0,
+        "standard_ant_mean": 60.0,
+        "ood_suite_mean": 40.0,
+        "sec_per_step": 0.015,
+        "param_count": 100_000,
+        "peak_gpu_mem_mb": 500.0,
+    }
+    mon.print_final_head_to_head(winner, baseline_s4)
+    captured = capsys.readouterr()
+    assert "FINAL OPTIMIZATION SUMMARY" in captured.out
+    assert "Improvement (Delta)" in captured.out
+    assert "+28.50" in captured.out
+
+
 def test_hpo_config_roundtrip_and_end_to_end_smoke(tmp_path: Path) -> None:
     """Runs the 5-stage HPO pipeline in --smoke mode, verifies --resume, and runs train_ant_brl."""
     out_dir = tmp_path / "hpo_run"
@@ -117,6 +243,7 @@ def test_hpo_config_roundtrip_and_end_to_end_smoke(tmp_path: Path) -> None:
             "--final-hours",
             "24.0",
             "--smoke",
+            "--debug",
         ]
     )
 
