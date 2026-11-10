@@ -51,6 +51,7 @@ class WinEvaluator:
         tau_s: float = 500.0,
         beta_w: float = 0.05,
         adaptive_ref_rate: float = 0.02,
+        min_floor_ref: Optional[float] = None,
     ) -> None:
         self.initial_r_ref = float(initial_r_ref)
         self.benchmark_r_ref = float(benchmark_r_ref)
@@ -58,6 +59,10 @@ class WinEvaluator:
         self.tau_s = float(tau_s)
         self.beta_w = float(beta_w)
         self.adaptive_ref_rate = float(adaptive_ref_rate)
+        if min_floor_ref is not None:
+            self.min_floor_ref = float(min_floor_ref)
+        else:
+            self.min_floor_ref = -abs(self.initial_r_ref) * 0.5
         self.ema_win_rate: float = 0.50
         self.episodes_evaluated: int = 0
 
@@ -82,7 +87,11 @@ class WinEvaluator:
             ema_win_rate: Updated EMA win rate W_bar_e in [0, 1].
         """
         win_indicator = int(
-            (not terminated_unhealthy) and (episode_return >= self.r_ref)
+            (not terminated_unhealthy)
+            and (
+                episode_return >= self.r_ref
+                or (forward_velocity >= 0.10 and episode_return >= self.min_floor_ref)
+            )
         )
 
         # Smooth logistic dominance score S_e = sigma((R_e - R_ref) / tau_s)
@@ -107,7 +116,8 @@ class WinEvaluator:
             ) * self.r_ref + self.adaptive_ref_rate * target_ref
         elif adapt_reference and win_indicator == 0 and self.ema_win_rate < 0.35:
             # Gently relax R_ref during early curriculum learning so duel stays informative
-            floor_ref = min(self.initial_r_ref, max(50.0, episode_return * 1.05))
+            target_floor = episode_return * 0.90 if episode_return < 0 else episode_return * 1.05
+            floor_ref = min(self.initial_r_ref, max(self.min_floor_ref, target_floor))
             self.r_ref = (
                 1.0 - self.adaptive_ref_rate
             ) * self.r_ref + self.adaptive_ref_rate * floor_ref

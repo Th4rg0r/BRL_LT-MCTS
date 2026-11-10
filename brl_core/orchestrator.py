@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 import numpy as np
 
 from brl_core.balancer import DDPGBalancer
@@ -47,6 +47,7 @@ class BRLTrainingOrchestrator:
         episode_idx: int,
         max_steps: Optional[int] = None,
         train_agent_every: int = 10,
+        step_callback: Optional[Callable[[int, int, float], None]] = None,
     ) -> Dict[str, Any]:
         """Executes a single co-evolutionary BRL episode (Warmup / BRL / Consolidation)."""
         brl_cfg = self.cfg.brl
@@ -115,6 +116,9 @@ class BRLTrainingOrchestrator:
             steps += 1
             obs = next_obs
             last_info = info
+
+            if step_callback is not None:
+                step_callback(steps, step_limit, ep_return)
 
             if steps % train_agent_every == 0:
                 agent_metrics = self.agent.train_step()
