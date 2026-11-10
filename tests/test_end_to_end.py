@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from dataclasses import replace
 import numpy as np
 import torch
 
 from config import load_config
-from experiments.train_ant_brl import main as run_train_main
+from experiments.train_ant_brl import load_training_checkpoint, main as run_train_main
 from la_mcts.backbone import SelfAttentionBackbone
 from la_mcts.gmm_heads import MultiPeakGMMActorHead, SupportCriticHead
 from la_mcts.rep_trainer import ModelRepresentationTrainer
@@ -86,12 +87,19 @@ def test_gate4_end_to_end_multi_seed_pipeline(tmp_path) -> None:
             "15",
             "--n-sim",
             "10",
+            "--checkpoint-interval",
+            "2",
             "--output-dir",
             str(out_dir),
         ]
     )
 
     assert len(results["seeds"]) == 3
+    assert results["best_overall_checkpoint_path"] is not None
+    assert results["final_overall_checkpoint_path"] is not None
+    assert Path(results["best_overall_checkpoint_path"]).exists()
+    assert Path(results["final_overall_checkpoint_path"]).exists()
+
     for seed_res in results["seeds"]:
         ema_w = seed_res["final_ema_win_rate"]
         assert 0.40 <= ema_w <= 0.60, f"Balancer EMA win rate {ema_w} drifted out of bounds"
@@ -101,3 +109,15 @@ def test_gate4_end_to_end_multi_seed_pipeline(tmp_path) -> None:
         assert "Spider-Ant" in final_bench
         assert "Heavy-Ice-Ant" in final_bench
         assert "Hexapod-Ant" in final_bench
+        assert Path(seed_res["best_checkpoint_path"]).exists()
+        assert Path(seed_res["final_checkpoint_path"]).exists()
+        assert len(seed_res["periodic_checkpoint_paths"]) == 1
+        assert Path(seed_res["periodic_checkpoint_paths"][0]).exists()
+
+    # Verify loading the saved checkpoint restores Agent, Tweaker, and Balancer cleanly
+    loaded_agent, loaded_twk, loaded_bal, loaded_cfg, payload = load_training_checkpoint(
+        results["final_overall_checkpoint_path"], device="cpu"
+    )
+    assert payload["episode"] == 4
+    act = loaded_agent.select_action(np.zeros(loaded_cfg.la_mcts.obs_dim, dtype=np.float32), deterministic=True)
+    assert act.shape == (loaded_cfg.ant_morph.max_action_capacity,)

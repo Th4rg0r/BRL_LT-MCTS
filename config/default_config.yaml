@@ -90,5 +90,6 @@ run:
   max_steps: 0         # 0 = ant_morph.max_episode_steps
   device: "cpu"
   eval_interval: 0     # 0 = min(10, episodes)
+  checkpoint_interval: 500 # Periodic milestone checkpoint interval in episodes
   parallel_seeds: 1
   gpu_mem_fraction: 0.0

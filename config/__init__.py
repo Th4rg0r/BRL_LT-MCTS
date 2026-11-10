@@ -120,6 +120,7 @@ class RunConfig:
     max_steps: int = 0  # 0 = ant_morph.max_episode_steps
     device: str = "cpu"
     eval_interval: int = 0  # 0 = min(10, episodes)
+    checkpoint_interval: int = 500  # 0 = only save best + final checkpoints
     parallel_seeds: int = 1
     gpu_mem_fraction: float = 0.0  # per-process CUDA memory cap (0 = no cap)
 

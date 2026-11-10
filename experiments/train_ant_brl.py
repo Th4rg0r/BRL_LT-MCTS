@@ -8,9 +8,10 @@ from dataclasses import replace
 import json
 from pathlib import Path
 import random
+import shutil
 import sys
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 import warnings
 
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="gymnasium.*")
@@ -21,7 +22,7 @@ from ant_morph_env.wrapper import MorphologicalAntBRLWrapper
 from brl_core.balancer import DDPGBalancer
 from brl_core.orchestrator import BRLTrainingOrchestrator
 from brl_core.tweaker import StochasticTweakerActorCritic
-from config import SystemConfig, load_config
+from config import SystemConfig, config_from_dict, config_to_dict, load_config
 from la_mcts.agent import LatentActionMCTSAgent
 
 
@@ -178,6 +179,98 @@ def compute_composite_benchmark_score(
     return 0.5 * std_ret + 0.5 * ood_ret
 
 
+def save_training_checkpoint(
+    path: str | Path,
+    seed: int,
+    episode: int,
+    total_env_steps: int,
+    cfg: SystemConfig,
+    agent: LatentActionMCTSAgent,
+    tweaker: StochasticTweakerActorCritic,
+    balancer: DDPGBalancer,
+    orchestrator: BRLTrainingOrchestrator,
+    benchmark_metrics: Optional[Dict[str, Dict[str, float]]] = None,
+    composite_score: Optional[float] = None,
+) -> Path:
+    """Saves a complete, self-contained PyTorch checkpoint (.pt) for Agent, Tweaker, and Balancer."""
+    ckpt_path = Path(path)
+    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+    payload: Dict[str, Any] = {
+        "seed": int(seed),
+        "episode": int(episode),
+        "total_env_steps": int(total_env_steps),
+        "config": config_to_dict(cfg),
+        "agent_state_dict": agent.state_dict(),
+        "tweaker_state_dict": tweaker.state_dict(),
+        "tweaker_optimizer_state_dict": tweaker.optimizer.state_dict(),
+        "balancer_state_dict": balancer.state_dict(),
+        "balancer_actor_optimizer_state_dict": balancer.actor_optimizer.state_dict(),
+        "balancer_critic_optimizer_state_dict": balancer.critic_optimizer.state_dict(),
+        "balancer_meta": {
+            "last_limits": balancer.last_limits.tolist(),
+            "last_budget": float(balancer.last_budget),
+            "last_costs": balancer.last_costs.tolist(),
+            "last_tweak": balancer.last_tweak.tolist(),
+        },
+        "win_evaluator": {
+            "ema_win_rate": float(orchestrator.win_evaluator.ema_win_rate),
+            "r_ref": float(orchestrator.win_evaluator.r_ref),
+            "episodes_evaluated": int(orchestrator.win_evaluator.episodes_evaluated),
+        },
+        "benchmark_metrics": benchmark_metrics or {},
+        "composite_score": float(composite_score) if composite_score is not None else None,
+    }
+    tmp_path = ckpt_path.with_suffix(".pt.tmp")
+    torch.save(payload, tmp_path)
+    tmp_path.replace(ckpt_path)
+    return ckpt_path
+
+
+def load_training_checkpoint(
+    path: str | Path,
+    device: str = "cpu",
+) -> Tuple[
+    LatentActionMCTSAgent,
+    StochasticTweakerActorCritic,
+    DDPGBalancer,
+    SystemConfig,
+    Dict[str, Any],
+]:
+    """Loads a saved `.pt` checkpoint and returns instantiated `(agent, tweaker, balancer, cfg, payload)`."""
+    ckpt_path = Path(path)
+    payload: Dict[str, Any] = torch.load(
+        ckpt_path, map_location=torch.device(device), weights_only=False
+    )
+    cfg = config_from_dict(payload.get("config", {}))
+    la_cfg = replace(
+        cfg.la_mcts,
+        max_action_dim=cfg.ant_morph.max_action_capacity,
+    )
+    cfg = replace(cfg, la_mcts=la_cfg)
+
+    agent = LatentActionMCTSAgent(config=cfg.la_mcts, device=device)
+    tweaker = StochasticTweakerActorCritic(config=cfg.brl, device=device)
+    balancer = DDPGBalancer(config=cfg.brl, device=device)
+
+    if "agent_state_dict" in payload:
+        agent.load_state_dict(payload["agent_state_dict"])
+    if "tweaker_state_dict" in payload:
+        tweaker.load_state_dict(payload["tweaker_state_dict"])
+    if "tweaker_optimizer_state_dict" in payload:
+        tweaker.optimizer.load_state_dict(payload["tweaker_optimizer_state_dict"])
+    if "balancer_state_dict" in payload:
+        balancer.load_state_dict(payload["balancer_state_dict"])
+    if "balancer_actor_optimizer_state_dict" in payload:
+        balancer.actor_optimizer.load_state_dict(
+            payload["balancer_actor_optimizer_state_dict"]
+        )
+    if "balancer_critic_optimizer_state_dict" in payload:
+        balancer.critic_optimizer.load_state_dict(
+            payload["balancer_critic_optimizer_state_dict"]
+        )
+    return agent, tweaker, balancer, cfg, payload
+
+
 def run_single_seed(
     seed: int,
     cfg: SystemConfig,
@@ -192,6 +285,8 @@ def run_single_seed(
         Callable[[int, Dict[str, Dict[str, float]], Dict[str, Any]], bool]
     ] = None,
     max_gpu_mem_gb: float = 0.0,
+    checkpoint_dir: Optional[str | Path] = None,
+    checkpoint_interval: int = 0,
 ) -> Dict[str, Any]:
     """Runs the 3-phase BRL + LA-MCTS training pipeline for a single random seed.
 
@@ -284,6 +379,15 @@ def run_single_seed(
     total_env_steps = 0
     pruned = False
     mem_exceeded = False
+    best_composite_score = float("-inf")
+    best_checkpoint_path: Optional[str] = None
+    final_checkpoint_path: Optional[str] = None
+    periodic_checkpoint_paths: List[str] = []
+
+    seed_ckpt_dir: Optional[Path] = None
+    if checkpoint_dir is not None:
+        seed_ckpt_dir = Path(checkpoint_dir) / f"seed_{seed}"
+        seed_ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     for ep in range(1, episodes + 1):
         ep_start_time = time.time()
@@ -349,6 +453,28 @@ def run_single_seed(
             benchmark_evals[ep] = evaluate_benchmark_suite(
                 agent=agent, env=env, max_steps=max_steps, verbose=verbose
             )
+            cur_comp_score = compute_composite_benchmark_score(benchmark_evals[ep])
+            if seed_ckpt_dir is not None and cur_comp_score >= best_composite_score:
+                best_composite_score = cur_comp_score
+                best_ckpt = save_training_checkpoint(
+                    path=seed_ckpt_dir / "best_model.pt",
+                    seed=seed,
+                    episode=ep,
+                    total_env_steps=total_env_steps,
+                    cfg=sys_cfg,
+                    agent=agent,
+                    tweaker=tweaker,
+                    balancer=balancer,
+                    orchestrator=orchestrator,
+                    benchmark_metrics=benchmark_evals[ep],
+                    composite_score=cur_comp_score,
+                )
+                best_checkpoint_path = str(best_ckpt)
+                if verbose:
+                    print(
+                        f"    [Checkpoint] New best composite score ({cur_comp_score:+.2f}) -> {best_ckpt}",
+                        flush=True,
+                    )
             if verbose:
                 print(f"  " + "-" * 50, flush=True)
 
@@ -372,6 +498,73 @@ def run_single_seed(
                     pruned = True
                     break
 
+        if (
+            seed_ckpt_dir is not None
+            and checkpoint_interval > 0
+            and ep % checkpoint_interval == 0
+            and ep < episodes
+        ):
+            latest_bench = benchmark_evals.get(ep)
+            latest_comp = (
+                compute_composite_benchmark_score(latest_bench)
+                if latest_bench is not None
+                else None
+            )
+            ep_ckpt = save_training_checkpoint(
+                path=seed_ckpt_dir / f"checkpoint_ep_{ep:04d}.pt",
+                seed=seed,
+                episode=ep,
+                total_env_steps=total_env_steps,
+                cfg=sys_cfg,
+                agent=agent,
+                tweaker=tweaker,
+                balancer=balancer,
+                orchestrator=orchestrator,
+                benchmark_metrics=latest_bench,
+                composite_score=latest_comp,
+            )
+            periodic_checkpoint_paths.append(str(ep_ckpt))
+            if verbose:
+                print(f"  [Checkpoint] Saved milestone checkpoint -> {ep_ckpt}", flush=True)
+
+    if seed_ckpt_dir is not None:
+        last_ep = len(episode_logs)
+        final_bench = benchmark_evals.get(last_ep)
+        final_comp = (
+            compute_composite_benchmark_score(final_bench)
+            if final_bench is not None
+            else None
+        )
+        final_ckpt = save_training_checkpoint(
+            path=seed_ckpt_dir / "final_model.pt",
+            seed=seed,
+            episode=last_ep,
+            total_env_steps=total_env_steps,
+            cfg=sys_cfg,
+            agent=agent,
+            tweaker=tweaker,
+            balancer=balancer,
+            orchestrator=orchestrator,
+            benchmark_metrics=final_bench,
+            composite_score=final_comp,
+        )
+        final_checkpoint_path = str(final_ckpt)
+        if best_checkpoint_path is None:
+            best_ckpt = save_training_checkpoint(
+                path=seed_ckpt_dir / "best_model.pt",
+                seed=seed,
+                episode=last_ep,
+                total_env_steps=total_env_steps,
+                cfg=sys_cfg,
+                agent=agent,
+                tweaker=tweaker,
+                balancer=balancer,
+                orchestrator=orchestrator,
+                benchmark_metrics=final_bench,
+                composite_score=final_comp,
+            )
+            best_checkpoint_path = str(best_ckpt)
+
     env.close()
     total_wall_sec = max(1e-6, time.time() - seed_start_time)
     peak_gpu_mem_mb = (
@@ -384,9 +577,15 @@ def run_single_seed(
         total_seed_dur = format_time_duration(total_wall_sec)
         print(
             f"\n>>> Seed {seed_idx + 1}/{total_seeds} (Seed {seed}) finished in {total_seed_dur}! "
-            f"Final EMA Win Rate: {orchestrator.win_evaluator.ema_win_rate:.1%}\n",
+            f"Final EMA Win Rate: {orchestrator.win_evaluator.ema_win_rate:.1%}",
             flush=True,
         )
+        if final_checkpoint_path is not None:
+            print(
+                f"    Final Model : {final_checkpoint_path}\n"
+                f"    Best Model  : {best_checkpoint_path}\n",
+                flush=True,
+            )
 
     return {
         "seed": seed,
@@ -400,6 +599,12 @@ def run_single_seed(
         "sec_per_step": total_wall_sec / max(1, total_env_steps),
         "pruned": pruned,
         "mem_exceeded": mem_exceeded,
+        "best_composite_score": (
+            float(best_composite_score) if best_composite_score > float("-inf") else None
+        ),
+        "best_checkpoint_path": best_checkpoint_path,
+        "final_checkpoint_path": final_checkpoint_path,
+        "periodic_checkpoint_paths": periodic_checkpoint_paths,
     }
 
 
@@ -465,6 +670,17 @@ def main(argv: List[str] | None = None) -> Dict[str, Any]:
         default="outputs",
         help="Directory to write checkpoint and summary JSON.",
     )
+    parser.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        default=None,
+        help="Episode interval for periodic milestone checkpoints (defaults to config run.checkpoint_interval).",
+    )
+    parser.add_argument(
+        "--no-save-checkpoints",
+        action="store_true",
+        help="Disable saving PyTorch model checkpoints (.pt) to disk.",
+    )
     args = parser.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -509,6 +725,15 @@ def main(argv: List[str] | None = None) -> Dict[str, Any]:
         if cfg.run.eval_interval > 0 and args.episodes is None
         else max(1, min(10, num_episodes))
     )
+    checkpoint_interval = (
+        args.checkpoint_interval
+        if args.checkpoint_interval is not None
+        else int(cfg.run.checkpoint_interval)
+    )
+    out_dir = Path(args.output_dir)
+    ckpt_root_dir: Optional[Path] = (
+        None if args.no_save_checkpoints else (out_dir / "checkpoints")
+    )
 
     global_start_time = time.time()
     print("=" * 80)
@@ -520,6 +745,15 @@ def main(argv: List[str] | None = None) -> Dict[str, Any]:
     print(f"  Max Steps/Ep  : {max_steps}")
     print(f"  MCTS Sims/Step: {cfg.la_mcts.n_sim}")
     print(f"  Eval Interval : Every {eval_interval} episodes")
+    if ckpt_root_dir is not None:
+        ckpt_int_str = (
+            f"Every {checkpoint_interval} episodes + Best + Final"
+            if checkpoint_interval > 0
+            else "Best + Final per seed"
+        )
+        print(f"  Checkpoints   : {ckpt_root_dir} ({ckpt_int_str})")
+    else:
+        print("  Checkpoints   : Disabled (--no-save-checkpoints)")
     print(f"  Output Dir    : {args.output_dir}")
     print("=" * 80, flush=True)
 
@@ -537,6 +771,8 @@ def main(argv: List[str] | None = None) -> Dict[str, Any]:
                 seed_idx=s_idx,
                 total_seeds=num_seeds,
                 verbose=True,
+                checkpoint_dir=ckpt_root_dir,
+                checkpoint_interval=checkpoint_interval,
             )
             all_seed_results.append(res)
     else:
@@ -551,6 +787,8 @@ def main(argv: List[str] | None = None) -> Dict[str, Any]:
                 "seed_idx": s_idx,
                 "total_seeds": num_seeds,
                 "verbose": (s_idx == 0),
+                "checkpoint_dir": ckpt_root_dir,
+                "checkpoint_interval": checkpoint_interval,
             }
             for s_idx in range(num_seeds)
         ]
@@ -565,8 +803,41 @@ def main(argv: List[str] | None = None) -> Dict[str, Any]:
                 results_by_idx[idx] = fut.result()
         all_seed_results = [results_by_idx[i] for i in range(num_seeds)]
 
-    out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    best_overall_ckpt_path: Optional[str] = None
+    final_overall_ckpt_path: Optional[str] = None
+    if ckpt_root_dir is not None and all_seed_results:
+        scored_seeds = [
+            r
+            for r in all_seed_results
+            if r.get("best_checkpoint_path") is not None
+        ]
+        if scored_seeds:
+            best_seed_res = max(
+                scored_seeds,
+                key=lambda r: (
+                    float(r["best_composite_score"])
+                    if r.get("best_composite_score") is not None
+                    else float("-inf")
+                ),
+            )
+            src_best = Path(str(best_seed_res["best_checkpoint_path"]))
+            if src_best.exists():
+                dst_best = out_dir / "best_overall_model.pt"
+                shutil.copy2(src_best, dst_best)
+                best_overall_ckpt_path = str(dst_best)
+
+            src_final = (
+                Path(str(best_seed_res["final_checkpoint_path"]))
+                if best_seed_res.get("final_checkpoint_path")
+                else None
+            )
+            if src_final is not None and src_final.exists():
+                dst_final = out_dir / "final_model.pt"
+                shutil.copy2(src_final, dst_final)
+                final_overall_ckpt_path = str(dst_final)
+
     summary_path = out_dir / "benchmark_summary.json"
     with summary_path.open("w", encoding="utf-8") as f:
         json.dump(all_seed_results, f, indent=2)
@@ -574,10 +845,21 @@ def main(argv: List[str] | None = None) -> Dict[str, Any]:
     total_time_str = format_time_duration(time.time() - global_start_time)
     print("=" * 80)
     print(f"  All {num_seeds} seeds completed in {total_time_str}!")
-    print(f"  Summary saved to: {summary_path}")
+    print(f"  Summary saved to     : {summary_path}")
+    if best_overall_ckpt_path is not None:
+        print(f"  Best Overall Model   : {best_overall_ckpt_path}")
+    if final_overall_ckpt_path is not None:
+        print(f"  Final Overall Model  : {final_overall_ckpt_path}")
+    if ckpt_root_dir is not None:
+        print(f"  Per-Seed Checkpoints : {ckpt_root_dir}/seed_<N>/{{best_model.pt, final_model.pt}}")
     print("=" * 80, flush=True)
 
-    return {"seeds": all_seed_results, "summary_path": str(summary_path)}
+    return {
+        "seeds": all_seed_results,
+        "summary_path": str(summary_path),
+        "best_overall_checkpoint_path": best_overall_ckpt_path,
+        "final_overall_checkpoint_path": final_overall_ckpt_path,
+    }
 
 
 if __name__ == "__main__":

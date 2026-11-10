@@ -442,3 +442,29 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
 
     def get_diagnostics(self) -> Dict[str, float]:
         return dict(self._diagnostics)
+
+    def state_dict(self) -> Dict[str, Any]:
+        """Returns a serializable state dictionary of all Agent networks and optimizer."""
+        return {
+            "backbone": self.backbone.state_dict(),
+            "actor_head": self.actor_head.state_dict(),
+            "critic_head": self.critic_head.state_dict(),
+            "rep_trainer": self.rep_trainer.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "diagnostics": dict(self._diagnostics),
+        }
+
+    def load_state_dict(self, state: Dict[str, Any]) -> None:
+        """Restores Agent networks and optimizer from a state dictionary."""
+        if "backbone" in state:
+            self.backbone.load_state_dict(state["backbone"])
+        if "actor_head" in state:
+            self.actor_head.load_state_dict(state["actor_head"])
+        if "critic_head" in state:
+            self.critic_head.load_state_dict(state["critic_head"])
+        if "rep_trainer" in state:
+            self.rep_trainer.load_state_dict(state["rep_trainer"])
+        if "optimizer" in state:
+            self.optimizer.load_state_dict(state["optimizer"])
+        if "diagnostics" in state:
+            self._diagnostics.update(state["diagnostics"])

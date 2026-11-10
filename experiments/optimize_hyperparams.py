@@ -455,6 +455,7 @@ def compute_final_run_protocol(
         max_steps=int(final_max_steps),
         device=str(device),
         eval_interval=10,
+        checkpoint_interval=500,
         parallel_seeds=int(parallel_seeds),
         gpu_mem_fraction=float(round(gpu_mem_fraction, 3)),
     )
