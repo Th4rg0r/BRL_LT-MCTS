@@ -406,14 +406,20 @@ def compute_final_run_protocol(
     measured_sec_per_step: float,
     baseline_sec_per_step: float,
     final_seeds: int = 10,
+    final_episodes: int = 3000,
     final_max_steps: int = 1000,
     final_hours: float = 24.0,
     parallel_seeds: int = 3,
     device: str = "cuda",
     gpu_mem_fraction: float = 0.25,
 ) -> Tuple[RunConfig, float, int]:
-    """Computes the optimal `RunConfig` for `optimal_config.yaml` so `final_seeds` seeds
-    complete within `final_hours` on the target machine.
+    """Computes the optimal `RunConfig` for `optimal_config.yaml`.
+
+    By default (`final_episodes=3000`, `final_max_steps=1000`), this sets the full
+    Ant-v4 reference benchmark protocol from Section 4.2 of `task.md`:
+    3,000 episodes x 1,000 steps = 3,000,000 environment steps per seed
+    (30,000,000 steps across 10 seeds). If `final_episodes <= 0`, episodes are
+    calibrated automatically from `final_hours`.
     """
     static_stats = estimate_static_model_stats(winning_cfg, max_steps=final_max_steps)
     rel_cost = float(static_stats["rel_cost_factor"])
@@ -432,9 +438,12 @@ def compute_final_run_protocol(
     steps_per_episode_incl_eval = float(final_max_steps) * (1.0 + 5.0 / 10.0)
     sec_per_episode = max(0.05, eff_sec_per_step * steps_per_episode_incl_eval)
 
-    raw_episodes = int(round(sec_budget_per_seed / sec_per_episode))
-    # Clamp to a sensible range [200, 3000] so submission runs are always substantial
-    recommended_episodes = int(np.clip(raw_episodes, 200, 3000))
+    if final_episodes > 0:
+        recommended_episodes = int(final_episodes)
+    else:
+        raw_episodes = int(round(sec_budget_per_seed / sec_per_episode))
+        recommended_episodes = int(np.clip(raw_episodes, 200, 3000))
+
     est_total_hours = (
         waves * contention * recommended_episodes * sec_per_episode
     ) / 3600.0
@@ -636,6 +645,15 @@ def main(argv: Optional[List[str]] = None) -> Dict[str, Any]:
         help="Number of seeds to configure in optimal_config.yaml for submission (default: 10).",
     )
     parser.add_argument(
+        "--final-episodes",
+        type=int,
+        default=3000,
+        help=(
+            "Episodes per seed in optimal_config.yaml matching the Ant-v4 reference protocol "
+            "(default: 3000 -> 3,000,000 steps/seed; pass 0 to auto-scale from --final-hours)."
+        ),
+    )
+    parser.add_argument(
         "--final-max-steps",
         type=int,
         default=1000,
@@ -645,7 +663,7 @@ def main(argv: Optional[List[str]] = None) -> Dict[str, Any]:
         "--final-hours",
         type=float,
         default=24.0,
-        help="Target wall-clock runtime in hours for the final 10-seed submission run (default: 24.0).",
+        help="Target wall-clock runtime in hours when --final-episodes=0 (default: 24.0).",
     )
     parser.add_argument(
         "--resume",
@@ -1055,13 +1073,14 @@ def main(argv: Optional[List[str]] = None) -> Dict[str, Any]:
     if baseline_s4_summary is None:
         baseline_s4_summary = ranked_lb[-1]
 
-    # Build final SystemConfig with calibrated 10-seed submission RunConfig
+    # Build final SystemConfig with the full 3M-steps/seed reference protocol (3000 ep x 1000 steps)
     winning_cfg = apply_params_to_config(base_cfg, winner["params"])
     final_run_cfg, est_final_hours, env_steps_per_seed = compute_final_run_protocol(
         winning_cfg=winning_cfg,
         measured_sec_per_step=float(winner["sec_per_step"]),
         baseline_sec_per_step=baseline_sec_per_step,
         final_seeds=args.final_seeds,
+        final_episodes=args.final_episodes,
         final_max_steps=args.final_max_steps,
         final_hours=args.final_hours,
         parallel_seeds=workers if not args.smoke else 3,
@@ -1073,9 +1092,15 @@ def main(argv: Optional[List[str]] = None) -> Dict[str, Any]:
         brl=replace(
             winning_cfg.brl,
             total_episodes=final_run_cfg.episodes,
-            warmup_episodes=max(10, int(round(final_run_cfg.episodes * (50.0 / 3000.0)))),
-            brl_episodes=max(
-                20, int(round(final_run_cfg.episodes * (2500.0 / 3000.0)))
+            warmup_episodes=(
+                50
+                if final_run_cfg.episodes == 3000
+                else max(10, int(round(final_run_cfg.episodes * (50.0 / 3000.0))))
+            ),
+            brl_episodes=(
+                2500
+                if final_run_cfg.episodes == 3000
+                else max(20, int(round(final_run_cfg.episodes * (2500.0 / 3000.0))))
             ),
         ),
         ant_morph=replace(

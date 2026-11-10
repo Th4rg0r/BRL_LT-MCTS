@@ -124,11 +124,17 @@ def test_hpo_config_roundtrip_and_end_to_end_smoke(tmp_path: Path) -> None:
     assert Path(res["report_md_path"]).exists()
     assert Path(res["summary_json_path"]).exists()
 
-    # Verify saved optimal_config.yaml loads cleanly and contains the 10-seed submission protocol
+    # Verify saved optimal_config.yaml loads cleanly and contains the full Ant-v4 reference protocol
+    # (3,000 episodes x 1,000 steps = 3,000,000 steps/seed across 10 seeds = 30,000,000 steps total)
     loaded_opt = load_config(opt_cfg_path)
     assert loaded_opt.run.seeds == 10
     assert loaded_opt.run.max_steps == 1000
-    assert loaded_opt.run.episodes >= 200
+    assert loaded_opt.run.episodes == 3000
+    assert loaded_opt.run.episodes * loaded_opt.run.max_steps == 3_000_000
+    assert loaded_opt.brl.total_episodes == 3000
+    assert loaded_opt.brl.warmup_episodes == 50
+    assert loaded_opt.brl.brl_episodes == 2500
+    assert loaded_opt.ant_morph.max_episode_steps == 1000
     assert loaded_opt.la_mcts.train_every_steps >= 5
 
     # Verify --resume reuses completed trials from JournalFileStorage without error
