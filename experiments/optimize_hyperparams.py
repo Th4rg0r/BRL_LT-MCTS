@@ -32,7 +32,7 @@ import numpy as np
 import optuna
 from optuna.pruners import HyperbandPruner, MedianPruner
 from optuna.samplers import CmaEsSampler, QMCSampler, TPESampler
-from optuna.storages import JournalStorage
+from optuna.storages import JournalStorage, fail_stale_trials
 from optuna.storages.journal import JournalFileBackend, JournalFileOpenLock
 from optuna.trial import TrialState
 import torch
@@ -280,14 +280,199 @@ def extract_top_candidates_summary(
     return summaries
 
 
+STAGE_NAME_MAP: Dict[str, int] = {
+    "0": 0,
+    "calib": 0,
+    "calibration": 0,
+    "stage0": 0,
+    "stage0_calib": 0,
+    "1": 1,
+    "screen": 1,
+    "screening": 1,
+    "stage1": 1,
+    "stage1_screen": 1,
+    "2": 2,
+    "focus": 2,
+    "focused": 2,
+    "stage2": 2,
+    "stage2_focus": 2,
+    "3": 3,
+    "finetune": 3,
+    "fine_tune": 3,
+    "fine-tuning": 3,
+    "cma": 3,
+    "stage3": 3,
+    "stage3_finetune": 3,
+    "stage3a": 3,
+    "stage3b": 3,
+    "4": 4,
+    "select": 4,
+    "selection": 4,
+    "eval": 4,
+    "holdout": 4,
+    "stage4": 4,
+    "stage4_select": 4,
+}
+
+
+def parse_stage_arg(val: Any) -> Optional[int]:
+    """Parses a stage identifier into an integer 0..4, or None for 'auto'."""
+    if val is None:
+        return None
+    s = str(val).strip().lower()
+    if s in ("auto", "none", ""):
+        return None
+    if s in STAGE_NAME_MAP:
+        return STAGE_NAME_MAP[s]
+    try:
+        idx = int(s)
+        if 0 <= idx <= 4:
+            return idx
+    except ValueError:
+        pass
+    valid = sorted(list(set(STAGE_NAME_MAP.keys())))
+    raise ValueError(f"Unknown stage '{val}'. Valid choices are 0..4 or aliases: {valid}")
+
+
+def cleanup_interrupted_running_trials(study: optuna.Study) -> int:
+    """Marks any lingering TrialState.RUNNING trials as FAIL so samplers don't stall."""
+    cleaned = 0
+    if study._storage is not None:
+        for t in study.trials:
+            if t.state == TrialState.RUNNING:
+                try:
+                    study._storage.set_trial_state_values(t._trial_id, state=TrialState.FAIL)
+                    cleaned += 1
+                except Exception:
+                    pass
+    return cleaned
+
+
+def save_baseline_calibration(path: Path, stats: BaselineStats) -> None:
+    """Saves baseline calibration metrics to disk."""
+    data = {
+        "raw_mean": float(stats.raw_mean),
+        "raw_std": float(stats.raw_std),
+        "lcb_score": float(stats.lcb_score),
+        "sec_per_step": float(stats.sec_per_step),
+        "param_count": int(stats.param_count),
+        "peak_vram_mb": float(stats.peak_vram_mb),
+        "standard_ant_mean": float(stats.standard_ant_mean),
+        "ood_suite_mean": float(stats.ood_suite_mean),
+    }
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def load_baseline_calibration(path: Path) -> Optional[BaselineStats]:
+    """Loads cached baseline calibration metrics from disk if present."""
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return BaselineStats(
+            raw_mean=float(data["raw_mean"]),
+            raw_std=float(data["raw_std"]),
+            lcb_score=float(data["lcb_score"]),
+            sec_per_step=float(data["sec_per_step"]),
+            param_count=int(data["param_count"]),
+            peak_vram_mb=float(data["peak_vram_mb"]),
+            standard_ant_mean=float(data["standard_ant_mean"]),
+            ood_suite_mean=float(data["ood_suite_mean"]),
+        )
+    except Exception:
+        return None
+
+
+def recover_baseline_from_study_or_default(
+    study: Optional[optuna.Study],
+    base_cfg: SystemConfig,
+) -> BaselineStats:
+    """Recovers baseline speed and variance from Trial 0 (base defaults) or static estimates."""
+    if study is not None and len(study.trials) > 0:
+        t0 = study.trials[0]
+        if "sec_per_step" in t0.user_attrs:
+            sec_step = max(1e-4, float(t0.user_attrs["sec_per_step"]))
+            raw_std = max(2.0, float(t0.user_attrs.get("raw_score_std", 10.0)))
+            raw_mean = float(t0.user_attrs.get("raw_score_mean", 0.0))
+            return BaselineStats(
+                raw_mean=raw_mean,
+                raw_std=raw_std,
+                lcb_score=raw_mean - 0.5 * raw_std,
+                sec_per_step=sec_step,
+                param_count=int(t0.user_attrs.get("param_count", 150_000)),
+                peak_vram_mb=float(t0.user_attrs.get("peak_gpu_mem_mb", 500.0)),
+                standard_ant_mean=float(t0.user_attrs.get("standard_ant_mean", raw_mean)),
+                ood_suite_mean=float(t0.user_attrs.get("ood_suite_mean", raw_mean)),
+            )
+    static_stats = estimate_static_model_stats(base_cfg)
+    return BaselineStats(
+        raw_mean=0.0,
+        raw_std=10.0,
+        lcb_score=-5.0,
+        sec_per_step=0.05,
+        param_count=int(static_stats["param_count"]),
+        peak_vram_mb=500.0,
+        standard_ant_mean=0.0,
+        ood_suite_mean=0.0,
+    )
+
+
+def auto_detect_resume_stage(
+    storage: Optional[JournalStorage],
+    out_dir: Path,
+) -> int:
+    """Auto-detects the earliest incomplete stage by inspecting Optuna studies."""
+    if storage is None:
+        return 0
+
+    try:
+        study_summaries = {s.study_name: s for s in optuna.study.get_all_study_summaries(storage)}
+    except Exception:
+        return 0
+
+    # Stage 3b check
+    if "stage3b_minor_refine" in study_summaries:
+        s3b = optuna.load_study(study_name="stage3b_minor_refine", storage=storage)
+        done_s3b = len([t for t in s3b.trials if t.state in (TrialState.COMPLETE, TrialState.PRUNED)])
+        if done_s3b > 0:
+            return 4
+
+    # Stage 3a check
+    if "stage3a_cma_core" in study_summaries:
+        s3a = optuna.load_study(study_name="stage3a_cma_core", storage=storage)
+        done_s3a = len([t for t in s3a.trials if t.state in (TrialState.COMPLETE, TrialState.PRUNED)])
+        if done_s3a >= 4:
+            return 3
+
+    # Stage 2 check
+    if "stage2_focus" in study_summaries:
+        s2 = optuna.load_study(study_name="stage2_focus", storage=storage)
+        done_s2 = len([t for t in s2.trials if t.state in (TrialState.COMPLETE, TrialState.PRUNED)])
+        if done_s2 >= 4:  # Has completed trials in Stage 2
+            return 3
+
+    # Stage 1 check
+    if "stage1_screen" in study_summaries:
+        s1 = optuna.load_study(study_name="stage1_screen", storage=storage)
+        done_s1 = len([t for t in s1.trials if t.state in (TrialState.COMPLETE, TrialState.PRUNED)])
+        if done_s1 >= 6:  # Has completed trials in Stage 1
+            return 2
+
+    calib_file = out_dir / "baseline_calibration.json"
+    if calib_file.exists():
+        return 1
+
+    return 0
+
+
 def create_stage_study(
     study_name: str,
     storage: Optional[JournalStorage],
     sampler: optuna.samplers.BaseSampler,
     pruner: optuna.pruners.BasePruner,
 ) -> optuna.Study:
-    """Creates or loads a maximization Optuna study."""
-    return optuna.create_study(
+    """Creates or loads a maximization Optuna study and cleans lingering running trials."""
+    study = optuna.create_study(
         study_name=study_name,
         storage=storage,
         direction="maximize",
@@ -295,6 +480,8 @@ def create_stage_study(
         pruner=pruner,
         load_if_exists=True,
     )
+    cleanup_interrupted_running_trials(study)
+    return study
 
 
 def run_stage_optimization(
@@ -752,6 +939,24 @@ def main(argv: Optional[List[str]] = None) -> Dict[str, Any]:
         help="Resume from existing Optuna JournalFileStorage in --output-dir.",
     )
     parser.add_argument(
+        "--start-stage",
+        "--from-stage",
+        type=str,
+        default="auto",
+        dest="start_stage",
+        help=(
+            "Stage to start optimization from: 'auto' (detect from journal if --resume), "
+            "0 ('calib'), 1 ('screen'), 2 ('focus'), 3 ('finetune'), or 4 ('select'). "
+            "Default: 'auto'."
+        ),
+    )
+    parser.add_argument(
+        "--skip-completed",
+        action="store_true",
+        default=True,
+        help="Skip stages that have already achieved their target trials (default: True).",
+    )
+    parser.add_argument(
         "--smoke",
         action="store_true",
         help="Run a fast end-to-end smoke test of all 5 stages with tiny fidelities.",
@@ -799,10 +1004,32 @@ def main(argv: Optional[List[str]] = None) -> Dict[str, Any]:
     partial_cfg_path = out_dir / "optimal_config.partial.yaml"
 
     journal_path = out_dir / "optuna_journal.log"
+    if args.resume and not journal_path.exists():
+        candidates = [
+            out_dir.parent / "optuna_journal.log",
+            Path("outputs/hpo/optuna_journal.log"),
+            Path("optuna_journal.log"),
+        ]
+        found = [p for p in candidates if p.exists()]
+        if found:
+            print(
+                f"\n  [WARNING] --resume requested, but journal not found at '{journal_path}'.\n"
+                f"            Found alternative journal at '{found[0]}'.\n"
+                f"            If you meant to resume from that journal, pass `--output-dir {found[0].parent}`.\n",
+                flush=True,
+            )
     if not args.resume and journal_path.exists():
         journal_path.unlink()
     lock_obj = JournalFileOpenLock(str(journal_path))
     storage = JournalStorage(JournalFileBackend(str(journal_path), lock_obj=lock_obj))
+
+    parsed_stage = parse_stage_arg(args.start_stage)
+    if parsed_stage is not None:
+        start_stage = parsed_stage
+    elif args.resume:
+        start_stage = auto_detect_resume_stage(storage, out_dir)
+    else:
+        start_stage = 0
 
     base_cfg = load_config(args.base_config)
     base_defaults = default_param_dict(base_cfg)
@@ -818,46 +1045,84 @@ def main(argv: Optional[List[str]] = None) -> Dict[str, Any]:
     )
 
     if not args.quiet:
+        stage_tag = f"Stage {start_stage}" if not args.resume else f"Stage {start_stage} (Resumed)"
         print("=" * 88)
         print("  LA-MCTS + BRL Multi-Fidelity Hyperparameter Optimizer")
         print(f"  Device & Hardware : {device} | {cpu_cores} CPUs | {ram_gb:.1f} GB RAM | GPU ~{gpu_total_gb:.1f} GB")
         print(f"  Parallel Workers  : {workers} (VRAM Cap: {args.max_gpu_mem_gb:.1f} GB total, {gpu_fraction * 100:.0f}%/worker)")
         print(f"  Time Budget       : {args.budget_hours:.2f} hours ({format_time_duration(total_budget_sec)})")
         print(f"  Objective Mode    : {args.objective} (Cost Penalty lambda={args.cost_penalty_lambda})")
+        print(f"  Start Stage       : {stage_tag}")
         print(f"  Output Config     : {final_cfg_path}")
         print("=" * 88, flush=True)
 
     # =========================================================================
     # STAGE 0: Baseline Calibration
     # =========================================================================
-    s0 = schedule["stage0_calib"]
-    if not args.quiet:
-        print(f"\n>>> [Stage 0: Baseline Calibration] ({s0.episodes} eps x {s0.max_steps} steps, {len(s0.seeds)} seeds)", flush=True)
+    baseline_calib_path = out_dir / "baseline_calibration.json"
     baseline_cfg = apply_params_to_config(base_cfg, base_defaults)
-    calib_res = evaluate_config_at_fidelity(
-        cfg=baseline_cfg,
-        stage=s0,
-        device=device,
-        objective_mode=args.objective,
-        baseline_sec_per_step=0.0,
-        baseline_seed_std=10.0,
-        cost_penalty_lambda=0.0,
-        max_gpu_mem_gb=args.max_gpu_mem_gb,
-        gpu_mem_fraction_per_worker=gpu_fraction,
-    )
-    baseline_sec_per_step = max(1e-4, calib_res.sec_per_step)
-    baseline_seed_std = max(2.0, calib_res.raw_score_std if calib_res.raw_score_std > 0 else abs(calib_res.raw_score_mean) * 0.1 + 5.0)
+    baseline_stats: Optional[BaselineStats] = None
 
-    baseline_stats = BaselineStats(
-        raw_mean=calib_res.raw_score_mean,
-        raw_std=calib_res.raw_score_std,
-        lcb_score=float(calib_res.penalized_objective - 0.5 * calib_res.raw_score_std),
-        sec_per_step=baseline_sec_per_step,
-        param_count=calib_res.param_count,
-        peak_vram_mb=calib_res.peak_gpu_mem_mb,
-        standard_ant_mean=calib_res.standard_ant_mean,
-        ood_suite_mean=calib_res.ood_suite_mean,
-    )
+    if start_stage > 0 or (args.resume and baseline_calib_path.exists()):
+        baseline_stats = load_baseline_calibration(baseline_calib_path)
+        if baseline_stats is not None and not args.quiet:
+            print(
+                f"\n>>> [Stage 0: Baseline Calibration] Loaded cached baseline stats from {baseline_calib_path} "
+                f"({baseline_stats.sec_per_step * 1000:.1f} ms/step, Raw mean={baseline_stats.raw_mean:+.2f}).",
+                flush=True,
+            )
+
+    if baseline_stats is None:
+        if start_stage > 0:
+            s1_peek = None
+            try:
+                s1_peek = optuna.load_study(study_name="stage1_screen", storage=storage)
+            except Exception:
+                pass
+            baseline_stats = recover_baseline_from_study_or_default(s1_peek, base_cfg)
+            save_baseline_calibration(baseline_calib_path, baseline_stats)
+            if not args.quiet:
+                print(
+                    f"\n>>> [Stage 0: Baseline Calibration] Recovered baseline metrics "
+                    f"({baseline_stats.sec_per_step * 1000:.1f} ms/step).",
+                    flush=True,
+                )
+        else:
+            s0 = schedule["stage0_calib"]
+            if not args.quiet:
+                print(f"\n>>> [Stage 0: Baseline Calibration] ({s0.episodes} eps x {s0.max_steps} steps, {len(s0.seeds)} seeds)", flush=True)
+            calib_res = evaluate_config_at_fidelity(
+                cfg=baseline_cfg,
+                stage=s0,
+                device=device,
+                objective_mode=args.objective,
+                baseline_sec_per_step=0.0,
+                baseline_seed_std=10.0,
+                cost_penalty_lambda=0.0,
+                max_gpu_mem_gb=args.max_gpu_mem_gb,
+                gpu_mem_fraction_per_worker=gpu_fraction,
+            )
+            baseline_sec_per_step = max(1e-4, calib_res.sec_per_step)
+            baseline_seed_std = max(
+                2.0,
+                calib_res.raw_score_std
+                if calib_res.raw_score_std > 0
+                else abs(calib_res.raw_score_mean) * 0.1 + 5.0,
+            )
+            baseline_stats = BaselineStats(
+                raw_mean=calib_res.raw_score_mean,
+                raw_std=calib_res.raw_score_std,
+                lcb_score=float(calib_res.penalized_objective - 0.5 * calib_res.raw_score_std),
+                sec_per_step=baseline_sec_per_step,
+                param_count=calib_res.param_count,
+                peak_vram_mb=calib_res.peak_gpu_mem_mb,
+                standard_ant_mean=calib_res.standard_ant_mean,
+                ood_suite_mean=calib_res.ood_suite_mean,
+            )
+            save_baseline_calibration(baseline_calib_path, baseline_stats)
+
+    baseline_sec_per_step = baseline_stats.sec_per_step
+    baseline_seed_std = baseline_stats.raw_std
     monitor.set_baseline(baseline_stats)
 
     # =========================================================================
@@ -874,16 +1139,6 @@ def main(argv: Optional[List[str]] = None) -> Dict[str, Any]:
     qmc_warmup = max(2, s1_target_trials // 3)
 
     all_param_names = [s.name for s in HYPERPARAM_SPECS]
-    monitor.start_stage(
-        stage_idx=1,
-        stage_name=s1.name,
-        target_trials=s1_target_trials,
-        timeout_sec=s1_budget_sec,
-        episodes=s1.episodes,
-        max_steps=s1.max_steps,
-        seeds_count=len(s1.seeds),
-        active_params_count=len(all_param_names),
-    )
 
     s1_sampler = TPESampler(
         multivariate=True,
@@ -899,57 +1154,72 @@ def main(argv: Optional[List[str]] = None) -> Dict[str, Any]:
         reduction_factor=2,
     )
     study_s1 = create_stage_study("stage1_screen", storage, s1_sampler, s1_pruner)
-    if len(study_s1.trials) == 0:
-        study_s1.enqueue_trial(dict(base_defaults))
 
-    run_stage_optimization(
-        study=study_s1,
-        stage=s1,
-        base_cfg=base_cfg,
-        active_names=all_param_names,
-        frozen_params=base_defaults,
-        narrowed_bounds=None,
-        target_trials=s1_target_trials,
-        stage_timeout_sec=s1_budget_sec,
-        workers=workers,
-        device=device,
-        objective_mode=args.objective,
-        baseline_sec_per_step=baseline_sec_per_step,
-        baseline_seed_std=baseline_seed_std,
-        cost_penalty_lambda=args.cost_penalty_lambda,
-        max_gpu_mem_gb=args.max_gpu_mem_gb,
-        gpu_mem_fraction_per_worker=gpu_fraction,
-        qmc_warmup_trials=qmc_warmup,
-        verbose=True,
-        monitor=monitor,
-    )
+    if start_stage <= 1:
+        monitor.start_stage(
+            stage_idx=1,
+            stage_name=s1.name,
+            target_trials=s1_target_trials,
+            timeout_sec=s1_budget_sec,
+            episodes=s1.episodes,
+            max_steps=s1.max_steps,
+            seeds_count=len(s1.seeds),
+            active_params_count=len(all_param_names),
+        )
+        if len(study_s1.trials) == 0:
+            study_s1.enqueue_trial(dict(base_defaults))
 
-    s1_cand_summaries = extract_top_candidates_summary(study_s1, base_defaults, top_k=3)
-    monitor.print_stage_dashboard(s1_cand_summaries)
+        run_stage_optimization(
+            study=study_s1,
+            stage=s1,
+            base_cfg=base_cfg,
+            active_names=all_param_names,
+            frozen_params=base_defaults,
+            narrowed_bounds=None,
+            target_trials=s1_target_trials,
+            stage_timeout_sec=s1_budget_sec,
+            workers=workers,
+            device=device,
+            objective_mode=args.objective,
+            baseline_sec_per_step=baseline_sec_per_step,
+            baseline_seed_std=baseline_seed_std,
+            cost_penalty_lambda=args.cost_penalty_lambda,
+            max_gpu_mem_gb=args.max_gpu_mem_gb,
+            gpu_mem_fraction_per_worker=gpu_fraction,
+            qmc_warmup_trials=qmc_warmup,
+            verbose=True,
+            monitor=monitor,
+        )
 
-    # =========================================================================
-    # IMPORTANCE ANALYSIS & SEARCH SPACE NARROWING
-    # =========================================================================
-    importances = compute_blended_importances(study_s1, prior_blend=0.50)
+        s1_cand_summaries = extract_top_candidates_summary(study_s1, base_defaults, top_k=3)
+        monitor.print_stage_dashboard(s1_cand_summaries)
+    else:
+        if not args.quiet:
+            print(f"\n>>> [Stage 1: Broad Screening] Skipped (starting from Stage {start_stage}). Recovering state...", flush=True)
+
+    # State reconstruction after Stage 1
+    has_s1_trials = any(t.state == TrialState.COMPLETE for t in study_s1.trials)
+    importances = compute_blended_importances(study_s1, prior_blend=0.50 if has_s1_trials else 1.0)
     focused_names, cma_names, minor_names = partition_parameters_by_importance(
         importances, max_focused_params=16, max_cma_params=10
     )
     s1_top_dicts = extract_top_param_dicts(study_s1, base_defaults, top_k=6)
     s1_best_params = dict(s1_top_dicts[0])
-    narrowed_s2 = compute_narrowed_bounds(s1_top_dicts, shrink_factor=0.60)
+    narrowed_s2 = compute_narrowed_bounds(s1_top_dicts, shrink_factor=0.60) if has_s1_trials else None
 
-    print("\n>>> [Importance Analysis: Prior Tier + PED-ANOVA + fANOVA]", flush=True)
-    for r in importances[:10]:
-        print(
-            f"    * {r.name:<20} (Tier {r.tier}): Blended={r.blended_score * 100:5.1f}% "
-            f"[PED-ANOVA={r.ped_anova_score * 100:4.1f}%, fANOVA={r.fanova_score * 100:4.1f}%]",
-            flush=True,
+    if start_stage <= 1 and not args.quiet:
+        print("\n>>> [Importance Analysis: Prior Tier + PED-ANOVA + fANOVA]", flush=True)
+        for r in importances[:10]:
+            print(
+                f"    * {r.name:<20} (Tier {r.tier}): Blended={r.blended_score * 100:5.1f}% "
+                f"[PED-ANOVA={r.ped_anova_score * 100:4.1f}%, fANOVA={r.fanova_score * 100:4.1f}%]",
+                flush=True,
+            )
+        save_config(
+            apply_params_to_config(base_cfg, s1_best_params),
+            partial_cfg_path,
+            header_comment="Intermediate Best Configuration after Stage 1 (Broad Screening)",
         )
-    save_config(
-        apply_params_to_config(base_cfg, s1_best_params),
-        partial_cfg_path,
-        header_comment="Intermediate Best Configuration after Stage 1 (Broad Screening)",
-    )
 
     # =========================================================================
     # STAGE 2: Focused Bayesian Optimization on Important Parameters
@@ -961,17 +1231,6 @@ def main(argv: Optional[List[str]] = None) -> Dict[str, Any]:
         4
         if args.smoke
         else int(np.clip((s2_budget_sec * workers * 1.3) / est_s2_trial_sec, 16, 90))
-    )
-
-    monitor.start_stage(
-        stage_idx=2,
-        stage_name=s2.name,
-        target_trials=s2_target_trials,
-        timeout_sec=s2_budget_sec,
-        episodes=s2.episodes,
-        max_steps=s2.max_steps,
-        seeds_count=len(s2.seeds),
-        active_params_count=len(focused_names),
     )
 
     s2_sampler = TPESampler(
@@ -988,42 +1247,71 @@ def main(argv: Optional[List[str]] = None) -> Dict[str, Any]:
         reduction_factor=2,
     )
     study_s2 = create_stage_study("stage2_focus", storage, s2_sampler, s2_pruner)
-    if len(study_s2.trials) == 0:
-        for top_d in s1_top_dicts[: min(3, s2_target_trials)]:
-            study_s2.enqueue_trial({k: top_d[k] for k in focused_names if k in top_d})
 
-    run_stage_optimization(
-        study=study_s2,
-        stage=s2,
-        base_cfg=base_cfg,
-        active_names=focused_names,
-        frozen_params=s1_best_params,
-        narrowed_bounds=narrowed_s2,
-        target_trials=s2_target_trials,
-        stage_timeout_sec=s2_budget_sec,
-        workers=workers,
-        device=device,
-        objective_mode=args.objective,
-        baseline_sec_per_step=baseline_sec_per_step,
-        baseline_seed_std=baseline_seed_std,
-        cost_penalty_lambda=args.cost_penalty_lambda,
-        max_gpu_mem_gb=args.max_gpu_mem_gb,
-        gpu_mem_fraction_per_worker=gpu_fraction,
-        verbose=True,
-        monitor=monitor,
-    )
+    if start_stage <= 2:
+        monitor.start_stage(
+            stage_idx=2,
+            stage_name=s2.name,
+            target_trials=s2_target_trials,
+            timeout_sec=s2_budget_sec,
+            episodes=s2.episodes,
+            max_steps=s2.max_steps,
+            seeds_count=len(s2.seeds),
+            active_params_count=len(focused_names),
+        )
+        if len(study_s2.trials) == 0:
+            for top_d in s1_top_dicts[: min(3, s2_target_trials)]:
+                study_s2.enqueue_trial({k: top_d[k] for k in focused_names if k in top_d})
 
-    s2_cand_summaries = extract_top_candidates_summary(study_s2, s1_best_params, top_k=3)
-    monitor.print_stage_dashboard(s2_cand_summaries)
+        run_stage_optimization(
+            study=study_s2,
+            stage=s2,
+            base_cfg=base_cfg,
+            active_names=focused_names,
+            frozen_params=s1_best_params,
+            narrowed_bounds=narrowed_s2,
+            target_trials=s2_target_trials,
+            stage_timeout_sec=s2_budget_sec,
+            workers=workers,
+            device=device,
+            objective_mode=args.objective,
+            baseline_sec_per_step=baseline_sec_per_step,
+            baseline_seed_std=baseline_seed_std,
+            cost_penalty_lambda=args.cost_penalty_lambda,
+            max_gpu_mem_gb=args.max_gpu_mem_gb,
+            gpu_mem_fraction_per_worker=gpu_fraction,
+            verbose=True,
+            monitor=monitor,
+        )
 
-    s2_top_dicts = extract_top_param_dicts(study_s2, s1_best_params, top_k=5)
-    s2_best_params = dict(s2_top_dicts[0])
-    narrowed_s3 = compute_narrowed_bounds(s2_top_dicts, shrink_factor=0.40)
-    save_config(
-        apply_params_to_config(base_cfg, s2_best_params),
-        partial_cfg_path,
-        header_comment="Intermediate Best Configuration after Stage 2 (Focused BO)",
-    )
+        s2_cand_summaries = extract_top_candidates_summary(study_s2, s1_best_params, top_k=3)
+        monitor.print_stage_dashboard(s2_cand_summaries)
+
+        s2_top_dicts = extract_top_param_dicts(study_s2, s1_best_params, top_k=5)
+        s2_best_params = dict(s2_top_dicts[0])
+        narrowed_s3 = compute_narrowed_bounds(s2_top_dicts, shrink_factor=0.40)
+        save_config(
+            apply_params_to_config(base_cfg, s2_best_params),
+            partial_cfg_path,
+            header_comment="Intermediate Best Configuration after Stage 2 (Focused BO)",
+        )
+    else:
+        if not args.quiet:
+            print(f"\n>>> [Stage 2: Focused BO] Skipped (starting from Stage {start_stage}). Recovering state...", flush=True)
+        has_s2_trials = any(t.state == TrialState.COMPLETE for t in study_s2.trials)
+        if has_s2_trials:
+            s2_top_dicts = extract_top_param_dicts(study_s2, s1_best_params, top_k=5)
+            s2_best_params = dict(s2_top_dicts[0])
+            narrowed_s3 = compute_narrowed_bounds(s2_top_dicts, shrink_factor=0.40)
+        elif partial_cfg_path.exists():
+            partial_sys_cfg = load_config(partial_cfg_path)
+            s2_best_params = default_param_dict(partial_sys_cfg)
+            s2_top_dicts = [s2_best_params]
+            narrowed_s3 = None
+        else:
+            s2_best_params = dict(s1_best_params)
+            s2_top_dicts = [s2_best_params]
+            narrowed_s3 = None
 
     # =========================================================================
     # STAGE 3: High-Fidelity Gradual Fine-Tuning (3a: CMA-ES Core, 3b: Minor Params)
@@ -1038,17 +1326,6 @@ def main(argv: Optional[List[str]] = None) -> Dict[str, Any]:
     )
     s3a_trials = max(2, int(round(0.70 * s3_total_trials)))
     s3b_trials = max(2, s3_total_trials - s3a_trials)
-
-    monitor.start_stage(
-        stage_idx=3,
-        stage_name="stage3a_cma_core",
-        target_trials=s3a_trials,
-        timeout_sec=s3_budget_sec * 0.70,
-        episodes=s3.episodes,
-        max_steps=s3.max_steps,
-        seeds_count=len(s3.seeds),
-        active_params_count=len(cma_names),
-    )
 
     # Use warm-started CMA-ES when enough trials exist, else tight multivariate TPE
     if s3a_trials >= 6 and not args.smoke:
@@ -1067,47 +1344,6 @@ def main(argv: Optional[List[str]] = None) -> Dict[str, Any]:
         )
     s3_pruner = MedianPruner(n_startup_trials=2, n_warmup_steps=s3.eval_interval)
     study_s3a = create_stage_study("stage3a_cma_core", storage, s3a_sampler, s3_pruner)
-    if len(study_s3a.trials) == 0:
-        study_s3a.enqueue_trial({k: s2_best_params[k] for k in cma_names if k in s2_best_params})
-
-    run_stage_optimization(
-        study=study_s3a,
-        stage=s3,
-        base_cfg=base_cfg,
-        active_names=cma_names,
-        frozen_params=s2_best_params,
-        narrowed_bounds=narrowed_s3,
-        target_trials=s3a_trials,
-        stage_timeout_sec=s3_budget_sec * 0.70,
-        workers=workers,
-        device=device,
-        objective_mode=args.objective,
-        baseline_sec_per_step=baseline_sec_per_step,
-        baseline_seed_std=baseline_seed_std,
-        cost_penalty_lambda=args.cost_penalty_lambda,
-        max_gpu_mem_gb=args.max_gpu_mem_gb,
-        gpu_mem_fraction_per_worker=gpu_fraction,
-        cma_continuous_only=True,
-        verbose=True,
-        monitor=monitor,
-    )
-
-    s3a_cand_summaries = extract_top_candidates_summary(study_s3a, s2_best_params, top_k=3)
-    monitor.print_stage_dashboard(s3a_cand_summaries)
-
-    s3a_top_dicts = extract_top_param_dicts(study_s3a, s2_best_params, top_k=3)
-    s3a_best_params = dict(s3a_top_dicts[0])
-
-    monitor.start_stage(
-        stage_idx=3,
-        stage_name="stage3b_minor_refine",
-        target_trials=s3b_trials,
-        timeout_sec=s3_budget_sec * 0.30,
-        episodes=s3.episodes,
-        max_steps=s3.max_steps,
-        seeds_count=len(s3.seeds),
-        active_params_count=len(minor_names),
-    )
 
     s3b_sampler = TPESampler(
         multivariate=True,
@@ -1117,32 +1353,105 @@ def main(argv: Optional[List[str]] = None) -> Dict[str, Any]:
         seed=204,
     )
     study_s3b = create_stage_study("stage3b_minor_refine", storage, s3b_sampler, s3_pruner)
-    if len(study_s3b.trials) == 0:
-        study_s3b.enqueue_trial({k: s3a_best_params[k] for k in minor_names if k in s3a_best_params})
 
-    run_stage_optimization(
-        study=study_s3b,
-        stage=s3,
-        base_cfg=base_cfg,
-        active_names=minor_names,
-        frozen_params=s3a_best_params,
-        narrowed_bounds=None,
-        target_trials=s3b_trials,
-        stage_timeout_sec=s3_budget_sec * 0.30,
-        workers=workers,
-        device=device,
-        objective_mode=args.objective,
-        baseline_sec_per_step=baseline_sec_per_step,
-        baseline_seed_std=baseline_seed_std,
-        cost_penalty_lambda=args.cost_penalty_lambda,
-        max_gpu_mem_gb=args.max_gpu_mem_gb,
-        gpu_mem_fraction_per_worker=gpu_fraction,
-        verbose=True,
-        monitor=monitor,
-    )
+    if start_stage <= 3:
+        monitor.start_stage(
+            stage_idx=3,
+            stage_name="stage3a_cma_core",
+            target_trials=s3a_trials,
+            timeout_sec=s3_budget_sec * 0.70,
+            episodes=s3.episodes,
+            max_steps=s3.max_steps,
+            seeds_count=len(s3.seeds),
+            active_params_count=len(cma_names),
+        )
+        if len(study_s3a.trials) == 0:
+            study_s3a.enqueue_trial({k: s2_best_params[k] for k in cma_names if k in s2_best_params})
 
-    s3b_cand_summaries = extract_top_candidates_summary(study_s3b, s3a_best_params, top_k=3)
-    monitor.print_stage_dashboard(s3b_cand_summaries)
+        run_stage_optimization(
+            study=study_s3a,
+            stage=s3,
+            base_cfg=base_cfg,
+            active_names=cma_names,
+            frozen_params=s2_best_params,
+            narrowed_bounds=narrowed_s3,
+            target_trials=s3a_trials,
+            stage_timeout_sec=s3_budget_sec * 0.70,
+            workers=workers,
+            device=device,
+            objective_mode=args.objective,
+            baseline_sec_per_step=baseline_sec_per_step,
+            baseline_seed_std=baseline_seed_std,
+            cost_penalty_lambda=args.cost_penalty_lambda,
+            max_gpu_mem_gb=args.max_gpu_mem_gb,
+            gpu_mem_fraction_per_worker=gpu_fraction,
+            cma_continuous_only=True,
+            verbose=True,
+            monitor=monitor,
+        )
+
+        s3a_cand_summaries = extract_top_candidates_summary(study_s3a, s2_best_params, top_k=3)
+        monitor.print_stage_dashboard(s3a_cand_summaries)
+
+        s3a_top_dicts = extract_top_param_dicts(study_s3a, s2_best_params, top_k=3)
+        s3a_best_params = dict(s3a_top_dicts[0])
+
+        monitor.start_stage(
+            stage_idx=3,
+            stage_name="stage3b_minor_refine",
+            target_trials=s3b_trials,
+            timeout_sec=s3_budget_sec * 0.30,
+            episodes=s3.episodes,
+            max_steps=s3.max_steps,
+            seeds_count=len(s3.seeds),
+            active_params_count=len(minor_names),
+        )
+        if len(study_s3b.trials) == 0:
+            study_s3b.enqueue_trial({k: s3a_best_params[k] for k in minor_names if k in s3a_best_params})
+
+        run_stage_optimization(
+            study=study_s3b,
+            stage=s3,
+            base_cfg=base_cfg,
+            active_names=minor_names,
+            frozen_params=s3a_best_params,
+            narrowed_bounds=None,
+            target_trials=s3b_trials,
+            stage_timeout_sec=s3_budget_sec * 0.30,
+            workers=workers,
+            device=device,
+            objective_mode=args.objective,
+            baseline_sec_per_step=baseline_sec_per_step,
+            baseline_seed_std=baseline_seed_std,
+            cost_penalty_lambda=args.cost_penalty_lambda,
+            max_gpu_mem_gb=args.max_gpu_mem_gb,
+            gpu_mem_fraction_per_worker=gpu_fraction,
+            verbose=True,
+            monitor=monitor,
+        )
+
+        s3b_cand_summaries = extract_top_candidates_summary(study_s3b, s3a_best_params, top_k=3)
+        monitor.print_stage_dashboard(s3b_cand_summaries)
+        s3b_top_dicts = extract_top_param_dicts(study_s3b, s3a_best_params, top_k=2)
+        s3b_best_params = dict(s3b_top_dicts[0])
+    else:
+        if not args.quiet:
+            print(f"\n>>> [Stage 3: Fine-Tuning] Skipped (starting from Stage {start_stage}). Recovering state...", flush=True)
+        has_s3a = any(t.state == TrialState.COMPLETE for t in study_s3a.trials)
+        if has_s3a:
+            s3a_top_dicts = extract_top_param_dicts(study_s3a, s2_best_params, top_k=3)
+            s3a_best_params = dict(s3a_top_dicts[0])
+        else:
+            s3a_best_params = dict(s2_best_params)
+            s3a_top_dicts = [s3a_best_params]
+
+        has_s3b = any(t.state == TrialState.COMPLETE for t in study_s3b.trials)
+        if has_s3b:
+            s3b_top_dicts = extract_top_param_dicts(study_s3b, s3a_best_params, top_k=2)
+            s3b_best_params = dict(s3b_top_dicts[0])
+        else:
+            s3b_best_params = dict(s3a_best_params)
+            s3b_top_dicts = [s3b_best_params]
 
     # =========================================================================
     # STAGE 4: Robust Multi-Seed Holdout Evaluation & Winner Selection
@@ -1150,14 +1459,17 @@ def main(argv: Optional[List[str]] = None) -> Dict[str, Any]:
     s4 = schedule["stage4_select"]
     s4_budget_sec = max(6.0, total_budget_sec * s4.budget_fraction)
 
-    s3b_top_dicts = extract_top_param_dicts(study_s3b, s3a_best_params, top_k=2)
-    candidate_pool: List[Tuple[str, Dict[str, Any]]] = [
-        ("Stage3b-Best", s3b_top_dicts[0]),
-        ("Stage3a-Best", s3a_best_params),
-        ("Stage2-Best", s2_best_params),
-    ]
-    if not args.smoke and len(s2_top_dicts) > 1:
-        candidate_pool.append(("Stage2-RunnerUp", s2_top_dicts[1]))
+    candidate_pool: List[Tuple[str, Dict[str, Any]]] = []
+    if any(t.state == TrialState.COMPLETE for t in study_s3b.trials):
+        candidate_pool.append(("Stage3b-Best", s3b_top_dicts[0]))
+    if any(t.state == TrialState.COMPLETE for t in study_s3a.trials):
+        candidate_pool.append(("Stage3a-Best", s3a_best_params))
+    if any(t.state == TrialState.COMPLETE for t in study_s2.trials):
+        candidate_pool.append(("Stage2-Best", s2_best_params))
+        if not args.smoke and len(s2_top_dicts) > 1:
+            candidate_pool.append(("Stage2-RunnerUp", s2_top_dicts[1]))
+    if any(t.state == TrialState.COMPLETE for t in study_s1.trials):
+        candidate_pool.append(("Stage1-Best", s1_best_params))
     candidate_pool.append(("Baseline-Default", dict(base_defaults)))
 
     # Deduplicate candidate parameter sets while keeping Baseline-Default explicitly

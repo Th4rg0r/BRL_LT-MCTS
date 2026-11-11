@@ -19,7 +19,14 @@ from experiments.hpo.search_space import (
     estimate_static_model_stats,
     sample_trial_params,
 )
-from experiments.optimize_hyperparams import main as run_hpo_main
+from experiments.optimize_hyperparams import (
+    auto_detect_resume_stage,
+    cleanup_interrupted_running_trials,
+    load_baseline_calibration,
+    main as run_hpo_main,
+    parse_stage_arg,
+    save_baseline_calibration,
+)
 from experiments.train_ant_brl import main as run_train_main
 from la_mcts.agent import LatentActionMCTSAgent
 
@@ -305,3 +312,120 @@ def test_hpo_config_roundtrip_and_end_to_end_smoke(tmp_path: Path) -> None:
         ]
     )
     assert len(train_res["seeds"]) == 1
+
+
+def test_hpo_stage_parsing_and_autodetect(tmp_path: Path) -> None:
+    """Verifies stage identifier parsing and auto-detection logic."""
+    assert parse_stage_arg("0") == 0
+    assert parse_stage_arg("calib") == 0
+    assert parse_stage_arg("1") == 1
+    assert parse_stage_arg("screen") == 1
+    assert parse_stage_arg("2") == 2
+    assert parse_stage_arg("focus") == 2
+    assert parse_stage_arg("3") == 3
+    assert parse_stage_arg("finetune") == 3
+    assert parse_stage_arg("4") == 4
+    assert parse_stage_arg("select") == 4
+    assert parse_stage_arg("auto") is None
+    assert parse_stage_arg(None) is None
+
+    import pytest
+    with pytest.raises(ValueError, match="Unknown stage"):
+        parse_stage_arg("invalid_stage_99")
+
+    # Test auto-detect with empty dir
+    empty_dir = tmp_path / "empty_dir"
+    empty_dir.mkdir()
+    assert auto_detect_resume_stage(None, empty_dir) == 0
+
+
+def test_hpo_baseline_calibration_and_stale_trial_cleanup(tmp_path: Path) -> None:
+    """Verifies baseline calibration save/load and stale trial cleanup."""
+    from experiments.hpo import BaselineStats
+    from optuna.trial import TrialState
+    from optuna.storages import InMemoryStorage
+
+    calib_file = tmp_path / "baseline_calibration.json"
+    stats = BaselineStats(
+        raw_mean=12.5,
+        raw_std=3.5,
+        lcb_score=10.75,
+        sec_per_step=0.012,
+        param_count=250_000,
+        peak_vram_mb=400.0,
+        standard_ant_mean=15.0,
+        ood_suite_mean=10.0,
+    )
+    save_baseline_calibration(calib_file, stats)
+    loaded = load_baseline_calibration(calib_file)
+    assert loaded is not None
+    assert loaded.raw_mean == 12.5
+    assert loaded.sec_per_step == 0.012
+
+    # Verify cleanup of RUNNING trials
+    storage = InMemoryStorage()
+    study = optuna.create_study(study_name="test_stale", storage=storage)
+    trial_id = storage.create_new_trial(study._study_id)
+    # Trial starts in RUNNING state
+    assert study.trials[0].state == TrialState.RUNNING
+    cleaned = cleanup_interrupted_running_trials(study)
+    assert cleaned == 1
+    assert study.trials[0].state == TrialState.FAIL
+
+
+def test_hpo_resume_from_start_stage(tmp_path: Path) -> None:
+    """Verifies resuming directly from Stage 4 with --start-stage 4 reusing previous stage results."""
+    out_dir = tmp_path / "hpo_stage_test"
+    out_dir.mkdir()
+    opt_cfg_path = out_dir / "optimal_config.yaml"
+
+    # Pre-populate a fake Stage 2 study in optuna journal
+    from optuna.storages import JournalStorage
+    from optuna.storages.journal import JournalFileBackend, JournalFileOpenLock
+    from experiments.hpo import BaselineStats
+
+    journal_path = out_dir / "optuna_journal.log"
+    lock_obj = JournalFileOpenLock(str(journal_path))
+    storage = JournalStorage(JournalFileBackend(str(journal_path), lock_obj=lock_obj))
+
+    # Pre-save baseline calibration
+    calib_file = out_dir / "baseline_calibration.json"
+    stats = BaselineStats(
+        raw_mean=50.0,
+        raw_std=5.0,
+        lcb_score=47.5,
+        sec_per_step=0.005,
+        param_count=100_000,
+        peak_vram_mb=400.0,
+        standard_ant_mean=55.0,
+        ood_suite_mean=45.0,
+    )
+    save_baseline_calibration(calib_file, stats)
+
+    # Pre-populate stage2_focus study with completed trials
+    study_s2 = optuna.create_study(study_name="stage2_focus", storage=storage, direction="maximize")
+    trial = study_s2.ask()
+    trial.set_user_attr("feasible", True)
+    trial.set_user_attr("full_params", {"lr": 0.0003, "n_sim": 8})
+    study_s2.tell(trial, 100.0)
+
+    # Run directly starting from Stage 4
+    res = run_hpo_main(
+        [
+            "--base-config",
+            "config/default_config.yaml",
+            "--output-config",
+            str(opt_cfg_path),
+            "--output-dir",
+            str(out_dir),
+            "--resume",
+            "--start-stage",
+            "4",
+            "--smoke",
+            "--quiet",
+        ]
+    )
+
+    assert opt_cfg_path.exists()
+    assert Path(res["optimal_config_path"]).exists()
+    assert res["winner"]["label"] in ("Stage2-Best", "Baseline-Default")
