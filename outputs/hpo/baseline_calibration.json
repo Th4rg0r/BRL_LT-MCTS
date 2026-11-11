@@ -1,0 +1,10 @@
+{
+  "raw_mean": -62.951169528785194,
+  "raw_std": 2.0,
+  "lcb_score": -63.951169528785194,
+  "sec_per_step": 0.07660433967129902,
+  "param_count": 4808487,
+  "peak_vram_mb": 697.6875,
+  "standard_ant_mean": -56.74187229114603,
+  "ood_suite_mean": -69.16046676642436
+}
