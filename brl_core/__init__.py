@@ -5,6 +5,7 @@ from brl_core.knapsack_proj import DifferentiableKnapsackProjection, KnapsackPro
 from brl_core.tweaker import StochasticTweakerActorCritic, TweakerTransition
 from brl_core.balancer import DDPGBalancer, BalancerReplayBuffer
 from brl_core.orchestrator import BRLTrainingOrchestrator
+from brl_core.perception import ModalitySliceSpec, PerceptionDistortionFilter
 
 __all__ = [
     "AbstractBRLSolverAgent",
@@ -16,4 +17,6 @@ __all__ = [
     "DDPGBalancer",
     "BalancerReplayBuffer",
     "BRLTrainingOrchestrator",
+    "ModalitySliceSpec",
+    "PerceptionDistortionFilter",
 ]

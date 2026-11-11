@@ -333,7 +333,8 @@ def render_scenario_video(
     )
     if hasattr(agent, "set_episode_context"):
         agent.set_episode_context(
-            tweak_vector=scenario_spec["tweak"], action_mask=morph_mask
+            tweak_vector=info.get("perceived_tweak_vector", scenario_spec["tweak"]),
+            action_mask=morph_mask,
         )
 
     disp_name = scenario_spec.get("display_name", scenario_key)

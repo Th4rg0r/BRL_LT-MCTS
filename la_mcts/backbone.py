@@ -24,7 +24,7 @@ class SubStateTokenizer(nn.Module):
         obs_dim: int = 27,
         k_tok: int = 8,
         d_model: int = 256,
-        context_dim: int = 12,
+        context_dim: int = 18,
         history_len: int = 8,
         max_action_dim: int = 8,
     ) -> None:
@@ -64,13 +64,38 @@ class SubStateTokenizer(nn.Module):
             return torch.cat([obs, pad], dim=-1)
         return obs[..., : self.obs_dim]
 
+    def _align_context_dim(self, ctx: torch.Tensor) -> torch.Tensor:
+        """Pads or truncates the last dimension of ctx to match self.context_dim."""
+        cur_dim = ctx.shape[-1]
+        if cur_dim == self.context_dim:
+            return ctx
+        if cur_dim < self.context_dim:
+            pad = torch.zeros(
+                *ctx.shape[:-1], self.context_dim - cur_dim, device=ctx.device, dtype=ctx.dtype
+            )
+            return torch.cat([ctx, pad], dim=-1)
+        return ctx[..., : self.context_dim]
+
+    def _align_history_dim(self, hist: torch.Tensor) -> torch.Tensor:
+        """Pads or truncates the flattened dimension of history to match expected input."""
+        expected_dim = self.history_len * (self.obs_dim + self.max_action_dim)
+        cur_dim = hist.shape[-1]
+        if cur_dim == expected_dim:
+            return hist
+        if cur_dim < expected_dim:
+            pad = torch.zeros(
+                *hist.shape[:-1], expected_dim - cur_dim, device=hist.device, dtype=hist.dtype
+            )
+            return torch.cat([hist, pad], dim=-1)
+        return hist[..., : expected_dim]
+
     def forward(
         self,
         obs: torch.Tensor,
         context: Optional[torch.Tensor] = None,
         history: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Maps observation (B, D_s) -> token matrix X^{(0)} of shape (B, K_tok [+1], d_model)."""
+        """Maps observation (B, D_s) -> token matrix X^{(0)} of shape (B, K_tok [+1/2], d_model)."""
         obs = self._align_obs_dim(obs)
         bsz = obs.shape[0]
         tokens = self.token_proj(obs).view(bsz, self.k_tok, self.d_model)
@@ -79,13 +104,16 @@ class SubStateTokenizer(nn.Module):
         if context is not None:
             if context.dim() == 1:
                 context = context.unsqueeze(0).expand(bsz, -1)
+            context = self._align_context_dim(context)
             ctx_tok = self.context_proj(context).unsqueeze(1) + self.context_pos_embedding
             tokens = torch.cat([tokens, ctx_tok], dim=1)
-        elif history is not None:
+
+        if history is not None:
             if history.dim() == 3:
                 history = history.reshape(bsz, -1)
-            ctx_tok = self.history_adapter(history).unsqueeze(1) + self.context_pos_embedding
-            tokens = torch.cat([tokens, ctx_tok], dim=1)
+            history = self._align_history_dim(history)
+            hist_tok = self.history_adapter(history).unsqueeze(1) + self.context_pos_embedding
+            tokens = torch.cat([tokens, hist_tok], dim=1)
 
         return tokens
 
@@ -130,7 +158,7 @@ class SelfAttentionBackbone(nn.Module):
         n_heads: int = 4,
         l_enc: int = 3,
         latent_dim: int = 256,
-        context_dim: int = 12,
+        context_dim: int = 18,
         history_len: int = 8,
         max_action_dim: int = 8,
     ) -> None:

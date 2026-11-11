@@ -10,6 +10,7 @@ import mujoco
 import numpy as np
 
 from brl_core.interfaces import WinEvaluator
+from brl_core.perception import ModalitySliceSpec, PerceptionDistortionFilter
 
 
 class MorphologicalHumanoidBRLWrapper(gym.Wrapper):
@@ -67,7 +68,12 @@ class MorphologicalHumanoidBRLWrapper(gym.Wrapper):
 
         self._capture_nominal_physics()
 
-        self.current_tweak = np.zeros(12, dtype=np.float64)
+        self.perception_filter = PerceptionDistortionFilter(
+            slice_spec=ModalitySliceSpec.create_humanoid_spec(self.canonical_obs_dim),
+            obs_dim=self.canonical_obs_dim,
+            max_latency_steps=4,
+        )
+        self.current_tweak = np.zeros(18, dtype=np.float64)
         self._ou_wind_state = np.zeros(3, dtype=np.float64)
         self._rng = np.random.default_rng()
         self._ep_steps = 0
@@ -135,8 +141,11 @@ class MorphologicalHumanoidBRLWrapper(gym.Wrapper):
     def _apply_tweak_physics(self, tweak: np.ndarray) -> None:
         model = self.mj_model
         data = self.mj_data
-        t = np.clip(np.asarray(tweak, dtype=np.float64), 0.0, 1000.0)
-        self.current_tweak = t.copy()
+        t_arr = np.asarray(tweak, dtype=np.float64).flatten()
+        if t_arr.shape[0] < 18:
+            t_arr = np.pad(t_arr, (0, 18 - t_arr.shape[0]))
+        self.current_tweak = np.clip(t_arr[:18], 0.0, 1000.0)
+        t = self.current_tweak[:12]
 
         # w1: Torso mass scaling [0.7x, 1.8x]
         scale_torso = 0.70 + 1.10 * (t[0] / 1000.0)
@@ -237,16 +246,33 @@ class MorphologicalHumanoidBRLWrapper(gym.Wrapper):
         self._start_x = float(self.mj_data.qpos[0])
         self._healthy_steps = 0
 
+        # Leg scale from tweak[2] (leg mass/scale)
+        norm_w = self.current_tweak[:12] / 1000.0
+        s_leg = 1.0 + 0.3 * float(norm_w[2])
+        true_scales = np.array([s_leg, s_leg], dtype=np.float32)
+        self.perception_filter.reset_episode(
+            tweak_vector=self.current_tweak,
+            true_leg_scales=true_scales,
+            seed=seed,
+        )
+        obs_distorted, perc_metrics = self.perception_filter.distort_observation(obs_arr)
+
         info["morphology_mask"] = np.ones(self.max_action_capacity, dtype=np.float32)
         info["tweak_vector"] = self.current_tweak.copy()
+        info["perceived_tweak_vector"] = self.perception_filter.perceived_context_vector.astype(np.float32)
+        info["perceived_leg_scales"] = self.perception_filter.perceived_leg_scales.astype(np.float32)
+        info["perception_metrics"] = perc_metrics
         info["torso_mass"] = float(self.mj_model.body_mass[self._torso_bodies[0]]) if self._torso_bodies else float(np.sum(self.mj_model.body_mass))
         info["brl_metrics"] = {
             "x_velocity": 0.0,
             "total_distance": 0.0,
             "energy_cost": 0.0,
             "healthy_steps": 0,
+            "tweak_vector": self.current_tweak.copy(),
+            "perceived_tweak_vector": self.perception_filter.perceived_context_vector.astype(np.float32),
+            "perception_metrics": perc_metrics,
         }
-        return obs_arr, info
+        return obs_distorted, info
 
     def step(
         self, action: np.ndarray
@@ -301,16 +327,23 @@ class MorphologicalHumanoidBRLWrapper(gym.Wrapper):
         if is_healthy:
             self._healthy_steps += 1
 
+        obs_distorted, perc_metrics = self.perception_filter.distort_observation(obs_arr)
+
         info["morphology_mask"] = np.ones(self.max_action_capacity, dtype=np.float32)
         info["tweak_vector"] = self.current_tweak.copy()
+        info["perceived_tweak_vector"] = self.perception_filter.perceived_context_vector.astype(np.float32)
+        info["perception_metrics"] = perc_metrics
         info["torso_mass"] = float(self.mj_model.body_mass[self._torso_bodies[0]]) if self._torso_bodies else float(np.sum(self.mj_model.body_mass))
         info["brl_metrics"] = {
             "x_velocity": float(x_vel),
             "total_distance": float(dist),
             "energy_cost": float(self._ep_energy),
             "healthy_steps": int(self._healthy_steps),
+            "tweak_vector": self.current_tweak.copy(),
+            "perceived_tweak_vector": self.perception_filter.perceived_context_vector.astype(np.float32),
+            "perception_metrics": perc_metrics,
         }
-        return obs_arr, float(reward), terminated, truncated, info
+        return obs_distorted, float(reward), terminated, truncated, info
 
 
 def evaluate_humanoid_benchmark_suite(
@@ -344,7 +377,10 @@ def evaluate_humanoid_benchmark_suite(
         obs, info = env.reset(options={"tweak_vector": spec["tweak"]})
         morph_mask = info.get("morphology_mask", np.ones(agent.cfg.max_action_dim, dtype=np.float32))
         if hasattr(agent, "set_episode_context"):
-            agent.set_episode_context(tweak_vector=spec["tweak"], action_mask=morph_mask)
+            agent.set_episode_context(
+                tweak_vector=info.get("perceived_tweak_vector", spec["tweak"]),
+                action_mask=morph_mask,
+            )
 
         ep_return = 0.0
         steps = 0

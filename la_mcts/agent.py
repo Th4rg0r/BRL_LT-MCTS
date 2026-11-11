@@ -28,14 +28,43 @@ class EpisodeTrajectory:
     mcts_policy_samples: List[np.ndarray] = field(default_factory=list)
     mcts_policy_weights: List[np.ndarray] = field(default_factory=list)
     context: np.ndarray = field(
-        default_factory=lambda: np.zeros(12, dtype=np.float32)
+        default_factory=lambda: np.zeros(18, dtype=np.float32)
     )
     action_mask: np.ndarray = field(
-        default_factory=lambda: np.ones(8, dtype=np.float32)
+        default_factory=lambda: np.ones(17, dtype=np.float32)
     )
 
     def __len__(self) -> int:
         return len(self.rewards)
+
+
+def build_step_history(
+    traj: EpisodeTrajectory,
+    step: int,
+    history_len: int,
+    obs_dim: int,
+    max_action_dim: int,
+) -> np.ndarray:
+    """Builds a flattened [history_len * (obs_dim + max_action_dim)] array of transitions before step."""
+    trans_dim = obs_dim + max_action_dim
+    hist = np.zeros((history_len, trans_dim), dtype=np.float32)
+    for slot_idx, t in enumerate(range(step - history_len, step)):
+        if 0 <= t < len(traj):
+            o = traj.obs[t]
+            if o.shape[0] < obs_dim:
+                o = np.pad(o, (0, obs_dim - o.shape[0]))
+            elif o.shape[0] > obs_dim:
+                o = o[:obs_dim]
+
+            a = traj.actions[t]
+            if a.shape[0] < max_action_dim:
+                a = np.pad(a, (0, max_action_dim - a.shape[0]))
+            elif a.shape[0] > max_action_dim:
+                a = a[:max_action_dim]
+
+            hist[slot_idx, :obs_dim] = o
+            hist[slot_idx, obs_dim:] = a
+    return hist.reshape(-1)
 
 
 class TrajectoryReplayBuffer:
@@ -47,11 +76,17 @@ class TrajectoryReplayBuffer:
         unroll_steps: int = 5,
         td_steps: int = 5,
         gamma: float = 0.99,
+        history_len: int = 4,
+        obs_dim: int = 111,
+        max_action_dim: int = 17,
     ) -> None:
         self.capacity_steps = capacity_steps
         self.unroll_steps = unroll_steps
         self.td_steps = td_steps
         self.gamma = gamma
+        self.history_len = history_len
+        self.obs_dim = obs_dim
+        self.max_action_dim = max_action_dim
         self.trajectories: Deque[EpisodeTrajectory] = deque()
         self.total_steps: int = 0
 
@@ -92,6 +127,7 @@ class TrajectoryReplayBuffer:
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
+        torch.Tensor,
         List[Tuple[EpisodeTrajectory, int]],
     ]:
         """Samples a batch of K-step unroll windows from stored trajectories."""
@@ -108,6 +144,7 @@ class TrajectoryReplayBuffer:
         weights_batch = []
         ctx_batch = []
         mask_batch = []
+        hist_batch = []
         refs: List[Tuple[EpisodeTrajectory, int]] = []
 
         traj_indices = np.random.randint(0, len(valid_trajs), size=batch_size)
@@ -123,6 +160,7 @@ class TrajectoryReplayBuffer:
             val_seq = []
             samp_seq = []
             w_seq = []
+            hist_seq = []
 
             for k in range(K + 1):
                 step = min(start + k, T - 1)
@@ -130,6 +168,15 @@ class TrajectoryReplayBuffer:
                 val_seq.append(self.compute_td_target(traj, step))
                 samp_seq.append(traj.mcts_policy_samples[step])
                 w_seq.append(traj.mcts_policy_weights[step])
+                hist_seq.append(
+                    build_step_history(
+                        traj,
+                        start + k,
+                        self.history_len,
+                        self.obs_dim,
+                        self.max_action_dim,
+                    )
+                )
                 if k < K:
                     if start + k < T:
                         act_seq.append(traj.actions[start + k])
@@ -146,6 +193,7 @@ class TrajectoryReplayBuffer:
             weights_batch.append(np.stack(w_seq, axis=0))
             ctx_batch.append(traj.context)
             mask_batch.append(traj.action_mask)
+            hist_batch.append(np.stack(hist_seq, axis=0))
 
         return (
             torch.as_tensor(np.stack(obs_batch), dtype=torch.float32, device=device),
@@ -160,6 +208,7 @@ class TrajectoryReplayBuffer:
             ),
             torch.as_tensor(np.stack(ctx_batch), dtype=torch.float32, device=device),
             torch.as_tensor(np.stack(mask_batch), dtype=torch.float32, device=device),
+            torch.as_tensor(np.stack(hist_batch), dtype=torch.float32, device=device),
             refs,
         )
 
@@ -238,11 +287,17 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             unroll_steps=self.cfg.unroll_steps,
             td_steps=self.cfg.td_steps,
             gamma=self.cfg.gamma,
+            history_len=self.cfg.history_len,
+            obs_dim=self.cfg.obs_dim,
+            max_action_dim=self.cfg.max_action_dim,
         )
 
         # Active episode state
         self.current_context = np.zeros(self.cfg.context_dim, dtype=np.float32)
         self.current_action_mask = np.ones(self.cfg.max_action_dim, dtype=np.float32)
+        self.episode_history_deque: Deque[Tuple[np.ndarray, np.ndarray]] = deque(
+            maxlen=self.cfg.history_len
+        )
         self.current_trajectory = EpisodeTrajectory(
             context=self.current_context.copy(),
             action_mask=self.current_action_mask.copy(),
@@ -272,6 +327,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                 mask = np.pad(mask, (0, self.cfg.max_action_dim - mask.shape[0]))
             self.current_action_mask = mask[: self.cfg.max_action_dim].copy()
 
+        self.episode_history_deque.clear()
         self.current_trajectory.context = self.current_context.copy()
         self.current_trajectory.action_mask = self.current_action_mask.copy()
 
@@ -283,8 +339,21 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             return np.pad(obs_arr, (0, self.cfg.obs_dim - obs_arr.shape[0]))
         return obs_arr[: self.cfg.obs_dim]
 
+    def _get_current_history_tensor(self) -> torch.Tensor:
+        """Constructs a (1, history_len * (obs_dim + max_action_dim)) tensor for the active step."""
+        trans_dim = self.cfg.obs_dim + self.cfg.max_action_dim
+        hist = np.zeros((self.cfg.history_len, trans_dim), dtype=np.float32)
+        n_avail = len(self.episode_history_deque)
+        pad_slots = self.cfg.history_len - n_avail
+        for idx, (o, a) in enumerate(self.episode_history_deque):
+            hist[pad_slots + idx, : self.cfg.obs_dim] = o
+            hist[pad_slots + idx, self.cfg.obs_dim :] = a
+        return torch.as_tensor(
+            hist.reshape(1, -1), dtype=torch.float32, device=self.device
+        )
+
     def select_action(self, obs: np.ndarray, deterministic: bool = False) -> np.ndarray:
-        """Runs Sampled Continuous MCTS from z_t = backbone(obs) to choose an action."""
+        """Runs Sampled Continuous MCTS from z_t = backbone(obs, context, history) to choose an action."""
         obs_aligned = self._align_obs(obs)
         with torch.inference_mode():
             obs_t = torch.as_tensor(
@@ -293,11 +362,12 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             ctx_t = torch.as_tensor(
                 self.current_context, dtype=torch.float32, device=self.device
             ).unsqueeze(0)
+            hist_t = self._get_current_history_tensor()
             mask_t = torch.as_tensor(
                 self.current_action_mask, dtype=torch.float32, device=self.device
             )
 
-            z_root = self.backbone(obs_t, context=ctx_t).squeeze(0)
+            z_root = self.backbone(obs_t, context=ctx_t, history=hist_t).squeeze(0)
             n_sim = self.cfg.n_sim_eval if deterministic else self.cfg.n_sim
             tau_act = self.cfg.tau_act_eval if deterministic else self.cfg.tau_act_train
 
@@ -351,8 +421,12 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
         self.current_trajectory.mcts_policy_weights.append(policy_weights)
         self._last_mcts_info = None
 
+        # Record transition to rolling history
+        self.episode_history_deque.append((obs_aligned, act_arr))
+
         if terminated or truncated:
             self.replay_buffer.add_trajectory(self.current_trajectory)
+            self.episode_history_deque.clear()
             self.current_trajectory = EpisodeTrajectory(
                 context=self.current_context.copy(),
                 action_mask=self.current_action_mask.copy(),
@@ -374,10 +448,20 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                 ctx_t = torch.as_tensor(
                     traj.context, dtype=torch.float32, device=self.device
                 ).unsqueeze(0)
+                hist_arr = build_step_history(
+                    traj,
+                    step,
+                    self.cfg.history_len,
+                    self.cfg.obs_dim,
+                    self.cfg.max_action_dim,
+                )
+                hist_t = torch.as_tensor(
+                    hist_arr, dtype=torch.float32, device=self.device
+                ).unsqueeze(0)
                 mask_t = torch.as_tensor(
                     traj.action_mask, dtype=torch.float32, device=self.device
                 )
-                z_root = self.backbone(obs_t, context=ctx_t).squeeze(0)
+                z_root = self.backbone(obs_t, context=ctx_t, history=hist_t).squeeze(0)
                 _, policy_weights, root_samples, root_value, _ = self.mcts.search(
                     z_root,
                     deterministic=False,
@@ -404,6 +488,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             weights_seq,
             ctx_batch,
             mask_batch,
+            hist_batch,
             _,
         ) = self.replay_buffer.sample_unroll_batch(bsz, self.device)
 
@@ -419,6 +504,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             actor_head=self.actor_head,
             critic_head=self.critic_head,
             context=ctx_batch,
+            history=hist_batch,
             action_mask=mask_batch,
             lambda_v=self.cfg.lambda_v,
             lambda_p=self.cfg.lambda_p,

@@ -103,7 +103,8 @@ def evaluate_benchmark_suite(
             np.ones(agent.cfg.max_action_dim, dtype=np.float32),
         )
         agent.set_episode_context(
-            tweak_vector=spec["tweak"], action_mask=morph_mask
+            tweak_vector=info.get("perceived_tweak_vector", spec["tweak"]),
+            action_mask=morph_mask,
         )
 
         ep_return = 0.0

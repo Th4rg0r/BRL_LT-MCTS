@@ -21,7 +21,7 @@ class LAMCTSConfig:
     l_enc: int = 3
     latent_dim: int = 256
     num_peaks: int = 5
-    log_std_bounds: Tuple[float, float] = (-5.0, 2.0)
+    log_std_bounds: Tuple[float, float] = (-3.0, 2.0)
     use_categorical_critic: bool = True
     support_min: int = -300
     support_max: int = 300
@@ -32,7 +32,7 @@ class LAMCTSConfig:
     proj_dim: int = 512
     pred_dim: int = 256
     unroll_steps: int = 5
-    lambda_rep: float = 4.0
+    lambda_rep: float = 2.0
     beta_mse: float = 1.0
     lambda_v: float = 0.5
     lambda_r: float = 1.0
@@ -48,9 +48,9 @@ class LAMCTSConfig:
     tau_act_train: float = 1.0
     tau_act_eval: float = 0.05
     lr: float = 3e-4
-    batch_size: int = 64
+    batch_size: int = 128
     buffer_capacity: int = 50000
-    context_dim: int = 12
+    context_dim: int = 18
     history_len: int = 8
     reanalyze_ratio: float = 0.25
     # Agent gradient update every N env steps (0 = auto: max_steps // 2, the original behaviour)
@@ -64,9 +64,9 @@ class LAMCTSConfig:
 class BRLConfig:
     """Configuration for Framework 2: Balanced Reinforcement Learning."""
 
-    num_params: int = 12
+    num_params: int = 18
     param_max: float = 1000.0
-    budget_max: float = 12000.0
+    budget_max: float = 18000.0
     cost_min: float = 0.1
     cost_max: float = 10.0
     target_win_rate: float = 0.50

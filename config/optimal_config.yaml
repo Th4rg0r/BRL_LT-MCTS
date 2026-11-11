@@ -53,13 +53,13 @@ la_mcts:
   lr: 0.0007217405739366711
   batch_size: 128
   buffer_capacity: 50000
-  context_dim: 12
+  context_dim: 18
   history_len: 8
   reanalyze_ratio: 0.25
   train_every_steps: 78
   reanalyze_every: 4
   reanalyze_states: 4
-brl: {num_params: 12, param_max: 1000.0, budget_max: 12000.0, cost_min: 0.1, cost_max: 10.0,
+brl: {num_params: 18, param_max: 1000.0, budget_max: 18000.0, cost_min: 0.1, cost_max: 10.0,
   target_win_rate: 0.5, ema_beta_w: 0.10205226705750281, tau_s: 440.1445556199655,
   initial_r_ref: 1000.0, benchmark_r_ref: 6169.54, window_k_w: 20, alpha_eq: 11.108538136500245,
   alpha_inst: 2.0, alpha_prog: 4.741532527371642, sigma_zpd: 0.17660656014862308,

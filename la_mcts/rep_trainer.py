@@ -171,6 +171,7 @@ class ModelRepresentationTrainer(nn.Module):
         actor_head: MultiPeakGMMActorHead,
         critic_head: SupportCriticHead,
         context: Optional[torch.Tensor] = None,
+        history: Optional[torch.Tensor] = None,
         action_mask: Optional[torch.Tensor] = None,
         lambda_v: float = 0.5,
         lambda_p: float = 1.0,
@@ -200,7 +201,17 @@ class ModelRepresentationTrainer(nn.Module):
                 .expand(bsz, k_plus_1, -1)
                 .reshape(bsz * k_plus_1, -1)
             )
-        z_true_all = backbone(flat_obs, context=flat_ctx).view(bsz, k_plus_1, -1)
+        flat_hist = None
+        if history is not None:
+            if history.dim() == 3:
+                flat_hist = history.reshape(bsz * k_plus_1, -1)
+            elif history.dim() == 2:
+                flat_hist = (
+                    history.unsqueeze(1)
+                    .expand(bsz, k_plus_1, -1)
+                    .reshape(bsz * k_plus_1, -1)
+                )
+        z_true_all = backbone(flat_obs, context=flat_ctx, history=flat_hist).view(bsz, k_plus_1, -1)
 
         z_hat = z_true_all[:, 0, :]
 

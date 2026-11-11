@@ -18,7 +18,7 @@ class BalancerReplayBuffer:
     """Replay Buffer and Rolling Statistics Tracker for the DDPG Balancer."""
 
     def __init__(
-        self, capacity: int = 5000, num_params: int = 12, window_k_w: int = 20
+        self, capacity: int = 5000, num_params: int = 18, window_k_w: int = 20
     ) -> None:
         self.capacity = capacity
         self.num_params = num_params

@@ -11,6 +11,7 @@ import numpy as np
 
 from ant_morph_env.xml_gen import ProceduralAntXMLGenerator
 from brl_core.interfaces import WinEvaluator
+from brl_core.perception import ModalitySliceSpec, PerceptionDistortionFilter
 
 
 class MorphologicalAntBRLWrapper(gym.Wrapper):
@@ -61,9 +62,14 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
 
         self.xml_gen = ProceduralAntXMLGenerator()
         self.win_evaluator = WinEvaluator()
+        self.perception_filter = PerceptionDistortionFilter(
+            slice_spec=ModalitySliceSpec.create_ant_spec(use_contact_forces=self.use_contact_forces),
+            obs_dim=self.canonical_obs_dim,
+            max_latency_steps=4,
+        )
 
-        self.current_tweak = np.zeros(12, dtype=np.float64)
-        self.last_xml_tweak = np.full(12, -999.0, dtype=np.float64)
+        self.current_tweak = np.zeros(18, dtype=np.float64)
+        self.last_xml_tweak = np.full(18, -999.0, dtype=np.float64)
         self.current_num_legs = self.default_num_legs
         self.last_xml_num_legs = -1
 
@@ -333,14 +339,27 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         opts = options or {}
         if "tweak_vector" in opts and opts["tweak_vector"] is not None:
             w_in = np.asarray(opts["tweak_vector"], dtype=np.float64).flatten()
-            if w_in.shape[0] < 12:
-                w_in = np.pad(w_in, (0, 12 - w_in.shape[0]))
-            self.current_tweak = np.clip(w_in[:12], 0.0, 1000.0)
+            if w_in.shape[0] < 18:
+                w_in = np.pad(w_in, (0, 18 - w_in.shape[0]))
+            self.current_tweak = np.clip(w_in[:18], 0.0, 1000.0)
 
         req_legs = int(opts.get("num_legs", self.default_num_legs))
         if req_legs not in (3, 4, 6):
             req_legs = 4
         self.current_num_legs = req_legs
+
+        # Reset perception distortion filter with true leg scales and tweak vector
+        true_scales = np.array(
+            self.xml_gen.compute_leg_scales(
+                self.current_tweak[0], self.current_tweak[1], self.current_tweak[2]
+            ),
+            dtype=np.float32,
+        )
+        self.perception_filter.reset_episode(
+            tweak_vector=self.current_tweak,
+            true_leg_scales=true_scales,
+            seed=seed,
+        )
 
         # Rebuild MJCF XML if morphological geometry parameters (w_1..w_4) or num_legs changed
         morph_delta = float(
@@ -368,11 +387,15 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
 
         canonical_obs = self._get_canonical_obs()
         obs_noisy = self._add_sensor_noise(canonical_obs)
+        obs_distorted, perc_metrics = self.perception_filter.distort_observation(obs_noisy)
         morph_mask = self.get_morphology_mask()
         info["morphology_mask"] = morph_mask
         info["tweak_vector"] = self.current_tweak.astype(np.float32)
+        info["perceived_tweak_vector"] = np.asarray(self.perception_filter.perceived_context_vector, dtype=np.float32)
+        info["perceived_leg_scales"] = np.asarray(self.perception_filter.perceived_leg_scales, dtype=np.float32)
+        info["perception_metrics"] = perc_metrics
         info["num_legs"] = self.current_num_legs
-        return obs_noisy, info
+        return obs_distorted, info
 
     def step(
         self, action: np.ndarray
@@ -429,6 +452,7 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
             terminated = True
 
         obs_noisy = self._add_sensor_noise(canonical_obs)
+        obs_distorted, perc_metrics = self.perception_filter.distort_observation(obs_noisy)
 
         self._ep_steps += 1
         self._ep_return += float(reward)
@@ -451,6 +475,8 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         )
 
         info["morphology_mask"] = morph_mask
+        info["perception_metrics"] = perc_metrics
+        info["perceived_tweak_vector"] = self.perception_filter.perceived_context_vector.astype(np.float32)
         info["brl_metrics"] = {
             "x_velocity": float(mean_x_vel),
             "total_distance": float(total_dist),
@@ -460,7 +486,9 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
             "dominance_score": float(dom_score),
             "ema_win_rate": float(ema_win),
             "tweak_vector": self.current_tweak.astype(np.float32),
+            "perceived_tweak_vector": self.perception_filter.perceived_context_vector.astype(np.float32),
+            "perception_metrics": perc_metrics,
             "num_legs": int(self.current_num_legs),
         }
 
-        return obs_noisy, float(reward), bool(terminated), bool(truncated), info
+        return obs_distorted, float(reward), bool(terminated), bool(truncated), info

@@ -40,6 +40,9 @@ class BRLTrainingOrchestrator:
         self.mean_x_vel: float = 0.0
         self.termination_rate: float = 0.0
         self.energy_cost: float = 0.0
+        self.last_perception_correctness: float = 1.0
+        self.last_leg_length_exactness: float = 1.0
+        self.last_obs_rmse: float = 0.0
         self.episode_history: List[Dict[str, Any]] = []
 
     def run_episode(
@@ -92,9 +95,10 @@ class BRLTrainingOrchestrator:
             "morphology_mask",
             np.ones(self.cfg.la_mcts.max_action_dim, dtype=np.float32),
         )
+        perceived_tweak = reset_info.get("perceived_tweak_vector", w_proj)
         if hasattr(self.agent, "set_episode_context"):
             self.agent.set_episode_context(
-                tweak_vector=w_proj, action_mask=morph_mask
+                tweak_vector=perceived_tweak, action_mask=morph_mask
             )
 
         # 4. Agent interacts with environment E(w_e)
@@ -140,6 +144,15 @@ class BRLTrainingOrchestrator:
 
         # 5. Evaluate duel outcome via WinEvaluator
         brl_info = last_info.get("brl_metrics", {})
+        perc_metrics = last_info.get("perception_metrics", {})
+        if not perc_metrics and "perception_metrics" in brl_info:
+            perc_metrics = brl_info.get("perception_metrics", {})
+
+        p_corr = float(perc_metrics.get("perception_correctness", 1.0))
+        leg_exact = float(perc_metrics.get("leg_length_exactness", 1.0))
+        obs_exact = float(perc_metrics.get("obs_exactness", 1.0))
+        obs_rmse = float(perc_metrics.get("obs_rmse", 0.0))
+
         unhealthy_term = bool(terminated and steps < step_limit)
         x_vel = float(brl_info.get("x_velocity", ep_return / max(steps, 1)))
         win_ind, dom_score, ema_win = self.win_evaluator.evaluate_episode(
@@ -152,6 +165,9 @@ class BRLTrainingOrchestrator:
         self.mean_x_vel = 0.9 * self.mean_x_vel + 0.1 * x_vel
         self.termination_rate = 0.9 * self.termination_rate + 0.1 * float(unhealthy_term)
         self.energy_cost = float(brl_info.get("energy_cost", 0.0))
+        self.last_perception_correctness = 0.9 * self.last_perception_correctness + 0.1 * p_corr
+        self.last_leg_length_exactness = 0.9 * self.last_leg_length_exactness + 0.1 * leg_exact
+        self.last_obs_rmse = 0.9 * self.last_obs_rmse + 0.1 * obs_rmse
         self.last_win = win_ind
         self.last_dominance = dom_score
         self.balancer.last_tweak = w_proj.copy()
@@ -194,6 +210,13 @@ class BRLTrainingOrchestrator:
         )
         bal_metrics = self.balancer.update(batch_size=16)
 
+        if len(w_proj) >= 18:
+            mean_phys_tweak = float(np.mean(w_proj[:12]))
+            mean_perc_tweak = float(np.mean(w_proj[12:18]))
+        else:
+            mean_phys_tweak = float(np.mean(w_proj))
+            mean_perc_tweak = 0.0
+
         summary = {
             "episode": episode_idx,
             "episode_return": ep_return,
@@ -206,6 +229,12 @@ class BRLTrainingOrchestrator:
             "mean_limit": float(np.mean(limits)),
             "mean_cost": float(np.mean(costs)),
             "mean_tweak": float(np.mean(w_proj)),
+            "mean_physics_tweak": mean_phys_tweak,
+            "mean_perception_tweak": mean_perc_tweak,
+            "perception_correctness": p_corr,
+            "leg_length_exactness": leg_exact,
+            "obs_exactness": obs_exact,
+            "obs_rmse": obs_rmse,
             "tweaker_reward": twk_reward,
             "balancer_reward": bal_reward,
             **agent_metrics,

@@ -11,6 +11,7 @@ import mujoco
 import numpy as np
 
 from brl_core.interfaces import WinEvaluator
+from brl_core.perception import ModalitySliceSpec, PerceptionDistortionFilter
 
 
 def _quat_to_euler(q: np.ndarray) -> Tuple[float, float, float]:
@@ -140,7 +141,12 @@ class MorphologicalDogBRLWrapper(gym.Env):
             self._standing_qpos[idx + 1] = 0.8  # thigh
             self._standing_qpos[idx + 2] = -1.6 # calf
 
-        self._current_tweak = np.zeros(12, dtype=np.float32)
+        self.perception_filter = PerceptionDistortionFilter(
+            slice_spec=ModalitySliceSpec.create_dog_spec(),
+            obs_dim=self.canonical_obs_dim,
+            max_latency_steps=4,
+        )
+        self._current_tweak = np.zeros(18, dtype=np.float32)
         self._action_mask = np.ones(self.act_dim, dtype=np.float32)
         self._wind_state = np.zeros(3, dtype=np.float64)
         self._sensor_noise_std = 0.0
@@ -150,10 +156,12 @@ class MorphologicalDogBRLWrapper(gym.Env):
         self._healthy_steps = 0
 
     def apply_tweak_vector(self, tweak: np.ndarray, disabled_leg: Optional[int] = None) -> None:
-        """Applies the 12D Knapsack physical tweak vector w_e to the MuJoCo simulation."""
-        tweak = np.clip(np.asarray(tweak, dtype=np.float32), 0.0, 1000.0)
-        self._current_tweak = tweak.copy()
-        norm_tweak = tweak / 1000.0
+        """Applies the 18D Knapsack physical + perception tweak vector w_e to the MuJoCo simulation."""
+        tweak_arr = np.asarray(tweak, dtype=np.float32).flatten()
+        if tweak_arr.shape[0] < 18:
+            tweak_arr = np.pad(tweak_arr, (0, 18 - tweak_arr.shape[0]))
+        self._current_tweak = np.clip(tweak_arr[:18], 0.0, 1000.0)
+        norm_tweak = self._current_tweak[:12] / 1000.0
 
         # Reset to defaults
         self.model.body_mass[:] = self._default_body_masses.copy()
@@ -320,14 +328,34 @@ class MorphologicalDogBRLWrapper(gym.Env):
         self._ep_energy = 0.0
         self._healthy_steps = 0
 
+        # Compute true leg scales from tweak asymmetry
+        norm_tweak = self._current_tweak[:12] / 1000.0
+        asym_fr = float(norm_tweak[2]) * 0.30
+        asym_lr = float(norm_tweak[3]) * 0.30
+        true_scales = np.array([
+            (1.0 + asym_fr) * (1.0 - asym_lr),
+            (1.0 + asym_fr) * (1.0 + asym_lr),
+            (1.0 - asym_fr) * (1.0 - asym_lr),
+            (1.0 - asym_fr) * (1.0 + asym_lr),
+        ], dtype=np.float32)
+        self.perception_filter.reset_episode(
+            tweak_vector=self._current_tweak,
+            true_leg_scales=true_scales,
+            seed=seed,
+        )
+
         obs = self._get_obs()
+        obs_distorted, perc_metrics = self.perception_filter.distort_observation(obs)
         info = {
             "morphology_mask": self._action_mask.copy(),
             "tweak_vector": self._current_tweak.copy(),
+            "perceived_tweak_vector": self.perception_filter.perceived_context_vector.astype(np.float32),
+            "perceived_leg_scales": self.perception_filter.perceived_leg_scales.astype(np.float32),
+            "perception_metrics": perc_metrics,
             "torso_mass": float(self.model.body_mass[self.torso_body_id]),
             "healthy": True,
         }
-        return obs, info
+        return obs_distorted, info
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
         self._step_count += 1
@@ -399,9 +427,12 @@ class MorphologicalDogBRLWrapper(gym.Env):
         truncated = self._step_count >= self.max_episode_steps
 
         obs = self._get_obs()
+        obs_distorted, perc_metrics = self.perception_filter.distort_observation(obs)
         info = {
             "morphology_mask": self._action_mask.copy(),
             "tweak_vector": self._current_tweak.copy(),
+            "perceived_tweak_vector": self.perception_filter.perceived_context_vector.astype(np.float32),
+            "perception_metrics": perc_metrics,
             "healthy": is_healthy,
             "brl_metrics": {
                 "forward_reward": float(forward_reward),
@@ -411,9 +442,12 @@ class MorphologicalDogBRLWrapper(gym.Env):
                 "total_distance": float(curr_x),
                 "energy_cost": float(self._ep_energy),
                 "healthy_steps": int(self._healthy_steps),
+                "tweak_vector": self._current_tweak.copy(),
+                "perceived_tweak_vector": self.perception_filter.perceived_context_vector.astype(np.float32),
+                "perception_metrics": perc_metrics,
             },
         }
-        return obs, float(reward), terminated, truncated, info
+        return obs_distorted, float(reward), terminated, truncated, info
 
     def render(self) -> Optional[np.ndarray]:
         """Renders current frame using offscreen MuJoCo renderer."""
@@ -471,7 +505,10 @@ def evaluate_dog_benchmark_suite(
         obs, info = env.reset(options={"tweak_vector": spec["tweak"], "disabled_leg": spec.get("disabled_leg")})
         morph_mask = info.get("morphology_mask", np.ones(agent.cfg.max_action_dim, dtype=np.float32))
         if hasattr(agent, "set_episode_context"):
-            agent.set_episode_context(tweak_vector=spec["tweak"], action_mask=morph_mask)
+            agent.set_episode_context(
+                tweak_vector=info.get("perceived_tweak_vector", spec["tweak"]),
+                action_mask=morph_mask,
+            )
 
         ep_return = 0.0
         steps = 0
