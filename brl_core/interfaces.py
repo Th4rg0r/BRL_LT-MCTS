@@ -86,18 +86,19 @@ class WinEvaluator:
             dominance_score: S_e in (0, 1).
             ema_win_rate: Updated EMA win rate W_bar_e in [0, 1].
         """
+        # Forward locomotion requirement: agent must actively locomote forward (mean velocity >= 0.15 m/s)
+        # to qualify for a win. Crouching or standing still (velocity < 0.15 m/s) is strictly a LOSS (0).
+        is_moving = forward_velocity >= 0.15
         win_indicator = int(
             (not terminated_unhealthy)
-            and (
-                episode_return >= self.r_ref
-                or (forward_velocity >= 0.10 and episode_return >= self.min_floor_ref)
-            )
+            and is_moving
+            and (episode_return >= self.r_ref)
         )
 
         # Smooth logistic dominance score S_e = sigma((R_e - R_ref) / tau_s)
         z = max(-30.0, min(30.0, (episode_return - self.r_ref) / max(self.tau_s, 1e-6)))
         dominance_score = 1.0 / (1.0 + math.exp(-z))
-        if terminated_unhealthy:
+        if terminated_unhealthy or not is_moving:
             dominance_score *= 0.5
 
         self.ema_win_rate = (

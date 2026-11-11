@@ -266,6 +266,13 @@ class MorphologicalHumanoidBRLWrapper(gym.Wrapper):
                 data.xfrc_applied[self._pelvis_body_id, :3] = self._ou_wind_state
 
         obs, reward, terminated, truncated, info = self.env.step(exec_action)
+
+        # Stagnation penalty to eliminate the standing alive-bonus exploit:
+        # If the humanoid fails to move forward (x_velocity < 0.05 m/s), penalize by -4.0
+        # to cancel the +5.0 healthy survival bonus, ensuring standing still yields near-zero return.
+        step_x_vel = float(info.get("x_velocity", 0.0))
+        if step_x_vel < 0.05:
+            reward -= 4.0
         self._ep_steps += 1
         self._ep_return += float(reward)
         self._ep_energy += float(np.sum(np.square(exec_action)))

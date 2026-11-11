@@ -90,3 +90,37 @@ def test_gate3_50_extreme_episodes_and_morphologies() -> None:
                 break
 
     wrapper.close()
+
+
+def test_standing_stagnation_penalty_and_win_evaluator() -> None:
+    """Verifies that static standing receives stagnation penalty and WinEvaluator rejects zero-velocity wins."""
+    from brl_core.interfaces import WinEvaluator
+
+    wrapper = MorphologicalAntBRLWrapper(max_action_capacity=12, fixed_action_space=True)
+    obs, info = wrapper.reset(seed=42)
+
+    # Issue zero action (ant stands still)
+    zero_action = np.zeros(12, dtype=np.float32)
+    obs, reward, term, trunc, step_info = wrapper.step(zero_action)
+    wrapper.close()
+
+    # Step velocity is near zero, so stagnation penalty (-0.8) must be applied
+    assert reward < 0.5, f"Expected stagnation penalty reducing reward to < 0.5, got {reward}"
+
+    # Verify WinEvaluator: standing still with high return MUST be evaluated as LOSS (0)
+    we = WinEvaluator(initial_r_ref=500.0)
+    win_ind, dom, ema = we.evaluate_episode(
+        episode_return=900.0,
+        terminated_unhealthy=False,
+        forward_velocity=0.01,  # Standing still / tiny jitter
+    )
+    assert win_ind == 0, "Standing still exploit must evaluate to LOSS (win_indicator = 0)"
+    assert dom <= 0.5, f"Dominance score for static hold should be dampened, got {dom}"
+
+    # Verify WinEvaluator: active forward locomotion WITH return >= r_ref MUST be WIN (1)
+    win_ind_run, dom_run, ema_run = we.evaluate_episode(
+        episode_return=900.0,
+        terminated_unhealthy=False,
+        forward_velocity=1.5,  # Active forward sprinting
+    )
+    assert win_ind_run == 1, "Active locomotion meeting r_ref must evaluate to WIN (win_indicator = 1)"

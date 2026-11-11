@@ -112,7 +112,7 @@ class MultiPeakGMMActorHead(nn.Module):
         latent_dim: int = 256,
         action_dim: int = 8,
         num_peaks: int = 5,
-        log_std_bounds: Tuple[float, float] = (-5.0, 2.0),
+        log_std_bounds: Tuple[float, float] = (-3.0, 2.0),
     ) -> None:
         super().__init__()
         self.latent_dim = latent_dim

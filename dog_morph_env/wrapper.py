@@ -69,8 +69,13 @@ class MorphologicalDogBRLWrapper(gym.Env):
         frame_skip: int = 10,
         healthy_z_range: Tuple[float, float] = (0.18, 0.60),
         max_action_capacity: int = 12,
+        render_mode: Optional[str] = None,
+        camera_name: Optional[str] = "track",
     ) -> None:
         super().__init__()
+        self.render_mode = render_mode
+        self.camera_name = camera_name
+        self._renderer: Optional[mujoco.Renderer] = None
         if xml_path is None:
             xml_path = str(Path(__file__).parent / "assets" / "unitree_go1.xml")
 
@@ -383,7 +388,12 @@ class MorphologicalDogBRLWrapper(gym.Env):
         lateral_cost = -0.1 * abs(float(self.data.qvel[1]))
         orientation_cost = -0.5 * (roll * roll + pitch * pitch)
 
-        reward = forward_reward + healthy_reward + ctrl_cost + lateral_cost + orientation_cost
+        # Stagnation penalty to eliminate the standing alive-bonus exploit:
+        # If the creature fails to move forward (vx < 0.05 m/s), penalize by -0.8
+        # to cancel the +1.0 healthy survival bonus, ensuring standing still yields near-zero return.
+        stagnation_penalty = -0.8 if float(vx) < 0.05 else 0.0
+
+        reward = forward_reward + healthy_reward + ctrl_cost + lateral_cost + orientation_cost + stagnation_penalty
 
         terminated = not is_healthy
         truncated = self._step_count >= self.max_episode_steps
@@ -404,6 +414,25 @@ class MorphologicalDogBRLWrapper(gym.Env):
             },
         }
         return obs, float(reward), terminated, truncated, info
+
+    def render(self) -> Optional[np.ndarray]:
+        """Renders current frame using offscreen MuJoCo renderer."""
+        if self.render_mode != "rgb_array":
+            return None
+        if self._renderer is None:
+            self._renderer = mujoco.Renderer(self.model, height=480, width=480)
+        self._renderer.update_scene(self.data, camera=self.camera_name)
+        return self._renderer.render()
+
+    def close(self) -> None:
+        """Cleans up offscreen renderer resources."""
+        if getattr(self, "_renderer", None) is not None:
+            try:
+                self._renderer.close()
+            except Exception:
+                pass
+            self._renderer = None
+        super().close()
 
 
 def evaluate_dog_benchmark_suite(
