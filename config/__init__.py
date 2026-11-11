@@ -108,6 +108,27 @@ class AntMorphConfig:
 
 
 @dataclass
+class HumanoidMorphConfig:
+    """Configuration for Morphological Humanoid Environment (Humanoid-v5)."""
+
+    env_id: str = "Humanoid-v5"
+    include_cfrc_ext: bool = True
+    max_episode_steps: int = 1000
+    healthy_z_range: Tuple[float, float] = (1.0, 2.0)
+    max_action_capacity: int = 17
+
+
+@dataclass
+class DogMorphConfig:
+    """Configuration for Morphological Quadruped Dog Environment (Unitree Go1)."""
+
+    env_id: str = "UnitreeGo1-v0"
+    max_episode_steps: int = 1000
+    healthy_z_range: Tuple[float, float] = (0.18, 0.60)
+    max_action_capacity: int = 12
+
+
+@dataclass
 class RunConfig:
     """Run protocol defaults for experiments/train_ant_brl.py (CLI flags override these).
 
@@ -132,6 +153,8 @@ class SystemConfig:
     la_mcts: LAMCTSConfig = field(default_factory=LAMCTSConfig)
     brl: BRLConfig = field(default_factory=BRLConfig)
     ant_morph: AntMorphConfig = field(default_factory=AntMorphConfig)
+    humanoid_morph: HumanoidMorphConfig = field(default_factory=HumanoidMorphConfig)
+    dog_morph: DogMorphConfig = field(default_factory=DogMorphConfig)
     run: RunConfig = field(default_factory=RunConfig)
 
 
@@ -156,12 +179,22 @@ def config_from_dict(raw: Dict[str, Any]) -> SystemConfig:
     if "healthy_z_range" in ant_raw:
         ant_raw["healthy_z_range"] = tuple(ant_raw["healthy_z_range"])
 
+    hum_raw = _filter_known(HumanoidMorphConfig, dict(raw.get("humanoid_morph", {}) or {}), "humanoid_morph")
+    if "healthy_z_range" in hum_raw:
+        hum_raw["healthy_z_range"] = tuple(hum_raw["healthy_z_range"])
+
+    dog_raw = _filter_known(DogMorphConfig, dict(raw.get("dog_morph", {}) or {}), "dog_morph")
+    if "healthy_z_range" in dog_raw:
+        dog_raw["healthy_z_range"] = tuple(dog_raw["healthy_z_range"])
+
     run_raw = _filter_known(RunConfig, dict(raw.get("run", {}) or {}), "run")
 
     return SystemConfig(
         la_mcts=LAMCTSConfig(**la_raw),
         brl=BRLConfig(**brl_raw),
         ant_morph=AntMorphConfig(**ant_raw),
+        humanoid_morph=HumanoidMorphConfig(**hum_raw),
+        dog_morph=DogMorphConfig(**dog_raw),
         run=RunConfig(**run_raw),
     )
 
