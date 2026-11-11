@@ -121,3 +121,147 @@ def test_gate4_end_to_end_multi_seed_pipeline(tmp_path) -> None:
     assert payload["episode"] == 4
     act = loaded_agent.select_action(np.zeros(loaded_cfg.la_mcts.obs_dim, dtype=np.float32), deterministic=True)
     assert act.shape == (loaded_cfg.ant_morph.max_action_capacity,)
+
+
+def test_train_resume_and_extension_step_tracking(tmp_path) -> None:
+    """Tests crash recovery, cumulative step tracking, and episode extension (e.g. 2 -> 4 episodes)."""
+    import json
+    out_dir = tmp_path / "resume_test"
+
+    # Phase 1: Run 2 episodes
+    r1 = run_train_main(
+        [
+            "--config", "config/default_config.yaml",
+            "--seeds", "1",
+            "--episodes", "2",
+            "--max-steps", "10",
+            "--n-sim", "6",
+            "--output-dir", str(out_dir),
+        ]
+    )
+    seed_res1 = r1["seeds"][0]
+    assert seed_res1["completed_episodes"] == 2
+    assert len(seed_res1["episodes"]) == 2
+    steps_phase1 = seed_res1["total_env_steps"]
+    assert steps_phase1 > 0
+
+    prog_file = out_dir / "checkpoints" / "seed_42" / "progress.json"
+    latest_ckpt = out_dir / "checkpoints" / "seed_42" / "latest_checkpoint.pt"
+    assert prog_file.exists()
+    assert latest_ckpt.exists()
+
+    with prog_file.open("r", encoding="utf-8") as f:
+        meta1 = json.load(f)
+    assert meta1["completed_episodes"] == 2
+    assert meta1["total_env_steps"] == steps_phase1
+    assert meta1["resume_count"] == 0
+    assert not meta1["is_resumed"]
+
+    # Phase 2: Resume and extend from 2 to 4 episodes
+    r2 = run_train_main(
+        [
+            "--config", "config/default_config.yaml",
+            "--seeds", "1",
+            "--episodes", "4",
+            "--max-steps", "10",
+            "--n-sim", "6",
+            "--resume",
+            "--output-dir", str(out_dir),
+        ]
+    )
+    seed_res2 = r2["seeds"][0]
+    assert seed_res2["completed_episodes"] == 4
+    assert seed_res2["is_resumed"]
+    assert seed_res2["resume_count"] == 1
+    # Only 2 additional episodes were executed in this session!
+    assert len(seed_res2["episodes"]) == 2
+    assert seed_res2["episodes"][0]["episode"] == 3
+    assert seed_res2["episodes"][1]["episode"] == 4
+    # Cumulative steps continued growing
+    assert seed_res2["total_env_steps"] > steps_phase1
+
+    with prog_file.open("r", encoding="utf-8") as f:
+        meta2 = json.load(f)
+    assert meta2["completed_episodes"] == 4
+    assert meta2["target_episodes"] == 4
+    assert meta2["remaining_episodes"] == 0
+    assert meta2["resume_count"] == 1
+    assert meta2["is_resumed"]
+
+    # Phase 3: Resume again when already completed 4 episodes -> should skip cleanly
+    r3 = run_train_main(
+        [
+            "--config", "config/default_config.yaml",
+            "--seeds", "1",
+            "--episodes", "4",
+            "--max-steps", "10",
+            "--n-sim", "6",
+            "--resume",
+            "--output-dir", str(out_dir),
+        ]
+    )
+    seed_res3 = r3["seeds"][0]
+    assert seed_res3.get("skipped", False)
+    assert len(seed_res3["episodes"]) == 0
+    assert seed_res3["completed_episodes"] == 4
+
+
+def test_step_milestones_and_eval(tmp_path) -> None:
+    """Verifies that crossing cumulative step thresholds triggers dedicated evaluation and checkpoints."""
+    out_dir = tmp_path / "milestone_test"
+    r = run_train_main(
+        [
+            "--config", "config/default_config.yaml",
+            "--seeds", "1",
+            "--episodes", "3",
+            "--max-steps", "15",
+            "--n-sim", "6",
+            "--step-milestones", "10,25",
+            "--output-dir", str(out_dir),
+        ]
+    )
+    seed_res = r["seeds"][0]
+    ckpt_dir = out_dir / "checkpoints" / "seed_42"
+    ms_ckpts = list(ckpt_dir.glob("checkpoint_step_*.pt"))
+    assert len(ms_ckpts) >= 1
+    assert "10" in seed_res["milestone_checkpoint_paths"] or "25" in seed_res["milestone_checkpoint_paths"]
+
+
+def test_parallel_multi_seed_logging(tmp_path) -> None:
+    """Verifies that 3 parallel seeds log without crashing or garbling, and create dedicated log files."""
+    import json
+    out_dir = tmp_path / "parallel_log_test"
+    r = run_train_main(
+        [
+            "--config", "config/default_config.yaml",
+            "--seeds", "3",
+            "--parallel-seeds", "3",
+            "--episodes", "2",
+            "--max-steps", "8",
+            "--n-sim", "6",
+            "--output-dir", str(out_dir),
+        ]
+    )
+    assert len(r["seeds"]) == 3
+
+    logs_dir = out_dir / "logs"
+    assert logs_dir.exists()
+    for s_val in (42, 43, 44):
+        log_file = logs_dir / f"seed_{s_val}.log"
+        jsonl_file = logs_dir / f"seed_{s_val}_progress.jsonl"
+        assert log_file.exists(), f"Missing {log_file}"
+        assert jsonl_file.exists(), f"Missing {jsonl_file}"
+        assert log_file.stat().st_size > 0
+        assert jsonl_file.stat().st_size > 0
+
+    status_file = out_dir / "training_status.json"
+    assert status_file.exists()
+    with status_file.open("r", encoding="utf-8") as f:
+        status_data = json.load(f)
+    assert status_data["num_seeds"] == 3
+    assert "42" in status_data["seeds"]
+    assert "43" in status_data["seeds"]
+    assert "44" in status_data["seeds"]
+    for s_key in ("42", "43", "44"):
+        assert status_data["seeds"][s_key]["completed_episodes"] == 2
+        assert status_data["seeds"][s_key]["total_env_steps"] > 0
