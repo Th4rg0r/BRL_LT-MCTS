@@ -2,6 +2,7 @@
 
 from la_mcts.backbone import SubStateTokenizer, SelfAttentionBackbone, min_max_normalize
 from la_mcts.gmm_heads import (
+    MorphologicalLimbHead,
     MultiPeakGMMActorHead,
     SupportCriticHead,
     TanhMixtureSameFamily,
@@ -16,6 +17,7 @@ __all__ = [
     "SubStateTokenizer",
     "SelfAttentionBackbone",
     "min_max_normalize",
+    "MorphologicalLimbHead",
     "MultiPeakGMMActorHead",
     "SupportCriticHead",
     "TanhMixtureSameFamily",

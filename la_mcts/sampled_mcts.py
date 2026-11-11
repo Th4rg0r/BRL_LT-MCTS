@@ -132,6 +132,7 @@ class SampledContinuousMCTS:
         temperature: float,
         value_prefix: float = 0.0,
         action_mask: Optional[torch.Tensor] = None,
+        limb_kinematics: Optional[torch.Tensor] = None,
     ) -> MCTSNode:
         """Evaluates actor and critic heads on a single latent state to initialize an MCTSNode."""
         sampled_actions, prior_weights_t = self.actor_head.sample_actions(
@@ -139,6 +140,7 @@ class SampledContinuousMCTS:
             k_act=self.k_act,
             temperature=temperature,
             action_mask=action_mask,
+            limb_kinematics=limb_kinematics,
         )
         v_val = float(self.critic_head(z_state.unsqueeze(0)).squeeze().item())
         return MCTSNode(
@@ -156,6 +158,7 @@ class SampledContinuousMCTS:
         tau_act: Optional[float] = None,
         n_sim: Optional[int] = None,
         action_mask: Optional[torch.Tensor] = None,
+        limb_kinematics: Optional[torch.Tensor] = None,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, MCTSNode]:
         """Executes N_sim MCTS simulations from z_root using virtual-loss leaf batching.
 
@@ -179,6 +182,7 @@ class SampledContinuousMCTS:
                 temperature=self.root_tau_beta,
                 value_prefix=0.0,
                 action_mask=action_mask,
+                limb_kinematics=limb_kinematics,
             )
             min_max_stats.update(root.v_value)
 
@@ -239,6 +243,7 @@ class SampledContinuousMCTS:
                     k_act=self.k_act,
                     temperature=self.inner_tau_beta,
                     action_mask=action_mask,
+                    limb_kinematics=limb_kinematics,
                 )
 
                 r_np = r_hat_batch.squeeze(-1).detach().cpu().numpy()

@@ -293,6 +293,27 @@ class MorphologicalDogBRLWrapper(gym.Env):
 
         return obs
 
+    def get_limb_kinematics(self) -> np.ndarray:
+        """Computes body-relative anchor (x,y,z) and instantaneous pointing (yaw, pitch) for 4 legs."""
+        torso_xpos = self.data.xpos[self.torso_body_id]
+        torso_xmat = self.data.xmat[self.torso_body_id].reshape(3, 3)
+        legs = ["fr", "fl", "rr", "rl"]
+        k_list = []
+        for l in legs:
+            a_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, f"{l}_hip")
+            f_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, f"{l}_calf")
+            if a_id >= 0 and f_id >= 0:
+                a_pos = torso_xmat.T @ (self.data.xpos[a_id] - torso_xpos)
+                d_pos = torso_xmat.T @ (self.data.xpos[f_id] - torso_xpos)
+                v = d_pos - a_pos
+                u = v / max(float(np.linalg.norm(v)), 1e-6)
+                yaw = float((np.arctan2(u[1], u[0]) + np.pi) / (2.0 * np.pi)) % 1.0
+                pitch = float((np.arcsin(np.clip(u[2], -1.0, 1.0)) + np.pi / 2.0) / np.pi)
+                k_list.append([float(a_pos[0]), float(a_pos[1]), float(a_pos[2]), yaw, pitch])
+            else:
+                k_list.append([0.188, -0.08, 0.0, 0.064, 0.286])
+        return np.array(k_list, dtype=np.float32)
+
     def reset(
         self,
         *,
@@ -352,6 +373,7 @@ class MorphologicalDogBRLWrapper(gym.Env):
             "perceived_tweak_vector": self.perception_filter.perceived_context_vector.astype(np.float32),
             "perceived_leg_scales": self.perception_filter.perceived_leg_scales.astype(np.float32),
             "perception_metrics": perc_metrics,
+            "limb_kinematics": self.get_limb_kinematics(),
             "torso_mass": float(self.model.body_mass[self.torso_body_id]),
             "healthy": True,
         }
@@ -433,6 +455,7 @@ class MorphologicalDogBRLWrapper(gym.Env):
             "tweak_vector": self._current_tweak.copy(),
             "perceived_tweak_vector": self.perception_filter.perceived_context_vector.astype(np.float32),
             "perception_metrics": perc_metrics,
+            "limb_kinematics": self.get_limb_kinematics(),
             "healthy": is_healthy,
             "brl_metrics": {
                 "forward_reward": float(forward_reward),

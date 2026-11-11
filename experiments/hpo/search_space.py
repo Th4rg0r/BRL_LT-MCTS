@@ -255,7 +255,7 @@ HYPERPARAM_SPECS: Tuple[HyperparamSpec, ...] = (
         tier="B",
         kind="float",
         default=1.0,
-        low=0.5,
+        low=0.1,
         high=1.5,
         description="Root visit count temperature during training",
     ),

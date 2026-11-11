@@ -327,6 +327,33 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         noisy_obs = obs + noise
         return np.clip(noisy_obs, -100.0, 100.0).astype(np.float32)
 
+    def get_limb_kinematics(self) -> np.ndarray:
+        """Computes body-relative anchor (x,y,z) and instantaneous pointing (yaw, pitch) for all legs."""
+        model = self.mj_model
+        data = self.mj_data
+        torso_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "torso")
+        if torso_id < 0:
+            torso_id = 1
+        torso_xpos = data.xpos[torso_id]
+        torso_xmat = data.xmat[torso_id].reshape(3, 3)
+
+        k_list = []
+        for i in range(1, self.current_num_legs + 1):
+            a_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"aux_{i}")
+            f_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"foot_{i}")
+            if a_id >= 0 and f_id >= 0:
+                a_pos = torso_xmat.T @ (data.xpos[a_id] - torso_xpos)
+                d_pos = torso_xmat.T @ (data.xpos[f_id] - torso_xpos)
+                v = d_pos - a_pos
+                u = v / max(float(np.linalg.norm(v)), 1e-6)
+                yaw = float((np.arctan2(u[1], u[0]) + np.pi) / (2.0 * np.pi)) % 1.0
+                pitch = float((np.arcsin(np.clip(u[2], -1.0, 1.0)) + np.pi / 2.0) / np.pi)
+                k_list.append([float(a_pos[0]), float(a_pos[1]), float(a_pos[2]), yaw, pitch])
+            else:
+                angle = (float(i - 1) / float(self.current_num_legs)) * 2.0 * math.pi
+                k_list.append([0.2 * math.cos(angle), 0.2 * math.sin(angle), 0.0, (angle / (2.0 * math.pi)) % 1.0, 0.5])
+        return np.array(k_list, dtype=np.float32)
+
     def reset(
         self,
         *,
@@ -394,6 +421,7 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         info["perceived_tweak_vector"] = np.asarray(self.perception_filter.perceived_context_vector, dtype=np.float32)
         info["perceived_leg_scales"] = np.asarray(self.perception_filter.perceived_leg_scales, dtype=np.float32)
         info["perception_metrics"] = perc_metrics
+        info["limb_kinematics"] = self.get_limb_kinematics()
         info["num_legs"] = self.current_num_legs
         return obs_distorted, info
 
@@ -477,6 +505,7 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         info["morphology_mask"] = morph_mask
         info["perception_metrics"] = perc_metrics
         info["perceived_tweak_vector"] = self.perception_filter.perceived_context_vector.astype(np.float32)
+        info["limb_kinematics"] = self.get_limb_kinematics()
         info["brl_metrics"] = {
             "x_velocity": float(mean_x_vel),
             "total_distance": float(total_dist),

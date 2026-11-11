@@ -24,14 +24,14 @@ la_mcts:
   lambda_r: 1.0
   lambda_p: 1.0
   c_reg: 0.0001
-  n_sim: 50
-  n_sim_eval: 100
+  n_sim: 32
+  n_sim_eval: 64
   k_act: 16
   c_1: 1.25
   c_2: 19652.0
-  root_tau_beta: 1.25
+  root_tau_beta: 1.0
   inner_tau_beta: 1.0
-  tau_act_train: 1.0
+  tau_act_train: 0.3
   tau_act_eval: 0.05
   lr: 0.0003
   batch_size: 128
@@ -52,7 +52,7 @@ brl:
   target_win_rate: 0.50
   ema_beta_w: 0.05
   tau_s: 500.0
-  initial_r_ref: 1000.0
+  initial_r_ref: 500.0
   benchmark_r_ref: 6169.54
   window_k_w: 20
   alpha_eq: 10.0
@@ -67,9 +67,9 @@ brl:
   beta_score: 1.0
   eta_viol: 2.0
   beta_ent: 0.01
-  warmup_episodes: 50
-  brl_episodes: 2500
-  total_episodes: 3000
+  warmup_episodes: 30
+  brl_episodes: 470
+  total_episodes: 500
   warmup_limit: 50.0
   warmup_budget: 100.0
 
@@ -86,10 +86,10 @@ ant_morph:
 run:
   seeds: 3
   seed_offset: 42
-  episodes: 0          # 0 = brl.total_episodes
+  episodes: 500          # 0 = brl.total_episodes
   max_steps: 0         # 0 = ant_morph.max_episode_steps
   device: "cuda"
-  eval_interval: 0     # 0 = min(10, episodes)
-  checkpoint_interval: 500 # Periodic milestone checkpoint interval in episodes
+  eval_interval: 10     # Evaluate every 10 episodes
+  checkpoint_interval: 100 # Periodic milestone checkpoint interval in episodes
   parallel_seeds: 3
   gpu_mem_fraction: 0.0

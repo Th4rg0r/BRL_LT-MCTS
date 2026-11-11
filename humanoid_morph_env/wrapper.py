@@ -206,6 +206,42 @@ class MorphologicalHumanoidBRLWrapper(gym.Wrapper):
 
         mujoco.mj_setConst(model, data)
 
+    def get_limb_kinematics(self) -> np.ndarray:
+        """Computes body-relative anchor (x,y,z) and instantaneous pointing (yaw, pitch) for waist, legs, and arms."""
+        model = self.mj_model
+        data = self.mj_data
+        torso_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "torso")
+        if torso_id < 0:
+            torso_id = 1
+        torso_xpos = data.xpos[torso_id]
+        torso_xmat = data.xmat[torso_id].reshape(3, 3)
+
+        specs = [
+            ("waist", None, None),
+            ("right_leg", "right_thigh", "right_foot"),
+            ("left_leg", "left_thigh", "left_foot"),
+            ("right_arm", "right_upper_arm", "right_lower_arm"),
+            ("left_arm", "left_upper_arm", "left_lower_arm"),
+        ]
+        k_list = []
+        for name, a_name, d_name in specs:
+            if a_name is None:
+                k_list.append([0.0, 0.0, 0.0, 0.5, 0.5])
+            else:
+                a_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, a_name)
+                d_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, d_name)
+                if a_id >= 0 and d_id >= 0:
+                    a_pos = torso_xmat.T @ (data.xpos[a_id] - torso_xpos)
+                    d_pos = torso_xmat.T @ (data.xpos[d_id] - torso_xpos)
+                    v = d_pos - a_pos
+                    u = v / max(float(np.linalg.norm(v)), 1e-6)
+                    yaw = float((np.arctan2(u[1], u[0]) + np.pi) / (2.0 * np.pi)) % 1.0
+                    pitch = float((np.arcsin(np.clip(u[2], -1.0, 1.0)) + np.pi / 2.0) / np.pi)
+                    k_list.append([float(a_pos[0]), float(a_pos[1]), float(a_pos[2]), yaw, pitch])
+                else:
+                    k_list.append([0.0, 0.0, 0.0, 0.5, 0.5])
+        return np.array(k_list, dtype=np.float32)
+
     def reset(
         self,
         *,
@@ -262,6 +298,7 @@ class MorphologicalHumanoidBRLWrapper(gym.Wrapper):
         info["perceived_tweak_vector"] = self.perception_filter.perceived_context_vector.astype(np.float32)
         info["perceived_leg_scales"] = self.perception_filter.perceived_leg_scales.astype(np.float32)
         info["perception_metrics"] = perc_metrics
+        info["limb_kinematics"] = self.get_limb_kinematics()
         info["torso_mass"] = float(self.mj_model.body_mass[self._torso_bodies[0]]) if self._torso_bodies else float(np.sum(self.mj_model.body_mass))
         info["brl_metrics"] = {
             "x_velocity": 0.0,
@@ -333,6 +370,7 @@ class MorphologicalHumanoidBRLWrapper(gym.Wrapper):
         info["tweak_vector"] = self.current_tweak.copy()
         info["perceived_tweak_vector"] = self.perception_filter.perceived_context_vector.astype(np.float32)
         info["perception_metrics"] = perc_metrics
+        info["limb_kinematics"] = self.get_limb_kinematics()
         info["torso_mass"] = float(self.mj_model.body_mass[self._torso_bodies[0]]) if self._torso_bodies else float(np.sum(self.mj_model.body_mass))
         info["brl_metrics"] = {
             "x_velocity": float(x_vel),

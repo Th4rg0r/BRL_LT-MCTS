@@ -104,8 +104,187 @@ class TanhMixtureSameFamily:
         return log_p_u - jacobian
 
 
+class MorphologicalLimbHead(nn.Module):
+    """Universal Morphological Limb Network f_phi(z_t, k_i(t)).
+
+    Receives the central overall latent representation z_t and an 8D harmonic kinematic
+    embedding of the limb's 3D body anchor (x, y, z) and instantaneous pointing direction
+    (phi_yaw, phi_pitch) relative to the torso coordinate frame.
+    Outputs the joint distribution parameters (mu, log_std) for that specific limb.
+    """
+
+    def __init__(
+        self,
+        latent_dim: int = 256,
+        num_peaks: int = 5,
+        max_joints_per_limb: int = 4,
+        hidden_dim: int = 128,
+        log_std_bounds: Tuple[float, float] = (-3.0, 2.0),
+    ) -> None:
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.num_peaks = num_peaks
+        self.max_joints_per_limb = max_joints_per_limb
+        self.hidden_dim = hidden_dim
+        self.log_std_bounds = log_std_bounds
+
+        # 8D geometric query embedding:
+        # [x, y, z, yaw, cos(2*pi*yaw), sin(2*pi*yaw), pitch, sin(pi*pitch)]
+        self.geom_dim = 8
+        in_dim = latent_dim + self.geom_dim
+
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+        )
+        self.mu_head = nn.Linear(hidden_dim, num_peaks * max_joints_per_limb)
+        self.log_std_head = nn.Linear(hidden_dim, num_peaks * max_joints_per_limb)
+
+    @staticmethod
+    def encode_kinematics(kinematics: torch.Tensor) -> torch.Tensor:
+        """Projects (..., 5) [x, y, z, yaw, pitch] into (..., 8) harmonic kinematic representation."""
+        x = kinematics[..., 0:1]
+        y = kinematics[..., 1:2]
+        z = kinematics[..., 2:3]
+        yaw = kinematics[..., 3:4]
+        pitch = kinematics[..., 4:5]
+
+        two_pi_yaw = 2.0 * math.pi * yaw
+        pi_pitch = math.pi * pitch
+
+        cos_yaw = torch.cos(two_pi_yaw)
+        sin_yaw = torch.sin(two_pi_yaw)
+        sin_pitch = torch.sin(pi_pitch)
+
+        return torch.cat([x, y, z, yaw, cos_yaw, sin_yaw, pitch, sin_pitch], dim=-1)
+
+    def forward_single_limb(
+        self,
+        z_t: torch.Tensor,
+        anchor: Tuple[float, float, float] | Sequence[float] | torch.Tensor,
+        yaw: float | torch.Tensor,
+        pitch: float | torch.Tensor,
+        num_joints: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Computes (mu, log_std) for a single queried limb given its 3D anchor and direction angles."""
+        device = z_t.device
+        dtype = z_t.dtype
+        if not torch.is_tensor(anchor):
+            anchor_t = torch.tensor(anchor, dtype=dtype, device=device)
+        else:
+            anchor_t = anchor.to(device=device, dtype=dtype)
+        if not torch.is_tensor(yaw):
+            yaw_t = torch.tensor([yaw], dtype=dtype, device=device)
+        else:
+            yaw_t = yaw.to(device=device, dtype=dtype).view(-1)
+        if not torch.is_tensor(pitch):
+            pitch_t = torch.tensor([pitch], dtype=dtype, device=device)
+        else:
+            pitch_t = pitch.to(device=device, dtype=dtype).view(-1)
+
+        kin_5d = torch.cat([anchor_t.view(-1, 3), yaw_t.view(-1, 1), pitch_t.view(-1, 1)], dim=-1)
+        geom = self.encode_kinematics(kin_5d)
+
+        if z_t.dim() == 1:
+            z_t_in = z_t.unsqueeze(0)
+        else:
+            z_t_in = z_t
+
+        bsz = z_t_in.shape[0]
+        if geom.shape[0] == 1 and bsz > 1:
+            geom = geom.expand(bsz, -1)
+
+        feat = torch.cat([z_t_in, geom], dim=-1)
+        h = self.mlp(feat)
+
+        mu_raw = self.mu_head(h).view(bsz, self.num_peaks, self.max_joints_per_limb)
+        log_std_raw = self.log_std_head(h).view(bsz, self.num_peaks, self.max_joints_per_limb)
+
+        n_j = num_joints if num_joints is not None else self.max_joints_per_limb
+        mu_raw = mu_raw[..., :n_j]
+        log_std_raw = log_std_raw[..., :n_j]
+
+        if z_t.dim() == 1:
+            return mu_raw.squeeze(0), log_std_raw.squeeze(0)
+        return mu_raw, log_std_raw
+
+    def forward_all_limbs(
+        self,
+        z_t: torch.Tensor,
+        limb_kinematics: torch.Tensor,
+        limb_joint_counts: Optional[Sequence[int]] = None,
+        target_action_dim: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Vectorized forward pass over all creature limbs simultaneously."""
+        orig_shape = z_t.shape[:-1]
+        z_flat = z_t.view(-1, self.latent_dim)
+        bsz = z_flat.shape[0]
+
+        if limb_kinematics.dim() == 2:
+            n_limbs = limb_kinematics.shape[0]
+            kin_flat = limb_kinematics.unsqueeze(0).expand(bsz, n_limbs, 5)
+        elif limb_kinematics.dim() == 3:
+            n_limbs = limb_kinematics.shape[-2]
+            kin_flat = limb_kinematics.view(bsz, n_limbs, 5)
+        else:
+            raise ValueError(f"Unsupported limb_kinematics shape: {limb_kinematics.shape}")
+
+        geom_emb = self.encode_kinematics(kin_flat)  # (bsz, n_limbs, 8)
+        z_expanded = z_flat.unsqueeze(1).expand(bsz, n_limbs, self.latent_dim)
+
+        combined = torch.cat([z_expanded, geom_emb], dim=-1)  # (bsz, n_limbs, latent_dim + 8)
+        h = self.mlp(combined)  # (bsz, n_limbs, hidden_dim)
+
+        mu_limbs = self.mu_head(h).view(bsz, n_limbs, self.num_peaks, self.max_joints_per_limb)
+        log_std_limbs = self.log_std_head(h).view(bsz, n_limbs, self.num_peaks, self.max_joints_per_limb)
+
+        # Transpose to (bsz, num_peaks, n_limbs, max_joints_per_limb)
+        mu_limbs = mu_limbs.permute(0, 2, 1, 3)
+        log_std_limbs = log_std_limbs.permute(0, 2, 1, 3)
+
+        if limb_joint_counts is not None:
+            pieces_mu = []
+            pieces_std = []
+            for i, j_count in enumerate(limb_joint_counts):
+                if i < n_limbs:
+                    pieces_mu.append(mu_limbs[:, :, i, :j_count])
+                    pieces_std.append(log_std_limbs[:, :, i, :j_count])
+            mu_assembled = torch.cat(pieces_mu, dim=-1)
+            log_std_assembled = torch.cat(pieces_std, dim=-1)
+        else:
+            mu_assembled = mu_limbs.reshape(bsz, self.num_peaks, n_limbs * self.max_joints_per_limb)
+            log_std_assembled = log_std_limbs.reshape(bsz, self.num_peaks, n_limbs * self.max_joints_per_limb)
+
+        if target_action_dim is not None:
+            cur_dim = mu_assembled.shape[-1]
+            if cur_dim < target_action_dim:
+                pad_size = target_action_dim - cur_dim
+                mu_pad = torch.zeros(bsz, self.num_peaks, pad_size, device=z_t.device, dtype=z_t.dtype)
+                std_pad = torch.zeros(bsz, self.num_peaks, pad_size, device=z_t.device, dtype=z_t.dtype)
+                mu_assembled = torch.cat([mu_assembled, mu_pad], dim=-1)
+                log_std_assembled = torch.cat([log_std_assembled, std_pad], dim=-1)
+            elif cur_dim > target_action_dim:
+                mu_assembled = mu_assembled[..., :target_action_dim]
+                log_std_assembled = log_std_assembled[..., :target_action_dim]
+
+        if orig_shape:
+            mu_assembled = mu_assembled.view(*orig_shape, self.num_peaks, mu_assembled.shape[-1])
+            log_std_assembled = log_std_assembled.view(*orig_shape, self.num_peaks, log_std_assembled.shape[-1])
+
+        return mu_assembled, log_std_assembled
+
+
 class MultiPeakGMMActorHead(nn.Module):
-    """Multi-Peak Gaussian Mixture Model Actor Head operating directly on z_t."""
+    """Multi-Peak Gaussian Mixture Model Actor Head operating directly on z_t.
+
+    Supports universal parameter sharing across limbs via MorphologicalLimbHead,
+    evaluating limbs in parallel using their 3D connection anchor (x, y, z) and
+    instantaneous pointing direction (yaw, pitch).
+    """
 
     def __init__(
         self,
@@ -113,32 +292,113 @@ class MultiPeakGMMActorHead(nn.Module):
         action_dim: int = 8,
         num_peaks: int = 5,
         log_std_bounds: Tuple[float, float] = (-3.0, 2.0),
+        use_morphological_limbs: bool = True,
+        joints_per_limb: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.latent_dim = latent_dim
         self.action_dim = action_dim
         self.num_peaks = num_peaks
         self.log_std_bounds = log_std_bounds
+        self.use_morphological_limbs = use_morphological_limbs
 
-        # Strictly three direct linear layers from z_t without intermediate hidden layers
+        # Mixture mode selection logits net
         self.logits_net = nn.Linear(latent_dim, num_peaks)
+
+        # Baseline direct linear layers (for legacy fallback)
         self.mu_net = nn.Linear(latent_dim, num_peaks * action_dim)
         self.log_std_net = nn.Linear(latent_dim, num_peaks * action_dim)
 
+        # Configure default kinematics and joint partitioning based on action_dim
+        if action_dim == 8:
+            # Ant (4 legs, 2 joints each)
+            self.default_joint_counts = [2, 2, 2, 2]
+            max_j = 2
+            def_kin = torch.tensor([
+                [ 0.2,  0.2, 0.0, 0.625, 0.50],
+                [-0.2,  0.2, 0.0, 0.875, 0.50],
+                [-0.2, -0.2, 0.0, 0.125, 0.50],
+                [ 0.2, -0.2, 0.0, 0.375, 0.50],
+            ], dtype=torch.float32)
+        elif action_dim == 12:
+            # Dog / Hexapod (4 legs * 3 joints, or 6 legs * 2 joints)
+            self.default_joint_counts = [3, 3, 3, 3]
+            max_j = 3
+            def_kin = torch.tensor([
+                [ 0.188, -0.08, 0.0, 0.064, 0.286],
+                [ 0.188,  0.08, 0.0, 0.938, 0.260],
+                [-0.188, -0.08, 0.0, 0.060, 0.256],
+                [-0.188,  0.08, 0.0, 0.946, 0.261],
+            ], dtype=torch.float32)
+        elif action_dim == 17:
+            # Humanoid (waist: 3, r_leg: 4, l_leg: 4, r_arm: 3, l_arm: 3)
+            self.default_joint_counts = [3, 4, 4, 3, 3]
+            max_j = 4
+            def_kin = torch.tensor([
+                [ 0.000,  0.000,  0.000, 0.500, 0.500],
+                [-0.010, -0.100, -0.465, 0.741, 0.008],
+                [-0.008,  0.100, -0.465, 0.364, 0.004],
+                [ 0.000, -0.170,  0.060, 0.376, 0.303],
+                [ 0.000,  0.170,  0.060, 0.623, 0.302],
+            ], dtype=torch.float32)
+        else:
+            j_per = max(1, action_dim // 4)
+            rem = action_dim - j_per * 3
+            self.default_joint_counts = [j_per, j_per, j_per, rem]
+            max_j = max(j_per, rem)
+            def_kin = torch.tensor([
+                [ 0.2,  0.2, 0.0, 0.125, 0.50],
+                [-0.2,  0.2, 0.0, 0.875, 0.50],
+                [-0.2, -0.2, 0.0, 0.375, 0.50],
+                [ 0.2, -0.2, 0.0, 0.625, 0.50],
+            ], dtype=torch.float32)
+
+        self.register_buffer("default_limb_kinematics", def_kin)
+
+        effective_max_j = joints_per_limb if joints_per_limb is not None else max_j
+        self.limb_head = MorphologicalLimbHead(
+            latent_dim=latent_dim,
+            num_peaks=num_peaks,
+            max_joints_per_limb=effective_max_j,
+            hidden_dim=128,
+            log_std_bounds=log_std_bounds,
+        )
+
     def get_distribution_params(
-        self, z_t: torch.Tensor, temperature: float = 1.0
+        self,
+        z_t: torch.Tensor,
+        temperature: float = 1.0,
+        limb_kinematics: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Projects z_t -> (logits, mu, std) with soft-clamped means and bounded log_std."""
         batch_shape = z_t.shape[:-1]
         logits = self.logits_net(z_t)
-        mu_raw = self.mu_net(z_t).view(*batch_shape, self.num_peaks, self.action_dim)
-        mu = 5.0 * torch.tanh(mu_raw / 5.0)
 
-        log_std = self.log_std_net(z_t).view(*batch_shape, self.num_peaks, self.action_dim)
-        log_std = torch.clamp(
-            log_std, min=self.log_std_bounds[0], max=self.log_std_bounds[1]
-        )
-        std = torch.exp(log_std)
+        if self.use_morphological_limbs:
+            kin = limb_kinematics
+            if kin is None:
+                kin = self.default_limb_kinematics.to(z_t.device)
+            elif not torch.is_tensor(kin):
+                kin = torch.as_tensor(kin, dtype=torch.float32, device=z_t.device)
+
+            n_limbs = kin.shape[-2]
+            counts = self.default_joint_counts if len(self.default_joint_counts) == n_limbs else None
+            mu_raw, log_std_raw = self.limb_head.forward_all_limbs(
+                z_t, kin, limb_joint_counts=counts, target_action_dim=self.action_dim
+            )
+            mu = 5.0 * torch.tanh(mu_raw / 5.0)
+            log_std = torch.clamp(
+                log_std_raw, min=self.log_std_bounds[0], max=self.log_std_bounds[1]
+            )
+            std = torch.exp(log_std)
+        else:
+            mu_raw = self.mu_net(z_t).view(*batch_shape, self.num_peaks, self.action_dim)
+            mu = 5.0 * torch.tanh(mu_raw / 5.0)
+            log_std = self.log_std_net(z_t).view(*batch_shape, self.num_peaks, self.action_dim)
+            log_std = torch.clamp(
+                log_std, min=self.log_std_bounds[0], max=self.log_std_bounds[1]
+            )
+            std = torch.exp(log_std)
 
         if temperature != 1.0 and temperature > 0.0:
             logits = logits / temperature
@@ -150,11 +410,57 @@ class MultiPeakGMMActorHead(nn.Module):
 
         return logits, mu, std
 
+    def get_limb_action(
+        self,
+        z_t: torch.Tensor,
+        anchor: Tuple[float, float, float] | Sequence[float],
+        yaw: float,
+        pitch: float,
+        num_joints: Optional[int] = None,
+        deterministic: bool = False,
+    ) -> torch.Tensor:
+        """Queries movements for a specific limb given anchor (x,y,z) and angles (yaw, pitch)."""
+        logits = self.logits_net(z_t)
+        mu_raw, log_std_raw = self.limb_head.forward_single_limb(
+            z_t, anchor=anchor, yaw=yaw, pitch=pitch, num_joints=num_joints
+        )
+        mu = 5.0 * torch.tanh(mu_raw / 5.0)
+        std = torch.exp(
+            torch.clamp(log_std_raw, min=self.log_std_bounds[0], max=self.log_std_bounds[1])
+        )
+
+        if deterministic:
+            best_mode = torch.argmax(logits, dim=-1)
+            if z_t.dim() == 1:
+                u = mu[best_mode]
+            else:
+                idx = best_mode.unsqueeze(-1).unsqueeze(-1).expand(*best_mode.shape, 1, mu.shape[-1])
+                u = torch.gather(mu, dim=-2, index=idx).squeeze(-2)
+        else:
+            probs = F.softmax(logits, dim=-1)
+            dist = D.Categorical(probs=probs)
+            mode_idx = dist.sample()
+            if z_t.dim() == 1:
+                chosen_mu = mu[mode_idx]
+                chosen_std = std[mode_idx]
+            else:
+                idx = mode_idx.unsqueeze(-1).unsqueeze(-1).expand(*mode_idx.shape, 1, mu.shape[-1])
+                chosen_mu = torch.gather(mu, dim=-2, index=idx).squeeze(-2)
+                chosen_std = torch.gather(std, dim=-2, index=idx).squeeze(-2)
+            u = chosen_mu + chosen_std * torch.randn_like(chosen_mu)
+
+        return torch.tanh(u)
+
     def forward(
-        self, z_t: torch.Tensor, temperature: float = 1.0
+        self,
+        z_t: torch.Tensor,
+        temperature: float = 1.0,
+        limb_kinematics: Optional[torch.Tensor] = None,
     ) -> TanhMixtureSameFamily:
         """Returns the TanhMixtureSameFamily distribution for latent state z_t."""
-        logits, mu, std = self.get_distribution_params(z_t, temperature=temperature)
+        logits, mu, std = self.get_distribution_params(
+            z_t, temperature=temperature, limb_kinematics=limb_kinematics
+        )
         return TanhMixtureSameFamily(logits=logits, mu=mu, std=std)
 
     def _fast_log_prob_u(
@@ -198,6 +504,7 @@ class MultiPeakGMMActorHead(nn.Module):
         k_act: int = 16,
         temperature: float = 1.0,
         action_mask: Optional[torch.Tensor] = None,
+        limb_kinematics: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Samples K_act actions from beta(. | z_t) and returns (actions, prior_weights).
 
@@ -209,7 +516,7 @@ class MultiPeakGMMActorHead(nn.Module):
 
         bsz = z_t.shape[0]
         logits_prop, mu_prop, std_prop = self.get_distribution_params(
-            z_t, temperature=temperature
+            z_t, temperature=temperature, limb_kinematics=limb_kinematics
         )
         probs = F.softmax(logits_prop, dim=-1)  # (B, M)
         # Draw K_act mixture indices per batch item: (B, K_act)
@@ -232,7 +539,7 @@ class MultiPeakGMMActorHead(nn.Module):
             )
         else:
             logits_targ, mu_targ, std_targ = self.get_distribution_params(
-                z_t, temperature=1.0
+                z_t, temperature=1.0, limb_kinematics=limb_kinematics
             )
             log_pi_u = self._fast_log_prob_u(
                 u, logits_targ, mu_targ, std_targ, action_mask=action_mask
@@ -254,9 +561,10 @@ class MultiPeakGMMActorHead(nn.Module):
         actions: torch.Tensor,
         action_mask: Optional[torch.Tensor] = None,
         temperature: float = 1.0,
+        limb_kinematics: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Evaluates exact log_prob(actions | z_t) supporting both (B, N) and (B, K_act, N)."""
-        dist = self.forward(z_t, temperature=temperature)
+        dist = self.forward(z_t, temperature=temperature, limb_kinematics=limb_kinematics)
         if actions.dim() == z_t.dim() + 1:
             # actions is (B, K_act, N), dist batch is (B,)
             a_trans = actions.transpose(0, 1)  # (K_act, B, N)

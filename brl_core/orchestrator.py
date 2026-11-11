@@ -96,9 +96,12 @@ class BRLTrainingOrchestrator:
             np.ones(self.cfg.la_mcts.max_action_dim, dtype=np.float32),
         )
         perceived_tweak = reset_info.get("perceived_tweak_vector", w_proj)
+        limb_kinematics = reset_info.get("limb_kinematics", None)
         if hasattr(self.agent, "set_episode_context"):
             self.agent.set_episode_context(
-                tweak_vector=perceived_tweak, action_mask=morph_mask
+                tweak_vector=perceived_tweak,
+                action_mask=morph_mask,
+                limb_kinematics=limb_kinematics,
             )
 
         # 4. Agent interacts with environment E(w_e)
@@ -111,7 +114,9 @@ class BRLTrainingOrchestrator:
         agent_metrics: Dict[str, float] = {}
 
         while steps < step_limit:
-            action = self.agent.select_action(obs, deterministic=False)
+            action = self.agent.select_action(
+                obs, deterministic=False, limb_kinematics=last_info.get("limb_kinematics")
+            )
             next_obs, reward, terminated, truncated, info = self.env.step(action)
             self.agent.observe_transition(
                 obs, action, float(reward), next_obs, terminated, truncated, info

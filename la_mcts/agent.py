@@ -33,6 +33,7 @@ class EpisodeTrajectory:
     action_mask: np.ndarray = field(
         default_factory=lambda: np.ones(17, dtype=np.float32)
     )
+    limb_kinematics: Optional[np.ndarray] = None
 
     def __len__(self) -> int:
         return len(self.rewards)
@@ -89,6 +90,9 @@ class TrajectoryReplayBuffer:
         self.max_action_dim = max_action_dim
         self.trajectories: Deque[EpisodeTrajectory] = deque()
         self.total_steps: int = 0
+
+    def __len__(self) -> int:
+        return len(self.trajectories)
 
     def add_trajectory(self, traj: EpisodeTrajectory) -> None:
         if len(traj) == 0:
@@ -295,12 +299,14 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
         # Active episode state
         self.current_context = np.zeros(self.cfg.context_dim, dtype=np.float32)
         self.current_action_mask = np.ones(self.cfg.max_action_dim, dtype=np.float32)
+        self.current_limb_kinematics: Optional[np.ndarray] = None
         self.episode_history_deque: Deque[Tuple[np.ndarray, np.ndarray]] = deque(
             maxlen=self.cfg.history_len
         )
         self.current_trajectory = EpisodeTrajectory(
             context=self.current_context.copy(),
             action_mask=self.current_action_mask.copy(),
+            limb_kinematics=None,
         )
         self._last_mcts_info: Optional[Tuple[np.ndarray, np.ndarray, float]] = None
         self._diagnostics: Dict[str, float] = {
@@ -314,8 +320,9 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
         self,
         tweak_vector: Optional[np.ndarray] = None,
         action_mask: Optional[np.ndarray] = None,
+        limb_kinematics: Optional[np.ndarray] = None,
     ) -> None:
-        """Sets the context token (normalized tweak vector w_e / 1000) and morphology mask."""
+        """Sets the context token (normalized tweak vector w_e / 1000), morphology mask, and limb kinematics."""
         if tweak_vector is not None:
             norm_w = np.asarray(tweak_vector, dtype=np.float32) / 1000.0
             if norm_w.shape[0] < self.cfg.context_dim:
@@ -326,10 +333,15 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             if mask.shape[0] < self.cfg.max_action_dim:
                 mask = np.pad(mask, (0, self.cfg.max_action_dim - mask.shape[0]))
             self.current_action_mask = mask[: self.cfg.max_action_dim].copy()
+        if limb_kinematics is not None:
+            self.current_limb_kinematics = np.asarray(limb_kinematics, dtype=np.float32).copy()
 
         self.episode_history_deque.clear()
         self.current_trajectory.context = self.current_context.copy()
         self.current_trajectory.action_mask = self.current_action_mask.copy()
+        self.current_trajectory.limb_kinematics = (
+            self.current_limb_kinematics.copy() if self.current_limb_kinematics is not None else None
+        )
 
     def _align_obs(self, obs: np.ndarray) -> np.ndarray:
         obs_arr = np.asarray(obs, dtype=np.float32).flatten()
@@ -352,9 +364,15 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             hist.reshape(1, -1), dtype=torch.float32, device=self.device
         )
 
-    def select_action(self, obs: np.ndarray, deterministic: bool = False) -> np.ndarray:
+    def select_action(
+        self,
+        obs: np.ndarray,
+        deterministic: bool = False,
+        limb_kinematics: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
         """Runs Sampled Continuous MCTS from z_t = backbone(obs, context, history) to choose an action."""
         obs_aligned = self._align_obs(obs)
+        active_kin = limb_kinematics if limb_kinematics is not None else self.current_limb_kinematics
         with torch.inference_mode():
             obs_t = torch.as_tensor(
                 obs_aligned, dtype=torch.float32, device=self.device
@@ -365,6 +383,11 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             hist_t = self._get_current_history_tensor()
             mask_t = torch.as_tensor(
                 self.current_action_mask, dtype=torch.float32, device=self.device
+            )
+            kin_t = (
+                torch.as_tensor(active_kin, dtype=torch.float32, device=self.device)
+                if active_kin is not None
+                else None
             )
 
             z_root = self.backbone(obs_t, context=ctx_t, history=hist_t).squeeze(0)
@@ -378,6 +401,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                     tau_act=tau_act,
                     n_sim=n_sim,
                     action_mask=mask_t,
+                    limb_kinematics=kin_t,
                 )
             )
 
@@ -386,6 +410,36 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             self._diagnostics["v_s0"] = float(root_value)
 
         return chosen_action * self.current_action_mask
+
+    def get_limb_movement(
+        self,
+        obs: np.ndarray,
+        anchor: Tuple[float, float, float] | Sequence[float],
+        yaw: float,
+        pitch: float,
+        num_joints: Optional[int] = None,
+        deterministic: bool = False,
+    ) -> np.ndarray:
+        """Computes movement action vector for a specific limb from its 3D anchor and direction angles."""
+        obs_aligned = self._align_obs(obs)
+        with torch.inference_mode():
+            obs_t = torch.as_tensor(
+                obs_aligned, dtype=torch.float32, device=self.device
+            ).unsqueeze(0)
+            ctx_t = torch.as_tensor(
+                self.current_context, dtype=torch.float32, device=self.device
+            ).unsqueeze(0)
+            hist_t = self._get_current_history_tensor()
+            z_t = self.backbone(obs_t, context=ctx_t, history=hist_t).squeeze(0)
+            limb_act_t = self.actor_head.get_limb_action(
+                z_t,
+                anchor=anchor,
+                yaw=yaw,
+                pitch=pitch,
+                num_joints=num_joints,
+                deterministic=deterministic,
+            )
+            return limb_act_t.detach().cpu().numpy()
 
     def observe_transition(
         self,
