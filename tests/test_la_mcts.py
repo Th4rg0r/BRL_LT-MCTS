@@ -126,3 +126,80 @@ def test_gate1_rep_trainer_and_sampled_mcts_latency() -> None:
     assert abs(float(np.sum(policy_weights)) - 1.0) <= 1e-6
     max_latency = 15.0 if next(backbone.parameters()).is_cuda else 50.0
     assert median_ms < max_latency, f"MCTS latency {median_ms:.2f} ms exceeded {max_latency} ms limit"
+
+
+def test_gate1_mcts_root_dirichlet_noise() -> None:
+    """Verifies Dirichlet noise mixing on root prior weights during search and search_batch."""
+    torch.manual_seed(123)
+    np.random.seed(123)
+
+    actor_head = MultiPeakGMMActorHead(
+        latent_dim=64, action_dim=4, num_peaks=3, log_std_bounds=(-5.0, 2.0)
+    )
+    critic_head = SupportCriticHead(latent_dim=64, use_categorical=False)
+    rep_trainer = ModelRepresentationTrainer(
+        latent_dim=64, action_dim=4, num_blocks=1, proj_dim=128, pred_dim=64
+    )
+
+    actor_head.eval()
+    critic_head.eval()
+    rep_trainer.eval()
+
+    z_root = torch.rand(64)
+
+    # 1. Non-deterministic search with Dirichlet noise enabled (eps = 0.25, alpha = 0.3)
+    mcts_noisy = SampledContinuousMCTS(
+        actor_head=actor_head,
+        critic_head=critic_head,
+        rep_trainer=rep_trainer,
+        n_sim=5,
+        k_act=8,
+        root_dirichlet_alpha=0.3,
+        root_exploration_fraction=0.25,
+    )
+
+    _, _, _, _, root_node_noisy = mcts_noisy.search(z_root, deterministic=False)
+    assert root_node_noisy.prior_weights.shape == (8,)
+    assert np.all(root_node_noisy.prior_weights >= 0.0)
+    assert abs(float(np.sum(root_node_noisy.prior_weights)) - 1.0) <= 1e-6
+
+    # 2. Deterministic search disables Dirichlet noise completely
+    # In deterministic mode, root.prior_weights must match pure actor head sample_actions priors exactly
+    torch.manual_seed(42)
+    np.random.seed(42)
+    _, expected_priors = actor_head.sample_actions(
+        z_root, k_act=8, temperature=mcts_noisy.root_tau_beta
+    )
+    expected_priors_np = expected_priors.detach().cpu().numpy()
+
+    torch.manual_seed(42)
+    np.random.seed(42)
+    _, _, _, _, root_node_det = mcts_noisy.search(z_root, deterministic=True)
+    np.testing.assert_allclose(root_node_det.prior_weights, expected_priors_np, atol=1e-6)
+
+    # 3. Fraction = 0.0 disables noise even when deterministic=False
+    mcts_no_frac = SampledContinuousMCTS(
+        actor_head=actor_head,
+        critic_head=critic_head,
+        rep_trainer=rep_trainer,
+        n_sim=5,
+        k_act=8,
+        root_dirichlet_alpha=0.3,
+        root_exploration_fraction=0.0,
+    )
+    torch.manual_seed(42)
+    np.random.seed(42)
+    _, _, _, _, root_node_no_frac = mcts_no_frac.search(z_root, deterministic=False)
+    np.testing.assert_allclose(root_node_no_frac.prior_weights, expected_priors_np, atol=1e-6)
+
+    # 4. Search batch testing: verify simplex bounds and shapes
+    z_batch = torch.rand(3, 64)
+    acts, pi_weights, root_acts, root_vals = mcts_noisy.search_batch(z_batch, deterministic=False)
+    assert acts.shape == (3, 4)
+    assert pi_weights.shape == (3, 8)
+    assert root_acts.shape == (3, 8, 4)
+    assert root_vals.shape == (3,)
+    for b in range(3):
+        assert abs(float(np.sum(pi_weights[b])) - 1.0) <= 1e-5
+        assert np.all(pi_weights[b] >= 0.0)
+

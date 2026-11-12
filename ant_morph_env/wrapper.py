@@ -463,13 +463,6 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
 
         _, reward, terminated, truncated, info = self.env.step(act_env)
 
-        # Stagnation penalty to eliminate the standing alive-bonus exploit:
-        # If the creature fails to move forward (x_velocity < 0.05 m/s), penalize by -0.8
-        # to cancel the +1.0 healthy survival bonus, ensuring standing still yields near-zero return.
-        step_x_vel = float(info.get("x_velocity", 0.0))
-        if step_x_vel < 0.05:
-            reward -= 0.8
-
         canonical_obs = self._get_canonical_obs()
         # Guard against non-finite physics states under extreme combined disturbances
         if not np.all(np.isfinite(canonical_obs)) or not math.isfinite(float(reward)):

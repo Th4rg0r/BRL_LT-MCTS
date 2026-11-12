@@ -438,12 +438,7 @@ class MorphologicalDogBRLWrapper(gym.Env):
         lateral_cost = -0.1 * abs(float(self.data.qvel[1]))
         orientation_cost = -0.5 * (roll * roll + pitch * pitch)
 
-        # Stagnation penalty to eliminate the standing alive-bonus exploit:
-        # If the creature fails to move forward (vx < 0.05 m/s), penalize by -0.8
-        # to cancel the +1.0 healthy survival bonus, ensuring standing still yields near-zero return.
-        stagnation_penalty = -0.8 if float(vx) < 0.05 else 0.0
-
-        reward = forward_reward + healthy_reward + ctrl_cost + lateral_cost + orientation_cost + stagnation_penalty
+        reward = forward_reward + healthy_reward + ctrl_cost + lateral_cost + orientation_cost
 
         terminated = not is_healthy
         truncated = self._step_count >= self.max_episode_steps

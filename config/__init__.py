@@ -45,6 +45,8 @@ class LAMCTSConfig:
     c_2: float = 19652.0
     root_tau_beta: float = 1.0
     inner_tau_beta: float = 1.0
+    root_dirichlet_alpha: float = 0.3
+    root_exploration_fraction: float = 0.25
     tau_act_train: float = 0.3
     tau_act_eval: float = 0.05
     lr: float = 3e-4
@@ -72,7 +74,7 @@ class BRLConfig:
     target_win_rate: float = 0.50
     ema_beta_w: float = 0.05
     tau_s: float = 500.0
-    initial_r_ref: float = 1000.0
+    initial_r_ref: float = 500.0
     benchmark_r_ref: float = 6169.54
     window_k_w: int = 20
     alpha_eq: float = 10.0
@@ -87,9 +89,9 @@ class BRLConfig:
     beta_score: float = 1.0
     eta_viol: float = 2.0
     beta_ent: float = 0.01
-    warmup_episodes: int = 50
-    brl_episodes: int = 2500
-    total_episodes: int = 3000
+    warmup_episodes: int = 30
+    brl_episodes: int = 470
+    total_episodes: int = 500
     warmup_limit: float = 50.0
     warmup_budget: float = 100.0
 
@@ -137,12 +139,12 @@ class RunConfig:
 
     seeds: int = 3
     seed_offset: int = 42
-    episodes: int = 0  # 0 = brl.total_episodes
+    episodes: int = 500  # 0 = brl.total_episodes
     max_steps: int = 0  # 0 = ant_morph.max_episode_steps
-    device: str = "cpu"
-    eval_interval: int = 0  # 0 = min(10, episodes)
-    checkpoint_interval: int = 500  # 0 = only save best + final checkpoints
-    parallel_seeds: int = 1
+    device: str = "cuda"
+    eval_interval: int = 10  # 0 = min(10, episodes)
+    checkpoint_interval: int = 100  # 0 = only save best + final checkpoints
+    parallel_seeds: int = 3
     gpu_mem_fraction: float = 0.0  # per-process CUDA memory cap (0 = no cap)
 
 

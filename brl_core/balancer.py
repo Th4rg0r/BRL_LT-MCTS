@@ -73,11 +73,14 @@ class BalancerReplayBuffer:
 
     def get_failure_correlations(self) -> np.ndarray:
         """Computes empirical Pearson correlation rho_fail in [-1, 1]^P between w_i and failure."""
-        if len(self.recent_tweaks) < 3:
+        n = min(len(self.recent_tweaks), len(self.recent_failures))
+        if n < 3:
             return np.zeros(self.num_params, dtype=np.float32)
 
-        w_mat = np.stack(list(self.recent_tweaks), axis=0).astype(np.float64)  # (N, P)
-        f_vec = np.array(self.recent_failures, dtype=np.float64)  # (N,)
+        tweaks_slice = list(self.recent_tweaks)[-n:]
+        failures_slice = list(self.recent_failures)[-n:]
+        w_mat = np.stack(tweaks_slice, axis=0).astype(np.float64)  # (n, P)
+        f_vec = np.array(failures_slice, dtype=np.float64)  # (n,)
         f_std = np.std(f_vec)
         if f_std < 1e-8:
             return np.zeros(self.num_params, dtype=np.float32)

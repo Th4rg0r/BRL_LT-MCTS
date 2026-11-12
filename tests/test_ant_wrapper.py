@@ -92,8 +92,8 @@ def test_gate3_50_extreme_episodes_and_morphologies() -> None:
     wrapper.close()
 
 
-def test_standing_stagnation_penalty_and_win_evaluator() -> None:
-    """Verifies that static standing receives stagnation penalty and WinEvaluator rejects zero-velocity wins."""
+def test_standing_reward_is_unpenalized_and_win_evaluator() -> None:
+    """Verifies the full env reward is returned (no stagnation penalty) and WinEvaluator still rejects zero-velocity wins."""
     from brl_core.interfaces import WinEvaluator
 
     wrapper = MorphologicalAntBRLWrapper(max_action_capacity=12, fixed_action_space=True)
@@ -104,8 +104,9 @@ def test_standing_stagnation_penalty_and_win_evaluator() -> None:
     obs, reward, term, trunc, step_info = wrapper.step(zero_action)
     wrapper.close()
 
-    # Step velocity is near zero, so stagnation penalty (-0.8) must be applied
-    assert reward < 0.5, f"Expected stagnation penalty reducing reward to < 0.5, got {reward}"
+    # No stagnation penalty: standing still keeps the healthy bonus (~+1.0) from the environment
+    assert np.isfinite(reward)
+    assert reward > 0.5, f"Expected unpenalized env reward (healthy bonus kept), got {reward}"
 
     # Verify WinEvaluator: standing still with high return MUST be evaluated as LOSS (0)
     we = WinEvaluator(initial_r_ref=500.0)

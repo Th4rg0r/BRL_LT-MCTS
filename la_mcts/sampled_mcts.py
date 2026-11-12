@@ -96,6 +96,8 @@ class SampledContinuousMCTS:
         inner_tau_beta: float = 1.0,
         tau_act: float = 1.0,
         batch_leaf_eval: int = 16,
+        root_dirichlet_alpha: float = 0.3,
+        root_exploration_fraction: float = 0.25,
     ) -> None:
         self.actor_head = actor_head
         self.critic_head = critic_head
@@ -109,6 +111,8 @@ class SampledContinuousMCTS:
         self.inner_tau_beta = inner_tau_beta
         self.tau_act = tau_act
         self.batch_leaf_eval = max(1, batch_leaf_eval)
+        self.root_dirichlet_alpha = float(root_dirichlet_alpha)
+        self.root_exploration_fraction = float(root_exploration_fraction)
 
     def _select_action_idx(self, node: MCTSNode, min_max_stats: MinMaxStats) -> int:
         """Selects action index j* in {0, ..., K_act-1} maximizing Sampled PUCT."""
@@ -184,6 +188,12 @@ class SampledContinuousMCTS:
                 action_mask=action_mask,
                 limb_kinematics=limb_kinematics,
             )
+            if not deterministic and self.root_exploration_fraction > 0.0:
+                noise = np.random.dirichlet([self.root_dirichlet_alpha] * self.k_act)
+                root.prior_weights = (
+                    (1.0 - self.root_exploration_fraction) * root.prior_weights
+                    + self.root_exploration_fraction * noise
+                ).astype(np.float64)
             min_max_stats.update(root.v_value)
 
             # Virtual-loss batched simulation loop for < 15 ms latency at N_sim=50
@@ -356,11 +366,18 @@ class SampledContinuousMCTS:
                 st = MinMaxStats()
                 v_b = float(v_roots[b])
                 st.update(v_b)
+                p_weights = priors_np[b].copy()
+                if not deterministic and self.root_exploration_fraction > 0.0:
+                    noise = np.random.dirichlet([self.root_dirichlet_alpha] * self.k_act)
+                    p_weights = (
+                        (1.0 - self.root_exploration_fraction) * p_weights
+                        + self.root_exploration_fraction * noise
+                    ).astype(np.float64)
                 node = MCTSNode(
                     z_state=root_z_batch[b],
                     value_prefix=0.0,
                     sampled_actions=sampled_acts_b[b],
-                    prior_weights=priors_np[b],
+                    prior_weights=p_weights,
                     v_value=v_b,
                 )
                 roots.append(node)

@@ -127,6 +127,7 @@ def save_training_checkpoint(
             "last_tweak": balancer.last_tweak.tolist(),
             "recent_returns": list(balancer.replay_buffer.recent_returns),
             "recent_failures": list(balancer.replay_buffer.recent_failures),
+            "recent_tweaks": [t.tolist() for t in balancer.replay_buffer.recent_tweaks],
         },
         "win_evaluator": {
             "ema_win_rate": float(orchestrator.win_evaluator.ema_win_rate),
@@ -412,6 +413,19 @@ def run_single_seed(
                     balancer.replay_buffer.recent_returns.extend(bm["recent_returns"])
                 if "recent_failures" in bm:
                     balancer.replay_buffer.recent_failures.extend(bm["recent_failures"])
+                if "recent_tweaks" in bm:
+                    balancer.replay_buffer.recent_tweaks.extend(
+                        [np.array(t, dtype=np.float32) for t in bm["recent_tweaks"]]
+                    )
+                # Align recent_tweaks and recent_failures lengths if restoring from older checkpoints
+                n_align = min(len(balancer.replay_buffer.recent_tweaks), len(balancer.replay_buffer.recent_failures))
+                if len(balancer.replay_buffer.recent_tweaks) != len(balancer.replay_buffer.recent_failures):
+                    aligned_tweaks = list(balancer.replay_buffer.recent_tweaks)[-n_align:]
+                    aligned_failures = list(balancer.replay_buffer.recent_failures)[-n_align:]
+                    balancer.replay_buffer.recent_tweaks.clear()
+                    balancer.replay_buffer.recent_failures.clear()
+                    balancer.replay_buffer.recent_tweaks.extend(aligned_tweaks)
+                    balancer.replay_buffer.recent_failures.extend(aligned_failures)
 
     start_ep = completed_episodes + 1
     if start_ep > episodes:
@@ -622,6 +636,28 @@ def run_single_seed(
                 periodic_checkpoint_paths.append(str(ep_ckpt))
 
         _save_current_progress(ep, latest_path_str)
+
+        if jsonl_path is not None:
+            try:
+                rec = {
+                    "seed": seed,
+                    "episode": ep,
+                    "steps": ep_steps,
+                    "total_env_steps": total_env_steps,
+                    "return": float(summary.get("episode_return", 0.0)),
+                    "total_distance": float(summary.get("total_distance", 0.0)),
+                    "x_velocity": float(summary.get("x_velocity", 0.0)),
+                    "ema_win_rate": float(summary.get("ema_win_rate", 0.0)),
+                    "win": bool(summary.get("win_indicator", False)),
+                    "r_ref": float(summary.get("r_ref", 0.0)),
+                    "budget": float(summary.get("budget", 0.0)),
+                    "loss_total": float(summary.get("loss_total", 0.0)),
+                    "ep_duration": float(ep_duration),
+                }
+                with jsonl_path.open("a", encoding="utf-8") as jf:
+                    jf.write(json.dumps(rec) + "\n")
+            except Exception:
+                pass
 
     total_wall_sec = time.time() - seed_start_time
     sec_per_step = total_wall_sec / max(1, total_env_steps)

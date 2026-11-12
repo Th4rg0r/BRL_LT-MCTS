@@ -226,6 +226,8 @@ class BRLTrainingOrchestrator:
             "episode": episode_idx,
             "episode_return": ep_return,
             "steps": steps,
+            "total_distance": float(brl_info.get("total_distance", 0.0)),
+            "x_velocity": float(brl_info.get("x_velocity", 0.0)),
             "win_indicator": win_ind,
             "dominance_score": dom_score,
             "ema_win_rate": ema_win,

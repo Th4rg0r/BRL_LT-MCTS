@@ -327,3 +327,42 @@ def test_orchestrator_perception_telemetry() -> None:
         assert orchestrator.last_perception_correctness <= 1.0
     finally:
         env.close()
+
+
+def test_balancer_mismatched_tweak_failure_correlations() -> None:
+    """Verifies that DDPGBalancerReplayBuffer gracefully handles mismatched lengths on resume."""
+    cfg = BRLConfig(num_params=18)
+    balancer = DDPGBalancer(config=cfg, device="cpu")
+    buf = balancer.replay_buffer
+
+    # Case 1: recent_tweaks has 3 items, recent_failures has 50 items (the resume bug)
+    buf.recent_failures.extend([1.0 if i % 2 == 0 else 0.0 for i in range(50)])
+    buf.recent_tweaks.extend([np.random.uniform(0, 100, size=18).astype(np.float32) for _ in range(3)])
+    corr = buf.get_failure_correlations()
+    assert corr.shape == (18,)
+    assert np.all(corr >= -1.0) and np.all(corr <= 1.0)
+
+    # Case 2: recent_tweaks has 50 items, recent_failures has 3 items
+    buf.recent_tweaks.clear()
+    buf.recent_failures.clear()
+    buf.recent_tweaks.extend([np.random.uniform(0, 100, size=18).astype(np.float32) for _ in range(50)])
+    buf.recent_failures.extend([1.0, 0.0, 1.0])
+    corr = buf.get_failure_correlations()
+    assert corr.shape == (18,)
+
+    # Case 3: recent_tweaks has 0 items, recent_failures has 50 items
+    buf.recent_tweaks.clear()
+    buf.recent_failures.clear()
+    buf.recent_failures.extend([1.0 for _ in range(50)])
+    corr = buf.get_failure_correlations()
+    assert corr.shape == (18,)
+    assert np.all(corr == 0.0)
+
+    # Case 4: build_state works without broadcast crash
+    state = balancer.build_state(
+        ema_win_rate=0.5,
+        last_win=0,
+        dominance_score=0.2,
+    )
+    assert state.shape == (balancer.state_dim,)
+

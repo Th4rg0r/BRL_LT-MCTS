@@ -276,6 +276,8 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             root_tau_beta=self.cfg.root_tau_beta,
             inner_tau_beta=self.cfg.inner_tau_beta,
             tau_act=self.cfg.tau_act_train,
+            root_dirichlet_alpha=getattr(self.cfg, "root_dirichlet_alpha", 0.3),
+            root_exploration_fraction=getattr(self.cfg, "root_exploration_fraction", 0.25),
         )
 
         params = (
