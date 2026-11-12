@@ -460,6 +460,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
         pitch: float,
         num_joints: Optional[int] = None,
         deterministic: bool = False,
+        peak_idx: Optional[int] = None,
     ) -> np.ndarray:
         """Computes movement action vector for a specific limb from its 3D anchor and direction angles."""
         obs_aligned = self._align_obs(obs)
@@ -472,6 +473,13 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             ).unsqueeze(0)
             hist_t = self._get_current_history_tensor()
             z_t = self.backbone(obs_t, context=ctx_t, history=hist_t).squeeze(0)
+            kin_t = (
+                torch.as_tensor(
+                    self.current_limb_kinematics, dtype=torch.float32, device=self.device
+                )
+                if self.current_limb_kinematics is not None
+                else None
+            )
             limb_act_t = self.actor_head.get_limb_action(
                 z_t,
                 anchor=anchor,
@@ -479,6 +487,8 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                 pitch=pitch,
                 num_joints=num_joints,
                 deterministic=deterministic,
+                peak_idx=peak_idx,
+                all_limbs_kinematics=kin_t,
             )
             return limb_act_t.detach().cpu().numpy()
 

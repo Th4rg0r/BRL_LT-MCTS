@@ -104,6 +104,32 @@ class TanhMixtureSameFamily:
         return log_p_u - jacobian
 
 
+class PeakPositionalEncoding(nn.Module):
+    """Positional encoder for GMM peak indices [0, 1, ..., num_peaks - 1]."""
+
+    def __init__(self, num_peaks: int, hidden_dim: int) -> None:
+        super().__init__()
+        self.num_peaks = num_peaks
+        self.hidden_dim = hidden_dim
+        pe = torch.zeros(num_peaks, hidden_dim)
+        position = torch.arange(0, num_peaks, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, hidden_dim, 2, dtype=torch.float32)
+            * (-math.log(10000.0) / max(1, hidden_dim))
+        )
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term[: hidden_dim // 2])
+        self.register_buffer("sinusoidal_pe", pe)
+        self.learnable_pe = nn.Embedding(num_peaks, hidden_dim)
+        nn.init.normal_(self.learnable_pe.weight, mean=0.0, std=0.02)
+
+    def forward(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """Returns peak positional encodings of shape (1, num_peaks, 1, hidden_dim)."""
+        idx = torch.arange(self.num_peaks, device=device)
+        pe = self.sinusoidal_pe.to(device=device, dtype=dtype) + self.learnable_pe(idx).to(dtype=dtype)
+        return pe.view(1, self.num_peaks, 1, self.hidden_dim)
+
+
 class MorphologicalLimbHead(nn.Module):
     """Universal Morphological Limb Network f_phi(z_t, k_i(t)) with Transformer Encoder-Decoder.
 
@@ -154,6 +180,13 @@ class MorphologicalLimbHead(nn.Module):
         self.global_type_emb = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
         self.limb_type_emb = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
 
+        # Peak positional encoding [0, 1, ..., num_peaks - 1] + limb query fusion for the Decoder
+        self.peak_pos_encoder = PeakPositionalEncoding(num_peaks=num_peaks, hidden_dim=hidden_dim)
+        self.dec_query_proj = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+        )
+
         enc_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
             nhead=n_heads,
@@ -179,8 +212,12 @@ class MorphologicalLimbHead(nn.Module):
         self.decoder = nn.TransformerDecoder(dec_layer, num_layers=n_dec_layers)
         self.out_ln = nn.LayerNorm(hidden_dim)
 
-        self.mu_head = nn.Linear(hidden_dim, num_peaks * max_joints_per_limb)
-        self.log_std_head = nn.Linear(hidden_dim, num_peaks * max_joints_per_limb)
+        # Per-(peak, limb) composition output heads: weight (1), mean (J), and log_std (J)
+        self.weight_head = nn.Linear(hidden_dim, 1)
+        self.mu_head = nn.Linear(hidden_dim, max_joints_per_limb)
+        self.log_std_head = nn.Linear(hidden_dim, max_joints_per_limb)
+        self.last_limb_weights: Optional[torch.Tensor] = None
+        self.last_peak_logits: Optional[torch.Tensor] = None
 
     @staticmethod
     def encode_kinematics(kinematics: torch.Tensor) -> torch.Tensor:
@@ -224,8 +261,17 @@ class MorphologicalLimbHead(nn.Module):
 
         enc_seq = torch.cat([e_global, e_ctx], dim=1)  # (B, 1 + N_ctx, D)
         memory = self.encoder(enc_seq)
-        dec_out = self.decoder(tgt=e_query, memory=memory)
-        return self.out_ln(dec_out)
+        bsz, n_query, _ = e_query.shape
+        peak_pe = self.peak_pos_encoder(z_flat.device, z_flat.dtype)
+        peak_exp = peak_pe.expand(bsz, self.num_peaks, n_query, self.hidden_dim)
+        limb_exp = e_query.unsqueeze(1).expand(bsz, self.num_peaks, n_query, self.hidden_dim)
+        dec_queries = (
+            self.dec_query_proj(torch.cat([limb_exp, peak_exp], dim=-1))
+            + limb_exp
+            + peak_exp
+        ).reshape(bsz, self.num_peaks * n_query, self.hidden_dim)
+        dec_out = self.decoder(tgt=dec_queries, memory=memory)
+        return self.out_ln(dec_out).view(bsz, self.num_peaks, n_query, self.hidden_dim)
 
     def forward_single_limb(
         self,
@@ -235,8 +281,9 @@ class MorphologicalLimbHead(nn.Module):
         pitch: float | torch.Tensor,
         num_joints: Optional[int] = None,
         all_limbs_kinematics: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Computes (mu, log_std) for a single queried limb given its 3D anchor and direction angles."""
+        return_weights: bool = False,
+    ) -> Tuple[torch.Tensor, ...]:
+        """Computes per-peak (mu, log_std) [and weight when return_weights=True] for a single limb."""
         device = z_t.device
         dtype = z_t.dtype
         if not torch.is_tensor(anchor):
@@ -271,17 +318,21 @@ class MorphologicalLimbHead(nn.Module):
                 ctx_t = ctx_t.unsqueeze(0).expand(bsz, -1, -1)
             ctx_geom = self.encode_kinematics(ctx_t)
 
-        h = self._encode_and_decode(z_t_in, query_geom=geom, context_geom=ctx_geom).squeeze(1)
-
+        h = self._encode_and_decode(z_t_in, query_geom=geom, context_geom=ctx_geom).squeeze(2)
+        weight_raw = self.weight_head(h).squeeze(-1)
         mu_raw = self.mu_head(h).view(bsz, self.num_peaks, self.max_joints_per_limb)
         log_std_raw = self.log_std_head(h).view(bsz, self.num_peaks, self.max_joints_per_limb)
-
         n_j = num_joints if num_joints is not None else self.max_joints_per_limb
         mu_raw = mu_raw[..., :n_j]
         log_std_raw = log_std_raw[..., :n_j]
-
+        self.last_limb_weights = weight_raw.unsqueeze(-1)
+        self.last_peak_logits = weight_raw
         if z_t.dim() == 1:
+            if return_weights:
+                return weight_raw.squeeze(0), mu_raw.squeeze(0), log_std_raw.squeeze(0)
             return mu_raw.squeeze(0), log_std_raw.squeeze(0)
+        if return_weights:
+            return weight_raw, mu_raw, log_std_raw
         return mu_raw, log_std_raw
 
     def forward_all_limbs(
@@ -290,8 +341,9 @@ class MorphologicalLimbHead(nn.Module):
         limb_kinematics: torch.Tensor,
         limb_joint_counts: Optional[Sequence[int]] = None,
         target_action_dim: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Vectorized forward pass over all creature limbs with Transformer inter-limb coordination."""
+        return_weights: bool = False,
+    ) -> Tuple[torch.Tensor, ...]:
+        """Vectorized forward pass over all creature limbs and all GMM peaks."""
         orig_shape = z_t.shape[:-1]
         z_flat = z_t.view(-1, self.latent_dim)
         bsz = z_flat.shape[0]
@@ -308,27 +360,30 @@ class MorphologicalLimbHead(nn.Module):
             raise ValueError(f"Unsupported limb_kinematics shape: {limb_kinematics.shape}")
 
         geom_emb = self.encode_kinematics(kin_flat)  # (bsz, n_limbs, 8)
-        h = self._encode_and_decode(z_flat, query_geom=geom_emb)  # (bsz, n_limbs, hidden_dim)
-
-        mu_limbs = self.mu_head(h).view(bsz, n_limbs, self.num_peaks, self.max_joints_per_limb)
-        log_std_limbs = self.log_std_head(h).view(bsz, n_limbs, self.num_peaks, self.max_joints_per_limb)
-
-        # Transpose to (bsz, num_peaks, n_limbs, max_joints_per_limb)
-        mu_limbs = mu_limbs.permute(0, 2, 1, 3)
-        log_std_limbs = log_std_limbs.permute(0, 2, 1, 3)
-
+        h = self._encode_and_decode(z_flat, query_geom=geom_emb)  # (bsz, num_peaks, n_limbs, hidden_dim)
+        limb_weights = self.weight_head(h).squeeze(-1)  # (bsz, num_peaks, n_limbs)
+        mu_limbs = self.mu_head(h)  # (bsz, num_peaks, n_limbs, max_joints_per_limb)
+        log_std_limbs = self.log_std_head(h)  # (bsz, num_peaks, n_limbs, max_joints_per_limb)
         if limb_joint_counts is not None:
             pieces_mu = []
             pieces_std = []
+            active_limb_indices = []
             for i, j_count in enumerate(limb_joint_counts):
-                if i < n_limbs:
+                if i < n_limbs and j_count > 0:
                     pieces_mu.append(mu_limbs[:, :, i, :j_count])
                     pieces_std.append(log_std_limbs[:, :, i, :j_count])
+                    active_limb_indices.append(i)
             mu_assembled = torch.cat(pieces_mu, dim=-1)
             log_std_assembled = torch.cat(pieces_std, dim=-1)
+            peak_logits = (
+                limb_weights[:, :, active_limb_indices].mean(dim=-1)
+                if active_limb_indices
+                else limb_weights.mean(dim=-1)
+            )
         else:
             mu_assembled = mu_limbs.reshape(bsz, self.num_peaks, n_limbs * self.max_joints_per_limb)
             log_std_assembled = log_std_limbs.reshape(bsz, self.num_peaks, n_limbs * self.max_joints_per_limb)
+            peak_logits = limb_weights.mean(dim=-1)
 
         if target_action_dim is not None:
             cur_dim = mu_assembled.shape[-1]
@@ -345,7 +400,12 @@ class MorphologicalLimbHead(nn.Module):
         if orig_shape:
             mu_assembled = mu_assembled.view(*orig_shape, self.num_peaks, mu_assembled.shape[-1])
             log_std_assembled = log_std_assembled.view(*orig_shape, self.num_peaks, log_std_assembled.shape[-1])
-
+            peak_logits = peak_logits.view(*orig_shape, self.num_peaks)
+            limb_weights = limb_weights.view(*orig_shape, self.num_peaks, n_limbs)
+        self.last_limb_weights = limb_weights
+        self.last_peak_logits = peak_logits
+        if return_weights:
+            return peak_logits, mu_assembled, log_std_assembled, limb_weights
         return mu_assembled, log_std_assembled
 
 
@@ -454,9 +514,17 @@ class MultiPeakGMMActorHead(nn.Module):
 
             n_limbs = kin.shape[-2]
             counts = self.default_joint_counts if len(self.default_joint_counts) == n_limbs else None
-            mu_raw, log_std_raw = self.limb_head.forward_all_limbs(
-                z_t, kin, limb_joint_counts=counts, target_action_dim=self.action_dim
+            peak_logits_limb, mu_raw, log_std_raw, limb_weights = (
+                self.limb_head.forward_all_limbs(
+                    z_t,
+                    kin,
+                    limb_joint_counts=counts,
+                    target_action_dim=self.action_dim,
+                    return_weights=True,
+                )
             )
+            logits = logits + peak_logits_limb
+            self.last_limb_weights = limb_weights
             mu = 5.0 * torch.tanh(mu_raw / 5.0)
             log_std = torch.clamp(
                 log_std_raw, min=self.log_std_bounds[0], max=self.log_std_bounds[1]
@@ -481,6 +549,39 @@ class MultiPeakGMMActorHead(nn.Module):
 
         return logits, mu, std
 
+    def select_composition(
+        self,
+        z_t: torch.Tensor,
+        limb_kinematics: Optional[torch.Tensor] = None,
+        deterministic: bool = False,
+        temperature: float = 1.0,
+        action_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Stochastically selects a whole-body position COMPOSITION (peak index k*)
+        and samples all limbs jointly from that selected peak composition.
+        """
+        single = z_t.dim() == 1
+        if single:
+            z_t = z_t.unsqueeze(0)
+        logits, mu, std = self.get_distribution_params(
+            z_t, temperature=temperature, limb_kinematics=limb_kinematics
+        )
+        peak_probs = F.softmax(logits, dim=-1)
+        if deterministic:
+            selected_peak = torch.argmax(logits, dim=-1)
+        else:
+            selected_peak = D.Categorical(probs=peak_probs).sample()
+        idx = selected_peak.unsqueeze(-1).unsqueeze(-1).expand(*selected_peak.shape, 1, self.action_dim)
+        chosen_mu = torch.gather(mu, dim=-2, index=idx).squeeze(-2)
+        chosen_std = torch.gather(std, dim=-2, index=idx).squeeze(-2)
+        u = chosen_mu if deterministic else (chosen_mu + chosen_std * torch.randn_like(chosen_mu))
+        action = torch.tanh(u)
+        if action_mask is not None:
+            action = action * action_mask
+        if single:
+            return action.squeeze(0), selected_peak.squeeze(0), peak_probs.squeeze(0)
+        return action, selected_peak, peak_probs
+
     def get_limb_action(
         self,
         z_t: torch.Tensor,
@@ -489,28 +590,42 @@ class MultiPeakGMMActorHead(nn.Module):
         pitch: float,
         num_joints: Optional[int] = None,
         deterministic: bool = False,
+        peak_idx: Optional[int | torch.Tensor] = None,
+        all_limbs_kinematics: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Queries movements for a specific limb given anchor (x,y,z) and angles (yaw, pitch)."""
-        logits = self.logits_net(z_t)
-        mu_raw, log_std_raw = self.limb_head.forward_single_limb(
-            z_t, anchor=anchor, yaw=yaw, pitch=pitch, num_joints=num_joints
+        limb_weights, mu_raw, log_std_raw = self.limb_head.forward_single_limb(
+            z_t,
+            anchor=anchor,
+            yaw=yaw,
+            pitch=pitch,
+            num_joints=num_joints,
+            all_limbs_kinematics=all_limbs_kinematics,
+            return_weights=True,
         )
+        logits = self.logits_net(z_t) + limb_weights
         mu = 5.0 * torch.tanh(mu_raw / 5.0)
         std = torch.exp(
             torch.clamp(log_std_raw, min=self.log_std_bounds[0], max=self.log_std_bounds[1])
         )
-
-        if deterministic:
-            best_mode = torch.argmax(logits, dim=-1)
-            if z_t.dim() == 1:
-                u = mu[best_mode]
-            else:
-                idx = best_mode.unsqueeze(-1).unsqueeze(-1).expand(*best_mode.shape, 1, mu.shape[-1])
-                u = torch.gather(mu, dim=-2, index=idx).squeeze(-2)
+        if peak_idx is not None:
+            mode_idx = (
+                peak_idx.to(device=z_t.device, dtype=torch.long)
+                if torch.is_tensor(peak_idx)
+                else torch.tensor(peak_idx, dtype=torch.long, device=z_t.device)
+            )
+        elif deterministic:
+            mode_idx = torch.argmax(logits, dim=-1)
         else:
             probs = F.softmax(logits, dim=-1)
-            dist = D.Categorical(probs=probs)
-            mode_idx = dist.sample()
+            mode_idx = D.Categorical(probs=probs).sample()
+        if deterministic:
+            if z_t.dim() == 1:
+                u = mu[mode_idx]
+            else:
+                idx = mode_idx.unsqueeze(-1).unsqueeze(-1).expand(*mode_idx.shape, 1, mu.shape[-1])
+                u = torch.gather(mu, dim=-2, index=idx).squeeze(-2)
+        else:
             if z_t.dim() == 1:
                 chosen_mu = mu[mode_idx]
                 chosen_std = std[mode_idx]

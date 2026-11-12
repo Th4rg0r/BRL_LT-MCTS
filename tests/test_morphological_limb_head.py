@@ -296,3 +296,24 @@ def test_per_step_limb_kinematics_propagation(obs_dim: int, act_dim: int, n_limb
         p.grad is not None and torch.norm(p.grad) > 0
         for p in agent.actor_head.limb_head.parameters()
     )
+
+
+def test_compositional_peak_pos_encoding_and_weights():
+    """Verifies peak positional encoding [0..K-1], per-limb per-peak weights, and composition selection."""
+    head = MorphologicalLimbHead(latent_dim=256, num_peaks=5, max_joints_per_limb=2, hidden_dim=128)
+    z_t = torch.randn(3, 256)
+    kin = torch.randn(3, 4, 5)
+    peak_logits, mu, log_std, limb_weights = head.forward_all_limbs(
+        z_t, kin, limb_joint_counts=[2, 2, 2, 2], return_weights=True
+    )
+    assert peak_logits.shape == (3, 5)
+    assert mu.shape == (3, 5, 8)
+    assert log_std.shape == (3, 5, 8)
+    assert limb_weights.shape == (3, 5, 4)
+    assert not torch.allclose(mu[:, 0, :], mu[:, 1, :])
+    actor = MultiPeakGMMActorHead(latent_dim=256, action_dim=8, num_peaks=5)
+    action, selected_peak, peak_probs = actor.select_composition(z_t, limb_kinematics=kin)
+    assert action.shape == (3, 8)
+    assert selected_peak.shape == (3,)
+    assert peak_probs.shape == (3, 5)
+    assert torch.allclose(peak_probs.sum(dim=-1), torch.ones(3), atol=1e-5)
