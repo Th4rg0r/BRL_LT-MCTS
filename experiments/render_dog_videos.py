@@ -37,6 +37,13 @@ def main() -> None:
         help="Checkpoint name filters (e.g. --checkpoints best latest). Default: all found.",
     )
     parser.add_argument(
+        "--scenario",
+        "-s",
+        type=str,
+        default=None,
+        help="Specific validation scenario to render (e.g. 'standard', 'icy' / 'ice_surface', 'tripod', 'payload', 'wind'). Default: all scenarios.",
+    )
+    parser.add_argument(
         "--max-steps",
         type=int,
         default=500,
@@ -69,6 +76,11 @@ def main() -> None:
         help="Smoothly orbit camera angle around the agent during recording.",
     )
     parser.add_argument(
+        "--no-track-camera",
+        action="store_true",
+        help="Disable centered tracking camera (keep camera fixed at world origin).",
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default="cpu",
@@ -81,6 +93,7 @@ def main() -> None:
         output_dir=args.output_dir,
         seeds=args.seeds,
         checkpoints=args.checkpoints,
+        scenario=args.scenario,
         max_steps=args.max_steps,
         fps=args.fps,
         overwrite=args.overwrite,
@@ -88,6 +101,7 @@ def main() -> None:
         device=args.device,
         deterministic=not args.stochastic,
         orbit_camera=args.orbit_camera,
+        track_camera=not args.no_track_camera,
     )
 
 

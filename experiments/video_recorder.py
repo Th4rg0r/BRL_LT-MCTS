@@ -121,6 +121,52 @@ def get_validation_scenarios(env_type: str) -> Dict[str, Dict[str, Any]]:
     raise ValueError(f"Unknown env_type '{env_type}'. Expected 'ant', 'humanoid', or 'dog'.")
 
 
+def filter_validation_scenarios(
+    scenarios: Dict[str, Dict[str, Any]],
+    scenario_query: Optional[str] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Filters validation scenarios by exact key or alias/keyword (e.g. 'icy', 'standard', 'spider')."""
+    if not scenario_query:
+        return scenarios
+
+    q = scenario_query.lower().strip()
+    alias_map = {
+        "ice": "ice",
+        "icy": "ice",
+        "standard": "standard",
+        "tripod": "tripod",
+        "spider": "spider",
+        "hexapod": "hexapod",
+        "payload": "payload",
+        "stiff": "stiff",
+        "wind": "wind",
+        "ankles": "ankles",
+        "mass": "mass",
+        "heavy": "heavy",
+    }
+    target = alias_map.get(q, q)
+
+    filtered = {}
+    for key, spec in scenarios.items():
+        k_low = key.lower()
+        d_low = spec.get("display_name", "").lower()
+        if (
+            q == k_low
+            or target in k_low
+            or target in d_low
+            or q in k_low
+            or q in d_low
+        ):
+            filtered[key] = spec
+
+    if not filtered:
+        avail = ", ".join(scenarios.keys())
+        raise ValueError(
+            f"Scenario query '{scenario_query}' matched no validation scenarios. Available: {avail}"
+        )
+    return filtered
+
+
 # ==============================================================================
 # Environment Creation Helper
 # ==============================================================================
@@ -220,7 +266,11 @@ def discover_checkpoints(
         stem = cp.stem
         # Check filter if provided
         if ckpt_filter:
-            matches_filter = any(f.lower() in stem.lower() for f in ckpt_filter)
+            clean_filter = [f[:-3] if f.lower().endswith(".pt") else f for f in ckpt_filter]
+            matches_filter = any(
+                f.lower() in stem.lower() or f.lower() in cp.name.lower()
+                for f in clean_filter
+            )
             if not matches_filter:
                 continue
 
@@ -302,22 +352,10 @@ def render_scenario_video(
     overlay_hud: bool = True,
     deterministic: bool = True,
     orbit_camera: bool = False,
+    track_camera: bool = True,
 ) -> Dict[str, Any]:
     """Runs an evaluation episode and saves it as an MP4 video with progressive faststart."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Invalidate any stale viewer cache before setting new morphology/scenario
-    if hasattr(env.unwrapped, "mujoco_renderer") and env.unwrapped.mujoco_renderer is not None:
-        r = env.unwrapped.mujoco_renderer
-        if hasattr(r, "_viewers"):
-            for v in r._viewers.values():
-                if hasattr(v, "close"):
-                    try:
-                        v.close()
-                    except Exception:
-                        pass
-            r._viewers.clear()
-            r.viewer = None
 
     # Configure reset options
     reset_opts: Dict[str, Any] = {"tweak_vector": scenario_spec["tweak"]}
@@ -335,9 +373,38 @@ def render_scenario_video(
         agent.set_episode_context(
             tweak_vector=info.get("perceived_tweak_vector", scenario_spec["tweak"]),
             action_mask=morph_mask,
+            limb_kinematics=info.get("limb_kinematics"),
         )
 
     disp_name = scenario_spec.get("display_name", scenario_key)
+
+    # Locate creature torso/root body for camera centering
+    torso_id = 1
+    if hasattr(env.unwrapped, "model"):
+        for b_name in ("torso", "trunk", "base_link", "pelvis", "root"):
+            try:
+                torso_id = env.unwrapped.model.body(b_name).id
+                break
+            except Exception:
+                pass
+        else:
+            torso_id = 1 if getattr(env.unwrapped.model, "nbody", 2) > 1 else 0
+
+    if hasattr(env.unwrapped, "mujoco_renderer") and env.unwrapped.mujoco_renderer is not None:
+        try:
+            import mujoco
+            v = env.unwrapped.mujoco_renderer._get_viewer("rgb_array")
+            if hasattr(v, "cam"):
+                v.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING if track_camera else mujoco.mjtCamera.mjCAMERA_FREE
+                v.cam.trackbodyid = torso_id
+                if track_camera and hasattr(env.unwrapped, "data") and hasattr(env.unwrapped.data, "xpos"):
+                    t_pos = env.unwrapped.data.xpos[torso_id]
+                    if np.all(np.isfinite(t_pos)):
+                        v.cam.lookat[0] = float(t_pos[0])
+                        v.cam.lookat[1] = float(t_pos[1])
+                        v.cam.lookat[2] = float(t_pos[2])
+        except Exception:
+            pass
 
     # Initialize video writer with faststart for progressive playback in Windows Media Player & web
     writer = imageio.get_writer(
@@ -356,11 +423,17 @@ def render_scenario_video(
 
     try:
         while steps < max_steps:
-            if orbit_camera:
+            if hasattr(env.unwrapped, "mujoco_renderer") and env.unwrapped.mujoco_renderer is not None:
                 try:
-                    if hasattr(env.unwrapped, "mujoco_renderer") and env.unwrapped.mujoco_renderer is not None:
-                        v = env.unwrapped.mujoco_renderer._get_viewer("rgb_array")
-                        if hasattr(v, "cam") and hasattr(v.cam, "azimuth"):
+                    v = env.unwrapped.mujoco_renderer._get_viewer("rgb_array")
+                    if hasattr(v, "cam"):
+                        if track_camera and hasattr(env.unwrapped, "data") and hasattr(env.unwrapped.data, "xpos"):
+                            torso_pos = env.unwrapped.data.xpos[torso_id]
+                            if np.all(np.isfinite(torso_pos)):
+                                v.cam.lookat[0] = float(torso_pos[0])
+                                v.cam.lookat[1] = float(torso_pos[1])
+                                v.cam.lookat[2] = float(torso_pos[2])
+                        if orbit_camera and hasattr(v.cam, "azimuth"):
                             v.cam.azimuth = (v.cam.azimuth + 0.6) % 360.0
                 except Exception:
                     pass
@@ -433,6 +506,7 @@ def run_batch_video_rendering(
     output_dir: str | Path,
     seeds: Optional[List[int]] = None,
     checkpoints: Optional[List[str]] = None,
+    scenario: Optional[str] = None,
     max_steps: int = 500,
     fps: int = 30,
     overwrite: bool = False,
@@ -440,6 +514,7 @@ def run_batch_video_rendering(
     device: str = "cpu",
     deterministic: bool = True,
     orbit_camera: bool = False,
+    track_camera: bool = True,
 ) -> Dict[str, Any]:
     """Runs video generation for all checkpoints and validation scenarios."""
     env_type = env_type.lower().strip()
@@ -448,7 +523,11 @@ def run_batch_video_rendering(
     videos_dir.mkdir(parents=True, exist_ok=True)
 
     mode_str = "Deterministic" if deterministic else "Stochastic"
-    cam_str = "Orbiting (Dynamic Angle)" if orbit_camera else "Fixed (Static Angle)"
+    if orbit_camera:
+        cam_str = "Orbiting (Dynamic Angle) + Tracking Centered" if track_camera else "Orbiting (Dynamic Angle)"
+    else:
+        cam_str = "Tracking Centered" if track_camera else "Fixed (Static Angle)"
+
     print("=" * 80)
     print(f"  BRL Video Rendering Suite - [{env_type.upper()}]")
     print(f"  Target Directory  : {out_dir}")
@@ -470,9 +549,13 @@ def run_batch_video_rendering(
         print(f"  [{idx:2d}] Seed {ck['seed']:2d} | Step {ck['total_env_steps']:8,d} | Ep {ck['episode']:4d} | {ck['path'].name}")
     print("-" * 80)
 
-    # 2. Get scenario specs
-    scenarios = get_validation_scenarios(env_type)
-    print(f"Validation Scenarios ({len(scenarios)}): {', '.join(scenarios.keys())}")
+    # 2. Get scenario specs & filter
+    all_scenarios = get_validation_scenarios(env_type)
+    scenarios = filter_validation_scenarios(all_scenarios, scenario)
+    if scenario:
+        print(f"Filtered Scenario ({len(scenarios)} of {len(all_scenarios)}): {', '.join(scenarios.keys())}")
+    else:
+        print(f"Validation Scenarios ({len(scenarios)}): {', '.join(scenarios.keys())}")
     print("-" * 80)
 
     # 3. Import appropriate checkpoint loader
@@ -513,7 +596,8 @@ def run_batch_video_rendering(
                 filename = f"seed_{seed:02d}_step_{steps:08d}_{stem}_{scen_key}.mp4"
                 video_path = videos_dir / filename
 
-                if video_path.exists() and not overwrite:
+                # Check if file exists and has valid non-zero content (> 1KB)
+                if video_path.exists() and video_path.stat().st_size > 1024 and not overwrite:
                     print(f"  [{video_idx:3d}/{total_videos:3d}] [SKIP] {filename} (Already exists)")
                     rendered_results.append({
                         "video_path": str(video_path),
@@ -540,6 +624,7 @@ def run_batch_video_rendering(
                     overlay_hud=overlay_hud,
                     deterministic=deterministic,
                     orbit_camera=orbit_camera,
+                    track_camera=track_camera,
                 )
                 print(f"Done! ({res['steps']} steps, Ret = {res['return']:+6.1f}, {res['wall_sec']:.1f}s)")
                 res.update({

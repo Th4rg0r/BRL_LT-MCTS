@@ -201,3 +201,183 @@ def test_orbit_camera_and_hud_status(tmp_path: Path):
     assert out_file.stat().st_size > 1000
     assert res["steps"] == 5
 
+
+def test_sequential_seed_rendering_no_black_screen(tmp_path: Path):
+    """Verifies that sequential renders across different seeds do not suffer from black screens (mean > 50)."""
+    import gymnasium as gym
+    import imageio
+    from ant_morph_env.wrapper import MorphologicalAntBRLWrapper
+    from experiments.video_recorder import render_scenario_video
+
+    base = gym.make("Ant-v5", render_mode="rgb_array")
+    env = MorphologicalAntBRLWrapper(env=base)
+
+    class DummyAgent:
+        class DummyCfg:
+            max_action_dim = 12
+        cfg = DummyCfg()
+        def select_action(self, obs, deterministic=True):
+            return np.zeros(12, dtype=np.float32)
+
+    agent = DummyAgent()
+    spec = {
+        "display_name": "Standard Ant Nominal",
+        "tweak": np.zeros(12, dtype=np.float32),
+        "num_legs": 4,
+    }
+
+    # Render seed 42 then seed 43 sequentially using the same environment
+    for seed in [42, 43]:
+        out_file = tmp_path / f"test_seed_{seed}.mp4"
+        render_scenario_video(
+            agent=agent,
+            env=env,
+            scenario_key="standard_ant",
+            scenario_spec=spec,
+            out_path=out_file,
+            seed=seed,
+            total_env_steps=1000,
+            episode=1,
+            env_name="ant",
+            max_steps=5,
+            fps=10,
+            track_camera=True,
+        )
+        assert out_file.exists()
+        assert out_file.stat().st_size > 1000
+        reader = imageio.get_reader(str(out_file), "ffmpeg")
+        first_frame = next(iter(reader))
+        reader.close()
+        # Pixel mean must be healthy (> 50), not black screen (~3.3)
+        assert float(first_frame.mean()) > 50.0, f"Seed {seed} produced black screen with mean {first_frame.mean()}"
+
+    env.close()
+
+
+
+def test_filter_validation_scenarios():
+    """Verifies single-scenario filtering and alias resolution (e.g. 'icy', 'standard')."""
+    from experiments.video_recorder import filter_validation_scenarios, get_validation_scenarios
+
+    ant_scens = get_validation_scenarios("ant")
+    assert len(ant_scens) == 5
+
+    # Test filtering single scenario: 'icy'
+    icy_filtered = filter_validation_scenarios(ant_scens, "icy")
+    assert len(icy_filtered) == 1
+    assert "heavy_ice" in icy_filtered
+
+    # Test filtering single scenario: 'standard'
+    std_filtered = filter_validation_scenarios(ant_scens, "standard")
+    assert len(std_filtered) == 1
+    assert "standard_ant" in std_filtered
+
+    # Test dog scenarios: 'payload'
+    dog_scens = get_validation_scenarios("dog")
+    payload_filtered = filter_validation_scenarios(dog_scens, "payload")
+    assert len(payload_filtered) == 1
+    assert "heavy_payload" in payload_filtered
+
+    # Test invalid scenario query
+    with pytest.raises(ValueError):
+        filter_validation_scenarios(ant_scens, "flying_ant_42")
+
+
+def test_track_camera_centering(tmp_path: Path):
+    """Verifies that track_camera centers viewer camera on the creature."""
+    import gymnasium as gym
+    from ant_morph_env.wrapper import MorphologicalAntBRLWrapper
+    from experiments.video_recorder import render_scenario_video
+
+    base = gym.make("Ant-v5", render_mode="rgb_array")
+    env = MorphologicalAntBRLWrapper(env=base)
+
+    class DummyAgent:
+        class DummyCfg:
+            max_action_dim = 12
+        cfg = DummyCfg()
+        def select_action(self, obs, deterministic=True):
+            return np.ones(12, dtype=np.float32) * 0.5
+
+    agent = DummyAgent()
+    spec = {
+        "display_name": "Standard Ant Track Test",
+        "tweak": np.zeros(12, dtype=np.float32),
+        "num_legs": 4,
+    }
+    out_file = tmp_path / "test_track_cam.mp4"
+
+    res = render_scenario_video(
+        agent=agent,
+        env=env,
+        scenario_key="standard_ant",
+        scenario_spec=spec,
+        out_path=out_file,
+        seed=42,
+        total_env_steps=1000,
+        episode=1,
+        env_name="ant",
+        max_steps=5,
+        fps=10,
+        track_camera=True,
+    )
+    env.close()
+
+    assert out_file.exists()
+    assert out_file.stat().st_size > 1000
+    assert res["steps"] == 5
+
+
+def test_sequential_seed_rendering_no_black_screen(tmp_path: Path):
+    """Verifies that sequential renders across different seeds do not suffer from black screens (mean > 50)."""
+    import gymnasium as gym
+    import imageio
+    from ant_morph_env.wrapper import MorphologicalAntBRLWrapper
+    from experiments.video_recorder import render_scenario_video
+
+    base = gym.make("Ant-v5", render_mode="rgb_array")
+    env = MorphologicalAntBRLWrapper(env=base)
+
+    class DummyAgent:
+        class DummyCfg:
+            max_action_dim = 12
+        cfg = DummyCfg()
+        def select_action(self, obs, deterministic=True):
+            return np.zeros(12, dtype=np.float32)
+
+    agent = DummyAgent()
+    spec = {
+        "display_name": "Standard Ant Nominal",
+        "tweak": np.zeros(12, dtype=np.float32),
+        "num_legs": 4,
+    }
+
+    # Render seed 42 then seed 43 sequentially using the same environment
+    for seed in [42, 43]:
+        out_file = tmp_path / f"test_seed_{seed}.mp4"
+        render_scenario_video(
+            agent=agent,
+            env=env,
+            scenario_key="standard_ant",
+            scenario_spec=spec,
+            out_path=out_file,
+            seed=seed,
+            total_env_steps=1000,
+            episode=1,
+            env_name="ant",
+            max_steps=5,
+            fps=10,
+            track_camera=True,
+        )
+        assert out_file.exists()
+        assert out_file.stat().st_size > 1000
+        reader = imageio.get_reader(str(out_file), "ffmpeg")
+        first_frame = next(iter(reader))
+        reader.close()
+        # Pixel mean must be healthy (> 50), not black screen (~3.3)
+        assert float(first_frame.mean()) > 50.0, f"Seed {seed} produced black screen with mean {first_frame.mean()}"
+
+    env.close()
+
+
+

@@ -105,6 +105,7 @@ def evaluate_benchmark_suite(
         agent.set_episode_context(
             tweak_vector=info.get("perceived_tweak_vector", spec["tweak"]),
             action_mask=morph_mask,
+            limb_kinematics=info.get("limb_kinematics"),
         )
 
         ep_return = 0.0

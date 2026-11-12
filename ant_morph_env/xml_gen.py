@@ -58,7 +58,7 @@ class ProceduralAntXMLGenerator:
             # Leg 5: Middle-Left (Hexapod)
             (5, 0.0, 1.25, -1.0, 0.0, "30 70", s_mid * s_left, True),
             # Leg 6: Middle-Right (Hexapod)
-            (6, 0.0, -1.25, 1.0, 0.0, "-70 -30", s_mid * s_right, False),
+            (6, 0.0, -1.25, 1.0, 0.0, "30 70", s_mid * s_right, False),
         ]
 
         if num_legs == 3:

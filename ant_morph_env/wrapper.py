@@ -135,20 +135,22 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         self.unwrapped.init_qpos = new_data.qpos.ravel().copy()
         self.unwrapped.init_qvel = new_data.qvel.ravel().copy()
 
-        # Update Gymnasium offscreen renderer if active and invalidate cached viewers
+        # Update Gymnasium offscreen renderer non-destructively without calling v.close() (which terminates GLFW globally)
         if hasattr(self.unwrapped, "mujoco_renderer") and self.unwrapped.mujoco_renderer is not None:
             r = self.unwrapped.mujoco_renderer
             r.model = new_model
             r.data = new_data
             if hasattr(r, "_viewers"):
                 for v in r._viewers.values():
-                    if hasattr(v, "close"):
-                        try:
-                            v.close()
-                        except Exception:
-                            pass
-                r._viewers.clear()
-                r.viewer = None
+                    try:
+                        v.model = new_model
+                        v.data = new_data
+                        if hasattr(v, "make_context_current"):
+                            v.make_context_current()
+                        v.scn = mujoco.MjvScene(new_model, getattr(v.scn, "maxgeom", 1000))
+                        v.con = mujoco.MjrContext(new_model, mujoco.mjtFontScale.mjFONTSCALE_150)
+                    except Exception:
+                        pass
 
         # Adjust healthy_z_range upper limit when front legs are scaled up (giraffe/spider morphology)
         s_front, s_back, s_left, s_right = self.xml_gen.compute_leg_scales(

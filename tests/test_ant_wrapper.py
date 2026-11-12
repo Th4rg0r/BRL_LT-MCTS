@@ -125,3 +125,57 @@ def test_standing_reward_is_unpenalized_and_win_evaluator() -> None:
         forward_velocity=1.5,  # Active forward sprinting
     )
     assert win_ind_run == 1, "Active locomotion meeting r_ref must evaluate to WIN (win_indicator = 1)"
+
+
+def test_hexapod_all_legs_point_downward() -> None:
+    """Verifies that all 6 legs of the Hexapod morphological ant point downwards towards the ground.
+
+    Ensures that Leg 6 (middle-right) has its ankle range oriented so that throughout its valid range
+    [30, 70] deg, its geom position in z is strictly below the torso (rel_z < 0), maintaining bilateral
+    downward symmetry with Leg 5 (middle-left).
+    """
+    import mujoco
+    from ant_morph_env.xml_gen import ProceduralAntXMLGenerator
+
+    gen = ProceduralAntXMLGenerator()
+    xml_str = gen.generate_xml(num_legs=6)
+
+    m = mujoco.MjModel.from_xml_string(xml_str)
+    d = mujoco.MjData(m)
+
+    torso_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "torso")
+    assert torso_id >= 0
+
+    # Test at min, mid, and max joint angle for each leg's ankle
+    for frac in [0.0, 0.5, 1.0]:
+        for j in range(1, m.njnt):
+            rng = m.jnt_range[j]
+            d.qpos[6 + j] = rng[0] + frac * (rng[1] - rng[0])
+        mujoco.mj_forward(m, d)
+
+        torso_z = float(d.xpos[torso_id][2])
+        for leg_id in range(1, 7):
+            geom_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, f"ankle_{leg_id}_geom")
+            assert geom_id >= 0
+            rel_z = float(d.geom_xpos[geom_id][2]) - torso_z
+            assert rel_z < 0.0, (
+                f"Leg {leg_id} points upwards at frac={frac}: geom_z={d.geom_xpos[geom_id][2]:.4f}, "
+                f"torso_z={torso_z:.4f}, rel_z={rel_z:.4f}"
+            )
+
+    # Check bilateral symmetry between Leg 5 (middle-left) and Leg 6 (middle-right) at mid-range
+    for j in range(1, m.njnt):
+        rng = m.jnt_range[j]
+        d.qpos[6 + j] = 0.5 * (rng[0] + rng[1])
+    mujoco.mj_forward(m, d)
+
+    torso_z = float(d.xpos[torso_id][2])
+    g5_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "ankle_5_geom")
+    g6_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "ankle_6_geom")
+    rel_z_5 = float(d.geom_xpos[g5_id][2]) - torso_z
+    rel_z_6 = float(d.geom_xpos[g6_id][2]) - torso_z
+
+    assert abs(rel_z_5 - rel_z_6) < 1e-4, (
+        f"Leg 5 (rel_z={rel_z_5:.4f}) and Leg 6 (rel_z={rel_z_6:.4f}) are not vertically symmetric!"
+    )
+
