@@ -552,21 +552,35 @@ def evaluate_dog_benchmark_suite(
         },
     }
 
+    import inspect
     results: Dict[str, Dict[str, float]] = {}
+    supports_ctx_kin = (
+        hasattr(agent, "set_episode_context")
+        and "limb_kinematics" in inspect.signature(agent.set_episode_context).parameters
+    )
+    supports_act_kin = "limb_kinematics" in inspect.signature(agent.select_action).parameters
     for name, spec in suite_specs.items():
         obs, info = env.reset(options={"tweak_vector": spec["tweak"], "disabled_leg": spec.get("disabled_leg")})
         morph_mask = info.get("morphology_mask", np.ones(agent.cfg.max_action_dim, dtype=np.float32))
         if hasattr(agent, "set_episode_context"):
-            agent.set_episode_context(
-                tweak_vector=info.get("perceived_tweak_vector", spec["tweak"]),
-                action_mask=morph_mask,
-            )
+            ctx_kwargs: Dict[str, Any] = {
+                "tweak_vector": info.get("perceived_tweak_vector", spec["tweak"]),
+                "action_mask": morph_mask,
+            }
+            if supports_ctx_kin:
+                ctx_kwargs["limb_kinematics"] = info.get("limb_kinematics")
+            agent.set_episode_context(**ctx_kwargs)
 
         ep_return = 0.0
         steps = 0
         last_info = info
         while steps < max_steps:
-            action = agent.select_action(obs, deterministic=True)
+            if supports_act_kin:
+                action = agent.select_action(
+                    obs, deterministic=True, limb_kinematics=last_info.get("limb_kinematics")
+                )
+            else:
+                action = agent.select_action(obs, deterministic=True)
             obs, reward, terminated, truncated, last_info = env.step(action)
             ep_return += float(reward)
             steps += 1

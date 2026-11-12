@@ -18,29 +18,29 @@ class LAMCTSConfig:
     k_tok: int = 8
     d_model: int = 256
     n_heads: int = 4
-    l_enc: int = 3
+    l_enc: int = 2
     latent_dim: int = 256
     num_peaks: int = 4
     log_std_bounds: Tuple[float, float] = (-3.0, 2.0)
     use_categorical_critic: bool = True
-    support_min: int = -300
-    support_max: int = 300
-    num_bins: int = 601
-    gamma: float = 0.995
-    td_steps: int = 8
+    support_min: int = -150
+    support_max: int = 150
+    num_bins: int = 301
+    gamma: float = 0.99
+    td_steps: int = 5
     l_dyn: int = 3
     proj_dim: int = 512
     pred_dim: int = 256
-    unroll_steps: int = 6
+    unroll_steps: int = 5
     lambda_rep: float = 2.0
     beta_mse: float = 1.0
     lambda_v: float = 0.5
     lambda_r: float = 1.0
     lambda_p: float = 1.0
     c_reg: float = 1e-4
-    n_sim: int = 50
-    n_sim_eval: int = 100
-    k_act: int = 24
+    n_sim: int = 32
+    n_sim_eval: int = 64
+    k_act: int = 16
     c_1: float = 1.25
     c_2: float = 19652.0
     root_tau_beta: float = 1.25
@@ -56,7 +56,7 @@ class LAMCTSConfig:
     history_len: int = 6
     reanalyze_ratio: float = 0.25
     # Agent gradient update every N env steps (0 = auto: max_steps // 2, the original behaviour)
-    train_every_steps: int = 20
+    train_every_steps: int = 50
     # MuZero Reanalyze every N episodes (0 = disabled) and number of states per Reanalyze pass
     reanalyze_every: int = 4
     reanalyze_states: int = 4
@@ -74,7 +74,7 @@ class BRLConfig:
     target_win_rate: float = 0.50
     ema_beta_w: float = 0.05
     tau_s: float = 500.0
-    initial_r_ref: float = 1000.0
+    initial_r_ref: float = 0.0
     benchmark_r_ref: float = 6169.54
     window_k_w: int = 20
     alpha_eq: float = 10.0
@@ -90,8 +90,8 @@ class BRLConfig:
     eta_viol: float = 2.0
     beta_ent: float = 0.01
     warmup_episodes: int = 100
-    brl_episodes: int = 2500
-    total_episodes: int = 3000
+    brl_episodes: int = 10000
+    total_episodes: int = 10000
     warmup_limit: float = 50.0
     warmup_budget: float = 100.0
 
@@ -137,14 +137,14 @@ class RunConfig:
     A value of 0 means "derive automatically" (see train_ant_brl.main).
     """
 
-    seeds: int = 10
+    seeds: int = 3
     seed_offset: int = 42
     episodes: int = 0  # 0 = brl.total_episodes
     max_steps: int = 0  # 0 = ant_morph.max_episode_steps
     device: str = "cuda"
     eval_interval: int = 0  # 0 = min(10, episodes)
     checkpoint_interval: int = 500  # 0 = only save best + final checkpoints
-    parallel_seeds: int = 10
+    parallel_seeds: int = 3
     gpu_mem_fraction: float = 0.0  # per-process CUDA memory cap (0 = no cap)
 
 

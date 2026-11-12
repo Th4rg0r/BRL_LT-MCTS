@@ -70,8 +70,8 @@ brl:
   eta_viol: 2.0
   beta_ent: 0.01
   warmup_episodes: 100
-  brl_episodes: 2500
-  total_episodes: 3000
+  brl_episodes: 10000
+  total_episodes: 10000
   warmup_limit: 50.0
   warmup_budget: 100.0
 
