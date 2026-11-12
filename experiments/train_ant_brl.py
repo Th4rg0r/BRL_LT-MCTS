@@ -1107,6 +1107,8 @@ def main(argv: List[str] | None = None) -> Dict[str, Any]:
         )
     )
     device = args.device if args.device is not None else (cfg.run.device or "cpu")
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        device = "cpu"
     parallel_seeds = (
         args.parallel_seeds
         if args.parallel_seeds is not None

@@ -208,26 +208,70 @@ def test_18d_differentiable_knapsack_projection() -> None:
     )
 
 
+def test_limb_kinematics_perception_distortion() -> None:
+    """Verifies that w_13 distorts limb position and w_14 distorts limb pointing."""
+    spec = ModalitySliceSpec.create_ant_spec(use_contact_forces=False)
+    pfilter = PerceptionDistortionFilter(slice_spec=spec, obs_dim=27)
+
+    # 1. Zero tweak -> 100% exact limb kinematics
+    tweak_zero = np.zeros(18, dtype=np.float32)
+    pfilter.reset_episode(tweak_vector=tweak_zero, seed=42)
+    clean_kin = np.array([
+        [0.2, 0.2, 0.0, 0.625, 0.5],
+        [-0.2, 0.2, 0.0, 0.875, 0.5],
+        [-0.2, -0.2, 0.0, 0.125, 0.5],
+        [0.2, -0.2, 0.0, 0.375, 0.5],
+    ], dtype=np.float32)
+
+    perc_kin, metrics = pfilter.distort_limb_kinematics(clean_kin)
+    assert np.allclose(perc_kin, clean_kin, atol=1e-6)
+    assert metrics["limb_kinematics_exactness"] == 1.0
+    assert metrics["limb_pos_rmse"] == 0.0
+    assert metrics["limb_pointing_rmse"] == 0.0
+
+    # 2. Position distortion only (w[12] = 800)
+    tweak_pos = np.zeros(18, dtype=np.float32)
+    tweak_pos[12] = 800.0
+    pfilter.reset_episode(tweak_vector=tweak_pos, seed=42)
+    perc_kin_pos, m_pos = pfilter.distort_limb_kinematics(clean_kin)
+    assert m_pos["limb_pos_rmse"] > 0.005
+    assert m_pos["limb_pointing_rmse"] == 0.0  # pointing unchanged
+    assert m_pos["limb_kinematics_exactness"] < 1.0
+
+    # 3. Pointing distortion only (w[13] = 800)
+    tweak_rot = np.zeros(18, dtype=np.float32)
+    tweak_rot[13] = 800.0
+    pfilter.reset_episode(tweak_vector=tweak_rot, seed=42)
+    perc_kin_rot, m_rot = pfilter.distort_limb_kinematics(clean_kin)
+    assert m_rot["limb_pos_rmse"] == 0.0  # position unchanged
+    assert m_rot["limb_pointing_rmse"] > 0.005
+    assert m_rot["limb_kinematics_exactness"] < 1.0
+
+
 def test_ant_wrapper_perception_integration() -> None:
     """Tests MorphologicalAntBRLWrapper with 18D tweak vector and perception metrics."""
     env = MorphologicalAntBRLWrapper(env_id="Ant-v5", use_contact_forces=False)
     try:
         tweak_18d = np.zeros(18, dtype=np.float32)
         tweak_18d[0] = 300.0   # Front leg length
-        tweak_18d[12] = 600.0  # Perception leg inexactness
-        tweak_18d[13] = 400.0  # Proprioceptive joint noise
+        tweak_18d[12] = 600.0  # Perception leg inexactness & limb position noise
+        tweak_18d[13] = 400.0  # Proprioceptive joint noise & limb pointing noise
 
         obs, info = env.reset(options={"tweak_vector": tweak_18d})
         assert obs.shape == (27,)
         assert "perceived_tweak_vector" in info
         assert "perception_metrics" in info
         assert info["perception_metrics"]["leg_length_exactness"] < 1.0
+        assert "limb_kinematics" in info
+        assert "true_limb_kinematics" in info
+        assert "limb_kinematics_exactness" in info["perception_metrics"]
 
         action = np.zeros(env.action_space.shape[0], dtype=np.float32)
         next_obs, reward, term, trunc, step_info = env.step(action)
         assert next_obs.shape == (27,)
         assert "perception_metrics" in step_info
         assert "perceived_tweak_vector" in step_info["brl_metrics"]
+        assert "limb_kinematics" in step_info
 
         # Backward compatibility: verify 12D input is seamlessly accepted
         tweak_12d = np.ones(12, dtype=np.float32) * 100.0
@@ -243,18 +287,53 @@ def test_dog_wrapper_perception_integration() -> None:
     env = MorphologicalDogBRLWrapper()
     try:
         tweak_18d = np.zeros(18, dtype=np.float32)
-        tweak_18d[13] = 500.0  # Joint noise
+        tweak_18d[12] = 500.0  # Limb position noise
+        tweak_18d[13] = 500.0  # Joint noise & limb pointing noise
         tweak_18d[15] = 400.0  # Contact force noise
 
         obs, info = env.reset(options={"tweak_vector": tweak_18d})
         assert obs.shape == (48,)
         assert "perceived_tweak_vector" in info
         assert "perception_metrics" in info
+        assert "limb_kinematics" in info
+        assert "limb_kinematics_exactness" in info["perception_metrics"]
+        assert "brl_metrics" in info
 
         action = np.zeros(12, dtype=np.float32)
         next_obs, reward, term, trunc, step_info = env.step(action)
         assert next_obs.shape == (48,)
         assert "perception_metrics" in step_info
+        assert "limb_kinematics" in step_info
+        assert "perceived_leg_scales" in step_info
+    finally:
+        env.close()
+
+
+def test_humanoid_wrapper_perception_integration() -> None:
+    """Tests MorphologicalHumanoidBRLWrapper with 18D tweak vector and perception metrics."""
+    env = MorphologicalHumanoidBRLWrapper(include_cfrc_ext=True)
+    try:
+        tweak_18d = np.zeros(18, dtype=np.float32)
+        tweak_18d[0] = 300.0   # Torso mass
+        tweak_18d[12] = 600.0  # Limb position noise
+        tweak_18d[13] = 400.0  # Joint noise & limb pointing noise
+
+        obs, info = env.reset(options={"tweak_vector": tweak_18d})
+        assert obs.shape == (348,)
+        assert "perceived_tweak_vector" in info
+        assert "perception_metrics" in info
+        assert "limb_kinematics" in info
+        assert info["limb_kinematics"].shape == (5, 5)
+        assert "limb_kinematics_exactness" in info["perception_metrics"]
+        assert "brl_metrics" in info
+
+        action = np.zeros(17, dtype=np.float32)
+        next_obs, reward, term, trunc, step_info = env.step(action)
+        assert next_obs.shape == (348,)
+        assert "perception_metrics" in step_info
+        assert "limb_kinematics" in step_info
+        assert "perceived_leg_scales" in step_info
+        assert "perceived_leg_scales" in step_info["brl_metrics"]
     finally:
         env.close()
 

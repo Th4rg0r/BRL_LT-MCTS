@@ -417,13 +417,19 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         canonical_obs = self._get_canonical_obs()
         obs_noisy = self._add_sensor_noise(canonical_obs)
         obs_distorted, perc_metrics = self.perception_filter.distort_observation(obs_noisy)
+        true_kinematics = self.get_limb_kinematics()
+        perc_kinematics, kin_metrics = self.perception_filter.distort_limb_kinematics(true_kinematics)
+        perc_metrics.update(kin_metrics)
+
         morph_mask = self.get_morphology_mask()
         info["morphology_mask"] = morph_mask
         info["tweak_vector"] = self.current_tweak.astype(np.float32)
         info["perceived_tweak_vector"] = np.asarray(self.perception_filter.perceived_context_vector, dtype=np.float32)
         info["perceived_leg_scales"] = np.asarray(self.perception_filter.perceived_leg_scales, dtype=np.float32)
         info["perception_metrics"] = perc_metrics
-        info["limb_kinematics"] = self.get_limb_kinematics()
+        info["limb_kinematics"] = perc_kinematics
+        info["true_limb_kinematics"] = true_kinematics
+        info["perceived_limb_kinematics"] = perc_kinematics
         info["num_legs"] = self.current_num_legs
         return obs_distorted, info
 
@@ -476,6 +482,9 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
 
         obs_noisy = self._add_sensor_noise(canonical_obs)
         obs_distorted, perc_metrics = self.perception_filter.distort_observation(obs_noisy)
+        true_kinematics = self.get_limb_kinematics()
+        perc_kinematics, kin_metrics = self.perception_filter.distort_limb_kinematics(true_kinematics)
+        perc_metrics.update(kin_metrics)
 
         self._ep_steps += 1
         self._ep_return += float(reward)
@@ -500,7 +509,10 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         info["morphology_mask"] = morph_mask
         info["perception_metrics"] = perc_metrics
         info["perceived_tweak_vector"] = self.perception_filter.perceived_context_vector.astype(np.float32)
-        info["limb_kinematics"] = self.get_limb_kinematics()
+        info["perceived_leg_scales"] = np.asarray(self.perception_filter.perceived_leg_scales, dtype=np.float32)
+        info["limb_kinematics"] = perc_kinematics
+        info["true_limb_kinematics"] = true_kinematics
+        info["perceived_limb_kinematics"] = perc_kinematics
         info["brl_metrics"] = {
             "x_velocity": float(mean_x_vel),
             "total_distance": float(total_dist),
@@ -511,6 +523,7 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
             "ema_win_rate": float(ema_win),
             "tweak_vector": self.current_tweak.astype(np.float32),
             "perceived_tweak_vector": self.perception_filter.perceived_context_vector.astype(np.float32),
+            "perceived_leg_scales": np.asarray(self.perception_filter.perceived_leg_scales, dtype=np.float32),
             "perception_metrics": perc_metrics,
             "num_legs": int(self.current_num_legs),
         }

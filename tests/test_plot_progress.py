@@ -7,6 +7,9 @@ from pathlib import Path
 import tempfile
 
 import numpy as np
+import pytest
+
+matplotlib = pytest.importorskip("matplotlib", reason="matplotlib is required for plot_progress tests")
 
 from experiments.plot_progress import (
     compute_rolling_mean,

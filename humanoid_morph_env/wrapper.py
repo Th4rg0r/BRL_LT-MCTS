@@ -242,6 +242,17 @@ class MorphologicalHumanoidBRLWrapper(gym.Wrapper):
                     k_list.append([0.0, 0.0, 0.0, 0.5, 0.5])
         return np.array(k_list, dtype=np.float32)
 
+    def _add_sensor_noise(self, obs: np.ndarray) -> np.ndarray:
+        """Applies calibrated proprioceptive Gaussian noise w_11 (current_tweak[10]) to observation vector."""
+        w11_n = float(self.current_tweak[10]) / 1000.0
+        if w11_n <= 1e-6:
+            return obs.astype(np.float32, copy=False)
+        sigma_obs = 0.25 * w11_n
+        obs_scale = np.maximum(np.abs(obs), 1.0)
+        noise = self._rng.normal(0.0, sigma_obs * obs_scale, size=obs.shape)
+        noisy_obs = obs + noise
+        return np.clip(noisy_obs, -100.0, 100.0).astype(np.float32)
+
     def reset(
         self,
         *,
@@ -269,13 +280,6 @@ class MorphologicalHumanoidBRLWrapper(gym.Wrapper):
         elif obs_arr.shape[0] > self.canonical_obs_dim:
             obs_arr = obs_arr[: self.canonical_obs_dim]
 
-        # Apply sensor noise (w11)
-        w11_noise = float(self.current_tweak[10]) / 1000.0
-        if w11_noise > 0.0:
-            sigma = 0.05 * w11_noise
-            noise = self._rng.normal(0.0, sigma, size=obs_arr.shape).astype(np.float32)
-            obs_arr = obs_arr + noise
-
         self._ep_steps = 0
         self._ep_return = 0.0
         self._ep_energy = 0.0
@@ -291,14 +295,21 @@ class MorphologicalHumanoidBRLWrapper(gym.Wrapper):
             true_leg_scales=true_scales,
             seed=seed,
         )
-        obs_distorted, perc_metrics = self.perception_filter.distort_observation(obs_arr)
+
+        obs_noisy = self._add_sensor_noise(obs_arr)
+        obs_distorted, perc_metrics = self.perception_filter.distort_observation(obs_noisy)
+        true_kin = self.get_limb_kinematics()
+        perc_kin, kin_metrics = self.perception_filter.distort_limb_kinematics(true_kin)
+        perc_metrics.update(kin_metrics)
 
         info["morphology_mask"] = np.ones(self.max_action_capacity, dtype=np.float32)
         info["tweak_vector"] = self.current_tweak.copy()
         info["perceived_tweak_vector"] = self.perception_filter.perceived_context_vector.astype(np.float32)
         info["perceived_leg_scales"] = self.perception_filter.perceived_leg_scales.astype(np.float32)
         info["perception_metrics"] = perc_metrics
-        info["limb_kinematics"] = self.get_limb_kinematics()
+        info["limb_kinematics"] = perc_kin
+        info["true_limb_kinematics"] = true_kin
+        info["perceived_limb_kinematics"] = perc_kin
         info["torso_mass"] = float(self.mj_model.body_mass[self._torso_bodies[0]]) if self._torso_bodies else float(np.sum(self.mj_model.body_mass))
         info["brl_metrics"] = {
             "x_velocity": 0.0,
@@ -307,6 +318,7 @@ class MorphologicalHumanoidBRLWrapper(gym.Wrapper):
             "healthy_steps": 0,
             "tweak_vector": self.current_tweak.copy(),
             "perceived_tweak_vector": self.perception_filter.perceived_context_vector.astype(np.float32),
+            "perceived_leg_scales": self.perception_filter.perceived_leg_scales.astype(np.float32),
             "perception_metrics": perc_metrics,
         }
         return obs_distorted, info
@@ -346,25 +358,26 @@ class MorphologicalHumanoidBRLWrapper(gym.Wrapper):
         elif obs_arr.shape[0] > self.canonical_obs_dim:
             obs_arr = obs_arr[: self.canonical_obs_dim]
 
-        w11_noise = float(self.current_tweak[10]) / 1000.0
-        if w11_noise > 0.0:
-            sigma = 0.05 * w11_noise
-            noise = self._rng.normal(0.0, sigma, size=obs_arr.shape).astype(np.float32)
-            obs_arr = obs_arr + noise
-
+        obs_noisy = self._add_sensor_noise(obs_arr)
         # Check torso health height (z in [1.0, 2.0])
         torso_z = float(self.mj_data.qpos[2])
         is_healthy = self.healthy_z_range[0] <= torso_z <= self.healthy_z_range[1]
         if is_healthy:
             self._healthy_steps += 1
 
-        obs_distorted, perc_metrics = self.perception_filter.distort_observation(obs_arr)
+        obs_distorted, perc_metrics = self.perception_filter.distort_observation(obs_noisy)
+        true_kin = self.get_limb_kinematics()
+        perc_kin, kin_metrics = self.perception_filter.distort_limb_kinematics(true_kin)
+        perc_metrics.update(kin_metrics)
 
         info["morphology_mask"] = np.ones(self.max_action_capacity, dtype=np.float32)
         info["tweak_vector"] = self.current_tweak.copy()
         info["perceived_tweak_vector"] = self.perception_filter.perceived_context_vector.astype(np.float32)
+        info["perceived_leg_scales"] = self.perception_filter.perceived_leg_scales.astype(np.float32)
         info["perception_metrics"] = perc_metrics
-        info["limb_kinematics"] = self.get_limb_kinematics()
+        info["limb_kinematics"] = perc_kin
+        info["true_limb_kinematics"] = true_kin
+        info["perceived_limb_kinematics"] = perc_kin
         info["torso_mass"] = float(self.mj_model.body_mass[self._torso_bodies[0]]) if self._torso_bodies else float(np.sum(self.mj_model.body_mass))
         info["brl_metrics"] = {
             "x_velocity": float(x_vel),
@@ -373,6 +386,7 @@ class MorphologicalHumanoidBRLWrapper(gym.Wrapper):
             "healthy_steps": int(self._healthy_steps),
             "tweak_vector": self.current_tweak.copy(),
             "perceived_tweak_vector": self.perception_filter.perceived_context_vector.astype(np.float32),
+            "perceived_leg_scales": self.perception_filter.perceived_leg_scales.astype(np.float32),
             "perception_metrics": perc_metrics,
         }
         return obs_distorted, float(reward), terminated, truncated, info

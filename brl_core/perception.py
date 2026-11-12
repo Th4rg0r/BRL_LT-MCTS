@@ -170,6 +170,18 @@ class PerceptionDistortionFilter:
         self._obs_history: deque[np.ndarray] = deque(maxlen=max_latency_steps)
         self._last_emitted_obs: Optional[np.ndarray] = None
 
+        # Limb position & pointing perception calibration
+        self._limb_pos_bias: Optional[np.ndarray] = None
+        self._limb_rot_bias: Optional[np.ndarray] = None
+        self._limb_pos_bias_std: float = 0.0
+        self._limb_rot_bias_std: float = 0.0
+        self._step_limb_pos_noise_std: float = 0.0
+        self._step_limb_rot_noise_std: float = 0.0
+        self.limb_pos_rmse: float = 0.0
+        self.limb_pointing_rmse: float = 0.0
+        self.limb_kinematics_exactness: float = 1.0
+        self.last_perceived_kinematics: Optional[np.ndarray] = None
+
         # Running telemetry
         self._step_sq_errors: List[float] = []
         self._ep_steps: int = 0
@@ -309,6 +321,30 @@ class PerceptionDistortionFilter:
             self._dropout_prob = 0.0
             self._latency_steps = 0
 
+        # ----------------------------------------------------------------------
+        # 3. Limb Kinematics Perception (Position: w[12] / Pointing: w[13])
+        # ----------------------------------------------------------------------
+        if u_morph > 1e-6:
+            self._step_limb_pos_noise_std = float(0.015 * u_morph)
+            self._limb_pos_bias_std = float(0.05 * u_morph)
+        else:
+            self._step_limb_pos_noise_std = 0.0
+            self._limb_pos_bias_std = 0.0
+
+        if u_joint > 1e-6:
+            self._step_limb_rot_noise_std = float(0.02 * u_joint)
+            self._limb_rot_bias_std = float(0.08 * u_joint)
+        else:
+            self._step_limb_rot_noise_std = 0.0
+            self._limb_rot_bias_std = 0.0
+
+        self._limb_pos_bias = None
+        self._limb_rot_bias = None
+        self.limb_pos_rmse = 0.0
+        self.limb_pointing_rmse = 0.0
+        self.limb_kinematics_exactness = 1.0
+        self.last_perceived_kinematics = None
+
         self._obs_history.clear()
         self._last_emitted_obs = None
         self._step_sq_errors.clear()
@@ -400,6 +436,92 @@ class PerceptionDistortionFilter:
         self._ep_steps += 1
         return output_obs, self.get_telemetry()
 
+    def distort_limb_kinematics(
+        self, true_kinematics: np.ndarray, rng: Optional[np.random.Generator] = None
+    ) -> Tuple[np.ndarray, Dict[str, Any]]:
+        """Applies configured perception noise to body-relative limb anchor position (x, y, z)
+        and instantaneous pointing (yaw, pitch).
+
+        Limb position inexactness is governed by w[12] (u_morph).
+        Limb pointing inexactness is governed by w[13] (u_joint).
+
+        Args:
+            true_kinematics: Array of shape (n_limbs, 5) where columns are [x, y, z, yaw, pitch].
+            rng: Optional RNG.
+
+        Returns:
+            perceived_kinematics: Distorted array of shape (n_limbs, 5).
+            metrics: Telemetry dictionary including limb_pos_rmse, limb_pointing_rmse, limb_kinematics_exactness.
+        """
+        if rng is not None:
+            self._rng = rng
+
+        kin = np.asarray(true_kinematics, dtype=np.float32)
+        if kin.ndim != 2 or kin.shape[1] < 5:
+            return kin, {
+                "limb_pos_rmse": 0.0,
+                "limb_pointing_rmse": 0.0,
+                "limb_kinematics_exactness": 1.0,
+            }
+
+        n_limbs = kin.shape[0]
+        # Lazily allocate persistent calibration biases for current limb count if not set
+        if self._limb_pos_bias is None or self._limb_pos_bias.shape[0] != n_limbs:
+            if self._limb_pos_bias_std > 1e-6:
+                self._limb_pos_bias = self._rng.normal(
+                    0.0, self._limb_pos_bias_std, size=(n_limbs, 3)
+                ).astype(np.float32)
+            else:
+                self._limb_pos_bias = np.zeros((n_limbs, 3), dtype=np.float32)
+
+        if self._limb_rot_bias is None or self._limb_rot_bias.shape[0] != n_limbs:
+            if self._limb_rot_bias_std > 1e-6:
+                self._limb_rot_bias = self._rng.normal(
+                    0.0, self._limb_rot_bias_std, size=(n_limbs, 2)
+                ).astype(np.float32)
+            else:
+                self._limb_rot_bias = np.zeros((n_limbs, 2), dtype=np.float32)
+
+        distorted = kin.copy()
+
+        # 1. Distort Limb Anchor Positions (x, y, z) via w[12]
+        if self._limb_pos_bias_std > 1e-6 or self._step_limb_pos_noise_std > 1e-6:
+            pos_noise = (
+                self._rng.normal(0.0, self._step_limb_pos_noise_std, size=(n_limbs, 3)).astype(np.float32)
+                if self._step_limb_pos_noise_std > 1e-6
+                else np.zeros((n_limbs, 3), dtype=np.float32)
+            )
+            distorted[:, 0:3] = kin[:, 0:3] + self._limb_pos_bias + pos_noise
+
+        # 2. Distort Limb Pointing Direction (yaw, pitch) via w[13]
+        if self._limb_rot_bias_std > 1e-6 or self._step_limb_rot_noise_std > 1e-6:
+            rot_noise = (
+                self._rng.normal(0.0, self._step_limb_rot_noise_std, size=(n_limbs, 2)).astype(np.float32)
+                if self._step_limb_rot_noise_std > 1e-6
+                else np.zeros((n_limbs, 2), dtype=np.float32)
+            )
+            raw_yaw = kin[:, 3] + self._limb_rot_bias[:, 0] + rot_noise[:, 0]
+            raw_pitch = kin[:, 4] + self._limb_rot_bias[:, 1] + rot_noise[:, 1]
+            distorted[:, 3] = raw_yaw % 1.0
+            distorted[:, 4] = np.clip(raw_pitch, 0.0, 1.0)
+
+        # Telemetry
+        pos_sq_err = float(np.mean(np.square(distorted[:, 0:3] - kin[:, 0:3])))
+        rot_sq_err = float(np.mean(np.square(distorted[:, 3:5] - kin[:, 3:5])))
+        self.limb_pos_rmse = float(math.sqrt(pos_sq_err))
+        self.limb_pointing_rmse = float(math.sqrt(rot_sq_err))
+        self.limb_kinematics_exactness = float(
+            1.0 / (1.0 + 10.0 * self.limb_pos_rmse + 5.0 * self.limb_pointing_rmse)
+        )
+        self.last_perceived_kinematics = distorted.copy()
+
+        metrics = {
+            "limb_pos_rmse": self.limb_pos_rmse,
+            "limb_pointing_rmse": self.limb_pointing_rmse,
+            "limb_kinematics_exactness": self.limb_kinematics_exactness,
+        }
+        return distorted.astype(np.float32), metrics
+
     def get_telemetry(self) -> Dict[str, Any]:
         """Returns instantaneous and episode-level perception telemetry."""
         if len(self._step_sq_errors) > 0:
@@ -409,7 +531,10 @@ class PerceptionDistortionFilter:
 
         obs_exactness = float(1.0 / (1.0 + obs_rmse))
         leg_exactness = float(self.leg_length_exactness)
-        composite_correctness = float(0.40 * leg_exactness + 0.60 * obs_exactness)
+        limb_exactness = float(self.limb_kinematics_exactness)
+        composite_correctness = float(
+            0.30 * leg_exactness + 0.50 * obs_exactness + 0.20 * limb_exactness
+        )
 
         mean_phys = float(np.mean(self.current_tweak[:12]))
         mean_perc = float(np.mean(self.current_tweak[12:18]))
@@ -417,6 +542,9 @@ class PerceptionDistortionFilter:
         return {
             "perception_correctness": composite_correctness,
             "leg_length_exactness": leg_exactness,
+            "limb_kinematics_exactness": limb_exactness,
+            "limb_pos_rmse": self.limb_pos_rmse,
+            "limb_pointing_rmse": self.limb_pointing_rmse,
             "obs_exactness": obs_exactness,
             "obs_rmse": obs_rmse,
             "true_leg_scales": [float(s) for s in self.true_leg_scales],

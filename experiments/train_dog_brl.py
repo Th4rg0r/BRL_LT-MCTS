@@ -821,6 +821,8 @@ def main(argv: List[str] | None = None) -> Dict[str, Any]:
     num_episodes = args.episodes if args.episodes is not None else (cfg.run.episodes if cfg.run.episodes > 0 else cfg.brl.total_episodes)
     max_steps = args.max_steps if args.max_steps is not None else (cfg.run.max_steps if cfg.run.max_steps > 0 else cfg.dog_morph.max_episode_steps)
     device = args.device if args.device is not None else (cfg.run.device or "cpu")
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        device = "cpu"
     parallel_seeds = args.parallel_seeds if args.parallel_seeds is not None else max(1, int(cfg.run.parallel_seeds))
     eval_interval = cfg.run.eval_interval if cfg.run.eval_interval > 0 and args.episodes is None else max(1, min(10, num_episodes))
     checkpoint_interval = args.checkpoint_interval if args.checkpoint_interval is not None else int(cfg.run.checkpoint_interval)

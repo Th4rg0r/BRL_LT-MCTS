@@ -146,6 +146,7 @@ class MorphologicalDogBRLWrapper(gym.Env):
             obs_dim=self.canonical_obs_dim,
             max_latency_steps=4,
         )
+        self._rng = np.random.default_rng()
         self._current_tweak = np.zeros(18, dtype=np.float32)
         self._action_mask = np.ones(self.act_dim, dtype=np.float32)
         self._wind_state = np.zeros(3, dtype=np.float64)
@@ -287,11 +288,18 @@ class MorphologicalDogBRLWrapper(gym.Env):
             foot_forces,
         ]).astype(np.float32)
 
-        if self._sensor_noise_std > 1e-6:
-            noise = np.random.normal(0.0, self._sensor_noise_std, size=obs.shape).astype(np.float32)
-            obs += noise
-
         return obs
+
+    def _add_sensor_noise(self, obs: np.ndarray) -> np.ndarray:
+        """Applies calibrated proprioceptive Gaussian noise w_11 (norm_tweak[10]) to observation vector."""
+        w11_n = float(self._current_tweak[10]) / 1000.0
+        if w11_n <= 1e-6:
+            return obs.astype(np.float32, copy=False)
+        sigma_obs = 0.25 * w11_n
+        obs_scale = np.maximum(np.abs(obs), 1.0)
+        noise = self._rng.normal(0.0, sigma_obs * obs_scale, size=obs.shape)
+        noisy_obs = obs + noise
+        return np.clip(noisy_obs, -100.0, 100.0).astype(np.float32)
 
     def get_limb_kinematics(self) -> np.ndarray:
         """Computes body-relative anchor (x,y,z) and instantaneous pointing (yaw, pitch) for 4 legs."""
@@ -322,7 +330,7 @@ class MorphologicalDogBRLWrapper(gym.Env):
     ) -> Tuple[np.ndarray, Dict[str, Any]]:
         super().reset(seed=seed)
         if seed is not None:
-            np.random.seed(seed)
+            self._rng = np.random.default_rng(seed)
 
         # Parse options
         tweak = np.zeros(12, dtype=np.float32)
@@ -339,7 +347,7 @@ class MorphologicalDogBRLWrapper(gym.Env):
         mujoco.mj_resetData(self.model, self.data)
         self.data.qpos[:] = self._standing_qpos.copy()
         # Small noise for initial exploration
-        self.data.qpos[7:19] += np.random.uniform(-0.05, 0.05, size=12)
+        self.data.qpos[7:19] += self._rng.uniform(-0.05, 0.05, size=12)
         self.data.qvel[:] = 0.0
 
         mujoco.mj_forward(self.model, self.data)
@@ -365,17 +373,34 @@ class MorphologicalDogBRLWrapper(gym.Env):
             seed=seed,
         )
 
-        obs = self._get_obs()
-        obs_distorted, perc_metrics = self.perception_filter.distort_observation(obs)
+        raw_obs = self._get_obs()
+        obs_noisy = self._add_sensor_noise(raw_obs)
+        obs_distorted, perc_metrics = self.perception_filter.distort_observation(obs_noisy)
+        true_kin = self.get_limb_kinematics()
+        perc_kin, kin_metrics = self.perception_filter.distort_limb_kinematics(true_kin)
+        perc_metrics.update(kin_metrics)
+
         info = {
             "morphology_mask": self._action_mask.copy(),
             "tweak_vector": self._current_tweak.copy(),
             "perceived_tweak_vector": self.perception_filter.perceived_context_vector.astype(np.float32),
             "perceived_leg_scales": self.perception_filter.perceived_leg_scales.astype(np.float32),
             "perception_metrics": perc_metrics,
-            "limb_kinematics": self.get_limb_kinematics(),
+            "limb_kinematics": perc_kin,
+            "true_limb_kinematics": true_kin,
+            "perceived_limb_kinematics": perc_kin,
             "torso_mass": float(self.model.body_mass[self.torso_body_id]),
             "healthy": True,
+            "brl_metrics": {
+                "x_velocity": 0.0,
+                "total_distance": 0.0,
+                "energy_cost": 0.0,
+                "healthy_steps": 0,
+                "tweak_vector": self._current_tweak.copy(),
+                "perceived_tweak_vector": self.perception_filter.perceived_context_vector.astype(np.float32),
+                "perceived_leg_scales": self.perception_filter.perceived_leg_scales.astype(np.float32),
+                "perception_metrics": perc_metrics,
+            },
         }
         return obs_distorted, info
 
@@ -395,7 +420,7 @@ class MorphologicalDogBRLWrapper(gym.Env):
         # Apply lateral and headwind forces to torso body via Ornstein-Uhlenbeck process
         if self._wind_lateral_mag > 1e-3 or self._wind_head_mag > 1e-3:
             # OU update: dx = -theta * x * dt + sigma * dW
-            wind_noise = np.random.normal(0.0, 1.0, size=3)
+            wind_noise = self._rng.normal(0.0, 1.0, size=3)
             self._wind_state[0] += -0.1 * self._wind_state[0] + 0.3 * wind_noise[0]  # headwind
             self._wind_state[1] += -0.1 * self._wind_state[1] + 0.3 * wind_noise[1]  # lateral
             wind_x = -self._wind_head_mag * (1.0 + 0.2 * self._wind_state[0])
@@ -443,14 +468,22 @@ class MorphologicalDogBRLWrapper(gym.Env):
         terminated = not is_healthy
         truncated = self._step_count >= self.max_episode_steps
 
-        obs = self._get_obs()
-        obs_distorted, perc_metrics = self.perception_filter.distort_observation(obs)
+        raw_obs = self._get_obs()
+        obs_noisy = self._add_sensor_noise(raw_obs)
+        obs_distorted, perc_metrics = self.perception_filter.distort_observation(obs_noisy)
+        true_kin = self.get_limb_kinematics()
+        perc_kin, kin_metrics = self.perception_filter.distort_limb_kinematics(true_kin)
+        perc_metrics.update(kin_metrics)
+
         info = {
             "morphology_mask": self._action_mask.copy(),
             "tweak_vector": self._current_tweak.copy(),
             "perceived_tweak_vector": self.perception_filter.perceived_context_vector.astype(np.float32),
+            "perceived_leg_scales": self.perception_filter.perceived_leg_scales.astype(np.float32),
             "perception_metrics": perc_metrics,
-            "limb_kinematics": self.get_limb_kinematics(),
+            "limb_kinematics": perc_kin,
+            "true_limb_kinematics": true_kin,
+            "perceived_limb_kinematics": perc_kin,
             "healthy": is_healthy,
             "brl_metrics": {
                 "forward_reward": float(forward_reward),
@@ -462,6 +495,7 @@ class MorphologicalDogBRLWrapper(gym.Env):
                 "healthy_steps": int(self._healthy_steps),
                 "tweak_vector": self._current_tweak.copy(),
                 "perceived_tweak_vector": self.perception_filter.perceived_context_vector.astype(np.float32),
+                "perceived_leg_scales": self.perception_filter.perceived_leg_scales.astype(np.float32),
                 "perception_metrics": perc_metrics,
             },
         }

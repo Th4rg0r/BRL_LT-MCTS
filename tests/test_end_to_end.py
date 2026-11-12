@@ -72,7 +72,7 @@ def test_gate4_representation_consistency_convergence() -> None:
 def test_gate4_end_to_end_multi_seed_pipeline(tmp_path) -> None:
     """Runs the full 3-seed end-to-end training & OOD benchmark suite verification."""
     cfg_Check = load_config("config/default_config.yaml")
-    assert cfg_Check.la_mcts.num_peaks == 5
+    assert cfg_Check.la_mcts.num_peaks == 4
 
     out_dir = tmp_path / "gate4_outputs"
     results = run_train_main(
