@@ -48,11 +48,11 @@ This document provides a comprehensive reference for every configuration paramet
   - Must evenly divide `d_model`.
 
 #### `l_enc`
-- **Type**: `int` | **Default**: `3`
+- **Type**: `int` | **Default**: `2`
 - **Purpose**: Number of stacked Transformer encoder layers in the observation representation network $h_\theta$.
 - **Training Impact**:
   - **Higher**: Deeper hierarchical reasoning over history and context, but increases latency during MCTS root node evaluation.
-  - **Lower**: Minimal inference latency; 3 layers provides an optimal balance between representation depth and fast MCTS simulation throughput.
+  - **Lower**: Minimal inference latency; 2 layers provides an optimal balance between representation depth and fast MCTS simulation throughput while `MorphologicalLimbHead` handles inter-limb attention.
 
 #### `latent_dim`
 - **Type**: `int` | **Default**: `256`
@@ -105,19 +105,19 @@ This document provides a comprehensive reference for every configuration paramet
   - **`false`**: Uses scalar MSE regression, which is prone to gradient explosions when the agent falls or transitions between high-reward locomotion and severe fall penalties.
 
 #### `support_min` and `support_max`
-- **Type**: `int` | **Default**: `support_min: -300`, `support_max: 300`
-- **Purpose**: Discrete value boundaries for the return distribution $[V_{\min}, V_{\max}]$.
+- **Type**: `int` | **Default**: `support_min: -150`, `support_max: 150`
+- **Purpose**: Discrete value boundaries for the `symlog`-transformed return distribution $[V_{\min}, V_{\max}]$.
 - **Training Impact**:
   - Returns falling outside $[support\_min, support\_max]$ are clipped to the boundary bins.
-  - Must cover the range of cumulative discounted episode returns ($\gamma=0.99$). For Ant-v5 with step rewards $\approx [-1, +5]$ over an effective horizon of $1/(1-\gamma) = 100$ steps, $[-300, +300]$ provides ample dynamic range.
+  - Because `SupportCriticHead` applies `symlog_transform` before binning, `[-150, 150]` covers raw cumulative returns well beyond `±20,000` while keeping the critic head compact.
 
 #### `num_bins`
-- **Type**: `int` | **Default**: `601`
+- **Type**: `int` | **Default**: `301`
 - **Purpose**: Number of discrete probability atoms spanning $[support\_min, support\_max]$.
 - **Training Impact**:
-  - Bin resolution is $\Delta = (300 - (-300)) / (601 - 1) = 1.0$ return units per bin.
+  - Bin resolution is $\Delta = (150 - (-150)) / (301 - 1) = 1.0$ `symlog` units per bin.
   - **Higher**: Finer value granularity at the cost of larger softmax layers.
-  - **Lower**: Coarser value predictions; 601 bins provides integer-level precision across the entire trajectory.
+  - **Lower**: Coarser value predictions; 301 bins provides unit-level `symlog` precision while halving critic head size compared to 601 bins.
 
 #### `gamma`
 - **Type**: `float` | **Default**: `0.99`
@@ -181,15 +181,15 @@ This document provides a comprehensive reference for every configuration paramet
 ### 1.5 MCTS Tree Search & Action Selection
 
 #### `n_sim` and `n_sim_eval`
-- **Type**: `int` | **Default**: `n_sim: 36`, `n_sim_eval: 64`
+- **Type**: `int` | **Default**: `n_sim: 32`, `n_sim_eval: 64`
 - **Purpose**: Number of MCTS simulation trajectories executed per environment step during training (`n_sim`) and evaluation (`n_sim_eval`).
 - **Training Impact**:
   - **Higher**: Deeper and broader search tree; significantly improves action quality and stability over complex terrain. However, runtime scales linearly with simulation count.
-  - **Training (36)**: Selected to maintain wall-clock throughput while giving substantial policy improvement over pure model-free policies.
-  - **Eval (64)**: Increased simulation budget during evaluation to extract maximum performance from the learned world model.
+  - **Training (32)**: Exact multiple of `batch_leaf_eval = 16` (2 GPU batches per step), maximizing wall-clock throughput while preserving strong tree planning.
+  - **Eval (64)**: 4 GPU batches during evaluation to extract maximum performance from the learned world model.
 
 #### `k_act`
-- **Type**: `int` | **Default**: `24`
+- **Type**: `int` | **Default**: `16`
 - **Purpose**: Number of candidate continuous actions sampled from the policy prior $p(a \mid s)$ when expanding a tree node.
 - **Training Impact**:
   - Continuous action spaces cannot be exhaustively expanded. $k_{\text{act}} = 24$ candidates cover diverse gait variations.
@@ -246,8 +246,8 @@ This document provides a comprehensive reference for every configuration paramet
   - Keeps training focused on recent, high-performing policy data while discarding obsolete early random exploratory steps.
 
 #### `train_every_steps`
-- **Type**: `int` | **Default**: `80`
-- **Purpose**: Frequency of agent gradient descent updates during episode execution. Every 80 environment steps, one training batch is sampled and backpropagated.
+- **Type**: `int` | **Default**: `50`
+- **Purpose**: Frequency of agent gradient descent updates during episode execution. Every 50 environment steps, one training batch is sampled and backpropagated.
 - **Training Impact**:
   - **Lower (e.g. 20)**: High sample efficiency (more updates per environment step), but slows down wall-clock simulation.
   - **Higher (e.g. 200)**: Faster wall-clock execution, but requires more environment interactions to learn.
@@ -331,7 +331,7 @@ The BRL framework sets up an asymmetric three-agent game:
   - $\beta_w = 0.05$ creates an effective smoothing window of $1 / 0.05 = 20$ episodes. Prevents erratic budget fluctuations caused by single-episode luck.
 
 #### `initial_r_ref` and `benchmark_r_ref`
-- **Type**: `float` | **Default**: `initial_r_ref: 1000.0`, `benchmark_r_ref: 6169.54`
+- **Type**: `float` | **Default**: `initial_r_ref: 0.0`, `benchmark_r_ref: 6169.54`
 - **Purpose**: Dynamic reference return $R_{\text{ref}}$ used to define an episode "win":
   $$\text{Episode Win} \iff \text{Return } R \ge R_{\text{ref}}$$
 - **Training Impact**:
@@ -382,7 +382,7 @@ The BRL framework sets up an asymmetric three-agent game:
 ### 2.4 Curriculum Schedule & Warmup
 
 #### `warmup_episodes`
-- **Type**: `int` | **Default**: `50`
+- **Type**: `int` | **Default**: `100`
 - **Purpose**: Number of initial episodes where environmental perturbations are strictly clamped.
 - **Training Impact**:
   - Allows the agent to learn basic upright posture and stepping before facing severe ice, missing legs, or heavy payloads.
