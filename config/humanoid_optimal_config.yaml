@@ -14,40 +14,40 @@ la_mcts:
   n_heads: 2
   l_enc: 2
   latent_dim: 256
-  num_peaks: 6
+  num_peaks: 4
   log_std_bounds: [-5.0, 2.0]
   use_categorical_critic: true
   support_min: -300
   support_max: 300
   num_bins: 601
-  gamma: 0.99
-  td_steps: 10
+  gamma: 0.995
+  td_steps: 8
   l_dyn: 1
   proj_dim: 512
   pred_dim: 128
-  unroll_steps: 4
+  unroll_steps: 6
   lambda_rep: 0.8853095624216669
   beta_mse: 1.3897002761045842
   lambda_v: 0.6055677780266552
   lambda_r: 0.621173253375189
   lambda_p: 0.455514714958742
   c_reg: 0.000368233957428611
-  n_sim: 8
-  n_sim_eval: 16
+  n_sim: 50
+  n_sim_eval: 100
   k_act: 24
   c_1: 0.9292231648106186
   c_2: 19652.0
-  root_tau_beta: 1.0466136285895133
+  root_tau_beta: 1.25
   inner_tau_beta: 1.1641586840610123
-  tau_act_train: 0.5629951553611371
+  tau_act_train: 1.0
   tau_act_eval: 0.05
   lr: 0.0007217405739366711
   batch_size: 128
   buffer_capacity: 50000
   context_dim: 18
-  history_len: 8
+  history_len: 6
   reanalyze_ratio: 0.25
-  train_every_steps: 78
+  train_every_steps: 20
   reanalyze_every: 4
   reanalyze_states: 4
 brl:
@@ -74,7 +74,7 @@ brl:
   beta_score: 1.0
   eta_viol: 1.6860981529771117
   beta_ent: 0.002297804285307939
-  warmup_episodes: 50
+  warmup_episodes: 100
   brl_episodes: 2500
   total_episodes: 3000
   warmup_limit: 50.0
@@ -88,10 +88,10 @@ humanoid_morph:
 run:
   seeds: 10
   seed_offset: 42
-  episodes: 3000
+  episodes: 0
   max_steps: 1000
   device: cuda
-  eval_interval: 10
+  eval_interval: 0
   checkpoint_interval: 500
-  parallel_seeds: 1
-  gpu_mem_fraction: 0.182
+  parallel_seeds: 10
+  gpu_mem_fraction: 0.0
