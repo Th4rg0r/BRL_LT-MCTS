@@ -86,7 +86,7 @@ ant_morph:
 
 # Run protocol defaults for experiments/train_ant_brl.py (CLI flags override; 0 = automatic)
 run:
-  seeds: 3
+  seeds: 10
   seed_offset: 42
   episodes: 0          # 0 = brl.total_episodes
   max_steps: 0         # 0 = ant_morph.max_episode_steps
