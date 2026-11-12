@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -105,12 +105,13 @@ class TanhMixtureSameFamily:
 
 
 class MorphologicalLimbHead(nn.Module):
-    """Universal Morphological Limb Network f_phi(z_t, k_i(t)).
+    """Universal Morphological Limb Network f_phi(z_t, k_i(t)) with Transformer Encoder-Decoder.
 
-    Receives the central overall latent representation z_t and an 8D harmonic kinematic
-    embedding of the limb's 3D body anchor (x, y, z) and instantaneous pointing direction
-    (phi_yaw, phi_pitch) relative to the torso coordinate frame.
-    Outputs the joint distribution parameters (mu, log_std) for that specific limb.
+    Projects the central overall latent representation z_t and all limbs' 8D harmonic
+    kinematic embeddings (3D anchor + yaw/pitch direction) into a shared hidden dimension d_limb.
+    A Pre-LN Transformer Encoder lets every limb attend to the global state and all other limbs
+    for inter-limb coordination, and a Pre-LN Transformer Decoder cross-attends each limb query
+    against the coordinated memory before predicting per-limb GMM parameters (mu, log_std).
     """
 
     def __init__(
@@ -120,6 +121,9 @@ class MorphologicalLimbHead(nn.Module):
         max_joints_per_limb: int = 4,
         hidden_dim: int = 128,
         log_std_bounds: Tuple[float, float] = (-3.0, 2.0),
+        n_heads: int = 4,
+        n_enc_layers: int = 1,
+        n_dec_layers: int = 1,
     ) -> None:
         super().__init__()
         self.latent_dim = latent_dim
@@ -127,20 +131,54 @@ class MorphologicalLimbHead(nn.Module):
         self.max_joints_per_limb = max_joints_per_limb
         self.hidden_dim = hidden_dim
         self.log_std_bounds = log_std_bounds
+        self.n_heads = n_heads
 
         # 8D geometric query embedding:
         # [x, y, z, yaw, cos(2*pi*yaw), sin(2*pi*yaw), pitch, sin(pi*pitch)]
         self.geom_dim = 8
-        in_dim = latent_dim + self.geom_dim
 
-        self.mlp = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
+        # Project global latent z_t and per-limb kinematics into shared token dimension
+        self.global_proj = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+        )
+        self.kin_proj = nn.Sequential(
+            nn.Linear(self.geom_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
-            nn.SiLU(),
         )
+
+        # Role embeddings (global state vs. limb token) - permutation-invariant across morphologies
+        self.global_type_emb = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
+        self.limb_type_emb = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
+
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=n_heads,
+            dim_feedforward=hidden_dim * 2,
+            dropout=0.0,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(
+            enc_layer, num_layers=n_enc_layers, enable_nested_tensor=False
+        )
+
+        dec_layer = nn.TransformerDecoderLayer(
+            d_model=hidden_dim,
+            nhead=n_heads,
+            dim_feedforward=hidden_dim * 2,
+            dropout=0.0,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.decoder = nn.TransformerDecoder(dec_layer, num_layers=n_dec_layers)
+        self.out_ln = nn.LayerNorm(hidden_dim)
+
         self.mu_head = nn.Linear(hidden_dim, num_peaks * max_joints_per_limb)
         self.log_std_head = nn.Linear(hidden_dim, num_peaks * max_joints_per_limb)
 
@@ -162,6 +200,33 @@ class MorphologicalLimbHead(nn.Module):
 
         return torch.cat([x, y, z, yaw, cos_yaw, sin_yaw, pitch, sin_pitch], dim=-1)
 
+    def _encode_and_decode(
+        self,
+        z_flat: torch.Tensor,
+        query_geom: torch.Tensor,
+        context_geom: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Runs Transformer Encoder over [global, context_limbs] and Decoder over query_limbs.
+
+        Args:
+            z_flat: (B, latent_dim)
+            query_geom: (B, N_query, 8)
+            context_geom: (B, N_ctx, 8); defaults to query_geom when None.
+        Returns:
+            h: (B, N_query, hidden_dim)
+        """
+        e_global = self.global_proj(z_flat).unsqueeze(1) + self.global_type_emb  # (B, 1, D)
+        e_query = self.kin_proj(query_geom) + self.limb_type_emb  # (B, N_q, D)
+        if context_geom is None:
+            e_ctx = e_query
+        else:
+            e_ctx = self.kin_proj(context_geom) + self.limb_type_emb  # (B, N_ctx, D)
+
+        enc_seq = torch.cat([e_global, e_ctx], dim=1)  # (B, 1 + N_ctx, D)
+        memory = self.encoder(enc_seq)
+        dec_out = self.decoder(tgt=e_query, memory=memory)
+        return self.out_ln(dec_out)
+
     def forward_single_limb(
         self,
         z_t: torch.Tensor,
@@ -169,6 +234,7 @@ class MorphologicalLimbHead(nn.Module):
         yaw: float | torch.Tensor,
         pitch: float | torch.Tensor,
         num_joints: Optional[int] = None,
+        all_limbs_kinematics: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Computes (mu, log_std) for a single queried limb given its 3D anchor and direction angles."""
         device = z_t.device
@@ -187,7 +253,7 @@ class MorphologicalLimbHead(nn.Module):
             pitch_t = pitch.to(device=device, dtype=dtype).view(-1)
 
         kin_5d = torch.cat([anchor_t.view(-1, 3), yaw_t.view(-1, 1), pitch_t.view(-1, 1)], dim=-1)
-        geom = self.encode_kinematics(kin_5d)
+        geom = self.encode_kinematics(kin_5d).unsqueeze(1)  # (B_or_1, 1, 8)
 
         if z_t.dim() == 1:
             z_t_in = z_t.unsqueeze(0)
@@ -196,10 +262,16 @@ class MorphologicalLimbHead(nn.Module):
 
         bsz = z_t_in.shape[0]
         if geom.shape[0] == 1 and bsz > 1:
-            geom = geom.expand(bsz, -1)
+            geom = geom.expand(bsz, -1, -1)
 
-        feat = torch.cat([z_t_in, geom], dim=-1)
-        h = self.mlp(feat)
+        ctx_geom = None
+        if all_limbs_kinematics is not None:
+            ctx_t = all_limbs_kinematics.to(device=device, dtype=dtype)
+            if ctx_t.dim() == 2:
+                ctx_t = ctx_t.unsqueeze(0).expand(bsz, -1, -1)
+            ctx_geom = self.encode_kinematics(ctx_t)
+
+        h = self._encode_and_decode(z_t_in, query_geom=geom, context_geom=ctx_geom).squeeze(1)
 
         mu_raw = self.mu_head(h).view(bsz, self.num_peaks, self.max_joints_per_limb)
         log_std_raw = self.log_std_head(h).view(bsz, self.num_peaks, self.max_joints_per_limb)
@@ -219,7 +291,7 @@ class MorphologicalLimbHead(nn.Module):
         limb_joint_counts: Optional[Sequence[int]] = None,
         target_action_dim: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Vectorized forward pass over all creature limbs simultaneously."""
+        """Vectorized forward pass over all creature limbs with Transformer inter-limb coordination."""
         orig_shape = z_t.shape[:-1]
         z_flat = z_t.view(-1, self.latent_dim)
         bsz = z_flat.shape[0]
@@ -227,17 +299,16 @@ class MorphologicalLimbHead(nn.Module):
         if limb_kinematics.dim() == 2:
             n_limbs = limb_kinematics.shape[0]
             kin_flat = limb_kinematics.unsqueeze(0).expand(bsz, n_limbs, 5)
-        elif limb_kinematics.dim() == 3:
+        elif limb_kinematics.dim() >= 3:
             n_limbs = limb_kinematics.shape[-2]
-            kin_flat = limb_kinematics.view(bsz, n_limbs, 5)
+            kin_flat = limb_kinematics.reshape(-1, n_limbs, 5)
+            if kin_flat.shape[0] == 1 and bsz > 1:
+                kin_flat = kin_flat.expand(bsz, n_limbs, 5)
         else:
             raise ValueError(f"Unsupported limb_kinematics shape: {limb_kinematics.shape}")
 
         geom_emb = self.encode_kinematics(kin_flat)  # (bsz, n_limbs, 8)
-        z_expanded = z_flat.unsqueeze(1).expand(bsz, n_limbs, self.latent_dim)
-
-        combined = torch.cat([z_expanded, geom_emb], dim=-1)  # (bsz, n_limbs, latent_dim + 8)
-        h = self.mlp(combined)  # (bsz, n_limbs, hidden_dim)
+        h = self._encode_and_decode(z_flat, query_geom=geom_emb)  # (bsz, n_limbs, hidden_dim)
 
         mu_limbs = self.mu_head(h).view(bsz, n_limbs, self.num_peaks, self.max_joints_per_limb)
         log_std_limbs = self.log_std_head(h).view(bsz, n_limbs, self.num_peaks, self.max_joints_per_limb)

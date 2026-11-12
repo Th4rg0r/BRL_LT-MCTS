@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 import torch.optim as optim
@@ -34,6 +34,7 @@ class EpisodeTrajectory:
         default_factory=lambda: np.ones(17, dtype=np.float32)
     )
     limb_kinematics: Optional[np.ndarray] = None
+    limb_kinematics_seq: List[Optional[np.ndarray]] = field(default_factory=list)
 
     def __len__(self) -> int:
         return len(self.rewards)
@@ -132,6 +133,7 @@ class TrajectoryReplayBuffer:
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
+        Optional[torch.Tensor],
         List[Tuple[EpisodeTrajectory, int]],
     ]:
         """Samples a batch of K-step unroll windows from stored trajectories."""
@@ -149,6 +151,9 @@ class TrajectoryReplayBuffer:
         ctx_batch = []
         mask_batch = []
         hist_batch = []
+        kin_batch = []
+        kin_shape: Optional[Tuple[int, ...]] = None
+        kin_valid = True
         refs: List[Tuple[EpisodeTrajectory, int]] = []
 
         traj_indices = np.random.randint(0, len(valid_trajs), size=batch_size)
@@ -165,6 +170,7 @@ class TrajectoryReplayBuffer:
             samp_seq = []
             w_seq = []
             hist_seq = []
+            kin_seq = []
 
             for k in range(K + 1):
                 step = min(start + k, T - 1)
@@ -181,6 +187,23 @@ class TrajectoryReplayBuffer:
                         self.max_action_dim,
                     )
                 )
+                step_kin = (
+                    traj.limb_kinematics_seq[step]
+                    if step < len(traj.limb_kinematics_seq)
+                    else traj.limb_kinematics
+                )
+                if step_kin is None:
+                    step_kin = traj.limb_kinematics
+                if step_kin is None:
+                    kin_valid = False
+                else:
+                    arr_k = np.asarray(step_kin, dtype=np.float32)
+                    if kin_shape is None:
+                        kin_shape = arr_k.shape
+                    elif arr_k.shape != kin_shape:
+                        kin_valid = False
+                    kin_seq.append(arr_k)
+
                 if k < K:
                     if start + k < T:
                         act_seq.append(traj.actions[start + k])
@@ -198,6 +221,14 @@ class TrajectoryReplayBuffer:
             ctx_batch.append(traj.context)
             mask_batch.append(traj.action_mask)
             hist_batch.append(np.stack(hist_seq, axis=0))
+            if kin_valid:
+                kin_batch.append(np.stack(kin_seq, axis=0))
+
+        kin_tensor = (
+            torch.as_tensor(np.stack(kin_batch), dtype=torch.float32, device=device)
+            if (kin_valid and len(kin_batch) == len(traj_indices))
+            else None
+        )
 
         return (
             torch.as_tensor(np.stack(obs_batch), dtype=torch.float32, device=device),
@@ -213,6 +244,7 @@ class TrajectoryReplayBuffer:
             torch.as_tensor(np.stack(ctx_batch), dtype=torch.float32, device=device),
             torch.as_tensor(np.stack(mask_batch), dtype=torch.float32, device=device),
             torch.as_tensor(np.stack(hist_batch), dtype=torch.float32, device=device),
+            kin_tensor,
             refs,
         )
 
@@ -311,6 +343,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             limb_kinematics=None,
         )
         self._last_mcts_info: Optional[Tuple[np.ndarray, np.ndarray, float]] = None
+        self._last_limb_kinematics: Optional[np.ndarray] = None
         self._diagnostics: Dict[str, float] = {
             "v_s0": 0.0,
             "td_error": 0.0,
@@ -337,6 +370,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             self.current_action_mask = mask[: self.cfg.max_action_dim].copy()
         if limb_kinematics is not None:
             self.current_limb_kinematics = np.asarray(limb_kinematics, dtype=np.float32).copy()
+            self._last_limb_kinematics = self.current_limb_kinematics.copy()
 
         self.episode_history_deque.clear()
         self.current_trajectory.context = self.current_context.copy()
@@ -375,6 +409,11 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
         """Runs Sampled Continuous MCTS from z_t = backbone(obs, context, history) to choose an action."""
         obs_aligned = self._align_obs(obs)
         active_kin = limb_kinematics if limb_kinematics is not None else self.current_limb_kinematics
+        self._last_limb_kinematics = (
+            np.asarray(active_kin, dtype=np.float32).copy()
+            if active_kin is not None
+            else None
+        )
         with torch.inference_mode():
             obs_t = torch.as_tensor(
                 obs_aligned, dtype=torch.float32, device=self.device
@@ -475,7 +514,18 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
         self.current_trajectory.mcts_values.append(float(root_value))
         self.current_trajectory.mcts_policy_samples.append(root_samples)
         self.current_trajectory.mcts_policy_weights.append(policy_weights)
+        step_kin = (
+            self._last_limb_kinematics
+            if self._last_limb_kinematics is not None
+            else info.get("limb_kinematics", self.current_limb_kinematics)
+        )
+        self.current_trajectory.limb_kinematics_seq.append(
+            np.asarray(step_kin, dtype=np.float32).copy()
+            if step_kin is not None
+            else None
+        )
         self._last_mcts_info = None
+        self._last_limb_kinematics = None
 
         # Record transition to rolling history
         self.episode_history_deque.append((obs_aligned, act_arr))
@@ -486,6 +536,11 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             self.current_trajectory = EpisodeTrajectory(
                 context=self.current_context.copy(),
                 action_mask=self.current_action_mask.copy(),
+                limb_kinematics=(
+                    self.current_limb_kinematics.copy()
+                    if self.current_limb_kinematics is not None
+                    else None
+                ),
             )
 
     def reanalyze_batch(self, num_states: int = 8) -> None:
@@ -517,6 +572,18 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                 mask_t = torch.as_tensor(
                     traj.action_mask, dtype=torch.float32, device=self.device
                 )
+                step_kin = (
+                    traj.limb_kinematics_seq[step]
+                    if step < len(traj.limb_kinematics_seq)
+                    else traj.limb_kinematics
+                )
+                if step_kin is None:
+                    step_kin = traj.limb_kinematics
+                kin_t = (
+                    torch.as_tensor(step_kin, dtype=torch.float32, device=self.device)
+                    if step_kin is not None
+                    else None
+                )
                 z_root = self.backbone(obs_t, context=ctx_t, history=hist_t).squeeze(0)
                 _, policy_weights, root_samples, root_value, _ = self.mcts.search(
                     z_root,
@@ -524,6 +591,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                     tau_act=self.cfg.tau_act_train,
                     n_sim=max(16, self.cfg.n_sim // 2),
                     action_mask=mask_t,
+                    limb_kinematics=kin_t,
                 )
                 traj.mcts_policy_samples[step] = root_samples
                 traj.mcts_policy_weights[step] = policy_weights
@@ -545,6 +613,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             ctx_batch,
             mask_batch,
             hist_batch,
+            kin_batch,
             _,
         ) = self.replay_buffer.sample_unroll_batch(bsz, self.device)
 
@@ -562,6 +631,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             context=ctx_batch,
             history=hist_batch,
             action_mask=mask_batch,
+            limb_kinematics=kin_batch,
             lambda_v=self.cfg.lambda_v,
             lambda_p=self.cfg.lambda_p,
             lambda_r=self.cfg.lambda_r,

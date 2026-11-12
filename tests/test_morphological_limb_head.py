@@ -88,13 +88,45 @@ def test_anchor_xy_distinguishes_dog_front_from_rear():
 
 
 def test_parameter_sharing_across_all_limbs():
-    """Verifies that all limbs share identical MLP parameters in MorphologicalLimbHead."""
+    """Verifies that all limbs share identical Transformer Encoder-Decoder weights in MorphologicalLimbHead."""
     head = MorphologicalLimbHead(latent_dim=256, num_peaks=5, max_joints_per_limb=4, hidden_dim=128)
-    # Total parameter count should be strictly that of one 2-layer MLP + mu_head + log_std_head
     num_params = sum(p.numel() for p in head.parameters())
-    # in_dim = 256 + 8 = 264. mlp.0: 264*128 + 128 = 33920. mlp.3: 128*128 + 128 = 16512.
-    # heads: 2 * (128 * 20 + 20) = 5160. Total ~ 55k parameters.
-    assert num_params < 70000, f"Too many parameters for single shared limb head: {num_params}"
+    assert num_params < 600000, f"Too many parameters for shared Transformer limb head: {num_params}"
+
+    # Parameter count is strictly invariant to number of queried limbs (4 vs 6)
+    z_t = torch.randn(2, 256)
+    kin_4 = torch.randn(2, 4, 5)
+    kin_6 = torch.randn(2, 6, 5)
+    mu_4, _ = head.forward_all_limbs(z_t, kin_4)
+    mu_6, _ = head.forward_all_limbs(z_t, kin_6)
+    assert mu_4.shape == (2, 5, 16)
+    assert mu_6.shape == (2, 5, 24)
+
+
+def test_inter_limb_coordination_attention():
+    """Verifies that changing another limb's position/angle alters a limb's output via Transformer attention."""
+    head = MorphologicalLimbHead(latent_dim=256, num_peaks=5, max_joints_per_limb=2, hidden_dim=128)
+    head.eval()
+    z_t = torch.randn(1, 256)
+
+    kin_a = torch.tensor([[
+        [ 0.2,  0.2, 0.0, 0.125, 0.50],
+        [-0.2,  0.2, 0.0, 0.875, 0.50],
+        [-0.2, -0.2, 0.0, 0.375, 0.50],
+        [ 0.2, -0.2, 0.0, 0.625, 0.50],
+    ]], dtype=torch.float32)
+
+    kin_b = kin_a.clone()
+    # Perturb limb 2 (index 1) significantly
+    kin_b[0, 1] = torch.tensor([-0.2, 0.2, 0.0, 0.25, 0.90])
+
+    with torch.no_grad():
+        mu_a, _ = head.forward_all_limbs(z_t, kin_a, limb_joint_counts=[2, 2, 2, 2])
+        mu_b, _ = head.forward_all_limbs(z_t, kin_b, limb_joint_counts=[2, 2, 2, 2])
+
+    # Limb 1 (joints 0:2) must respond to Limb 2's state change
+    limb1_diff = torch.norm(mu_a[0, :, :2] - mu_b[0, :, :2]).item()
+    assert limb1_diff > 1e-4, f"Limb 1 failed to attend to Limb 2's kinematics: diff={limb1_diff}"
 
 
 def test_actor_head_all_environments_shape():
@@ -219,3 +251,48 @@ def test_end_to_end_training_unroll_gradient():
         for p in agent.actor_head.limb_head.parameters()
     )
     assert has_grads, "MorphologicalLimbHead parameters received no gradients during train step!"
+
+
+@pytest.mark.parametrize(
+    "obs_dim,act_dim,n_limbs",
+    [
+        (27, 8, 4),    # Ant
+        (43, 12, 4),   # Dog (Unitree Go1)
+        (376, 17, 5),  # Humanoid
+    ],
+)
+def test_per_step_limb_kinematics_propagation(obs_dim: int, act_dim: int, n_limbs: int):
+    """Verifies per-step limb_kinematics storage, unroll batching, reanalyze, and gradients across Ant, Dog, and Humanoid."""
+    cfg = LAMCTSConfig(
+        obs_dim=obs_dim,
+        max_action_dim=act_dim,
+        n_sim=4,
+        k_act=4,
+        unroll_steps=2,
+        batch_size=2,
+    )
+    agent = LatentActionMCTSAgent(config=cfg, device="cpu")
+    kin_init = np.random.randn(n_limbs, 5).astype(np.float32)
+    agent.set_episode_context(tweak_vector=np.zeros(18), limb_kinematics=kin_init)
+
+    for step in range(5):
+        obs = np.zeros(obs_dim, dtype=np.float32)
+        step_kin = np.random.randn(n_limbs, 5).astype(np.float32)
+        act = agent.select_action(obs, deterministic=False, limb_kinematics=step_kin)
+        agent.observe_transition(obs, act, 1.0, obs, step == 4, False, {"limb_kinematics": step_kin})
+
+    assert len(agent.replay_buffer) == 1
+    assert len(agent.replay_buffer.trajectories[0].limb_kinematics_seq) == 5
+
+    batch = agent.replay_buffer.sample_unroll_batch(batch_size=2, device=torch.device("cpu"))
+    kin_batch = batch[9]
+    assert kin_batch is not None
+    assert kin_batch.shape == (2, 3, n_limbs, 5)
+
+    agent.reanalyze_batch(num_states=2)
+    metrics = agent.train_step()
+    assert "loss_total" in metrics
+    assert any(
+        p.grad is not None and torch.norm(p.grad) > 0
+        for p in agent.actor_head.limb_head.parameters()
+    )

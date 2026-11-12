@@ -62,7 +62,7 @@ class WinEvaluator:
         if min_floor_ref is not None:
             self.min_floor_ref = float(min_floor_ref)
         else:
-            self.min_floor_ref = -abs(self.initial_r_ref) * 0.5
+            self.min_floor_ref = -max(2500.0, abs(self.initial_r_ref) * 2.5)
         self.ema_win_rate: float = 0.50
         self.episodes_evaluated: int = 0
 

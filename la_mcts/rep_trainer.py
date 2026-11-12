@@ -173,6 +173,7 @@ class ModelRepresentationTrainer(nn.Module):
         context: Optional[torch.Tensor] = None,
         history: Optional[torch.Tensor] = None,
         action_mask: Optional[torch.Tensor] = None,
+        limb_kinematics: Optional[torch.Tensor] = None,
         lambda_v: float = 0.5,
         lambda_p: float = 1.0,
         lambda_r: float = 1.0,
@@ -216,9 +217,14 @@ class ModelRepresentationTrainer(nn.Module):
         z_hat = z_true_all[:, 0, :]
 
         # Step k = 0 value and policy loss
+        kin_0 = (
+            limb_kinematics[:, 0]
+            if (limb_kinematics is not None and limb_kinematics.dim() == 4)
+            else limb_kinematics
+        )
         loss_v = critic_head.compute_loss(z_hat, target_value_seq[:, 0])
         log_probs_0 = actor_head.log_prob(
-            z_hat, mcts_policy_samples[:, 0], action_mask=action_mask
+            z_hat, mcts_policy_samples[:, 0], action_mask=action_mask, limb_kinematics=kin_0
         )  # (B, K_act)
         loss_p = -torch.sum(mcts_policy_weights[:, 0] * log_probs_0, dim=-1).mean()
 
@@ -235,8 +241,13 @@ class ModelRepresentationTrainer(nn.Module):
             loss_r = loss_r + F.mse_loss(r_hat.squeeze(-1), reward_seq[:, k - 1])
             loss_v = loss_v + critic_head.compute_loss(z_hat, target_value_seq[:, k])
 
+            kin_k = (
+                limb_kinematics[:, k]
+                if (limb_kinematics is not None and limb_kinematics.dim() == 4)
+                else limb_kinematics
+            )
             log_probs_k = actor_head.log_prob(
-                z_hat, mcts_policy_samples[:, k], action_mask=action_mask
+                z_hat, mcts_policy_samples[:, k], action_mask=action_mask, limb_kinematics=kin_k
             )
             loss_p = (
                 loss_p

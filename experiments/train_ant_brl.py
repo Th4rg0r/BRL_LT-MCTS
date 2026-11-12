@@ -112,7 +112,9 @@ def evaluate_benchmark_suite(
         steps = 0
         last_info = info
         while steps < max_steps:
-            action = agent.select_action(obs, deterministic=True)
+            action = agent.select_action(
+                obs, deterministic=True, limb_kinematics=last_info.get("limb_kinematics")
+            )
             obs, reward, terminated, truncated, last_info = env.step(action)
             ep_return += float(reward)
             steps += 1
