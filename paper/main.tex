@@ -1,0 +1,247 @@
+\documentclass[11pt,a4paper]{article}
+
+% arXiv / CoRL / IROS / NeurIPS Preprint Manuscript
+% Inventor & Author: Peter Szakony, Resilient Coder PS e.U., Austria
+% Project: Latent-Monte-Carlo-Tree-Search (LA-MCTS) & Balanced Reinforcement Learning (BRL)
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{microtype}
+\usepackage{cite}
+\usepackage{enumitem}
+\usepackage{array}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=blue,
+    urlcolor=blue
+}
+
+\title{\textbf{Latent-Monte-Carlo-Tree-Search and Balanced Reinforcement Learning:\\Adapting Superhuman Self-Play and Tree Search to Continuous Real-World Control and Zero-Shot Morphological Locomotion}}
+
+\author{
+  \textbf{Peter Szakony}\thanks{Inventor and Principal Architect at Resilient Coder PS e.U., Austria. Email: \texttt{peter.szakony@hotmail.com}} \\
+  Resilient Coder PS e.U. \\
+  Austria \\
+  \texttt{peter.szakony@hotmail.com}
+}
+
+\date{November 2026}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+2016 was a landmark year for Reinforcement Learning (RL), as scientists from DeepMind reached a historic milestone by creating AlphaGo, an RL algorithm that defeated the World Champion in Go and demonstrated superhuman problem-solving capabilities. Yet despite major progress in autonomous driving, legged locomotion, and scientific discovery, contemporary real-world RL agents rarely exhibit true superhuman resilience when confronted with unexpected, untrained, or out-of-distribution physical conditions. This paper introduces two core algorithmic inventions that adapt the foundational mechanisms behind AlphaGo's superhuman performance—Monte Carlo Tree Search (MCTS) and self-play curriculum evolution—to continuous, high-dimensional real-world state and action spaces:
+(1) \textbf{Latent-Monte-Carlo-Tree-Search (LA-MCTS)}, which eliminates compounding state-reconstruction errors by mapping latent representations and continuous action pairs directly to subsequent latent representations inside the search tree ($\text{latent}(N) \times \text{action}(N) \to \text{latent}(N+1)$); and
+(2) \textbf{Balanced Reinforcement Learning (BRL)}, a tri-agent game-theoretic framework comprising the primary \emph{Agent}, an adversarial \emph{Tweaker} that degrades physical dynamics and perception accuracy, and a meta-controlling \emph{Balancer} (the ``judge'') that regulates the Tweaker's parameter limits, costs, and worsening budget to lock the Agent--Tweaker Win/Loss ratio at a cybernetic Nash equilibrium.
+Furthermore, to achieve zero-shot morphological generalization, we introduce a \textbf{Universal Kinematic Limb-Attachment Representation} that encodes each limb by its 3D torso-relative attachment anchor, axial and radial distances, and instantaneous pointing angles, querying a secondary limb network conditioned on the main agent's global latent representation. In our continuous locomotion case study (trained exclusively on a 4-legged topology), a single model achieves zero-shot 6-legged (Hexapod) and 3-legged (Tripod) locomotion across severe physical and perceptual perturbations, reaching $+23.06\,\text{m}$ on low-friction ice, $+21.15\,\text{m}$ on elongated spider kinematics, and $+12.00\,\text{m}$ (up to $2.59\,\text{m/s}$ sprint velocity) zero-shot on a 6-legged Hexapod.
+\end{abstract}
+
+\vspace{0.5em}
+\noindent\fbox{%
+    \parbox{0.97\textwidth}{%
+        \textbf{TL;DR --- Executive Summary}
+        \begin{itemize}[leftmargin=1.5em,itemsep=2pt,topsep=4pt]
+            \item \textbf{The Problem Solved:} Standard Reinforcement Learning algorithms solve narrow subproblems efficiently in optimal conditions but fail catastrophically when confronted with unexpected obstacles, unmodeled physical disturbances, sensor degradation, or structural morphological changes (such as limb loss or unseen body topologies).
+            \item \textbf{The Invented Architecture (by Peter Szakony, Resilient Coder PS e.U.):}
+            \begin{enumerate}[leftmargin=1.5em,itemsep=1pt,topsep=2pt]
+                \item \textbf{Latent-Monte-Carlo-Tree-Search (LA-MCTS):} Eliminates error-prone raw observation/image generation during continuous tree expansion by transitioning directly in a normalized latent space ($\text{latent}(N) + \text{action}(N) \to \text{latent}(N+1) \to \text{action}(N+1)$) via Sampled Continuous PUCT, Multi-Peak Tanh-GMM Actor Heads, and Action-Conditioned FiLM Residual Dynamics.
+                \item \textbf{Balanced Reinforcement Learning (BRL):} Adapts AlphaGo's self-play arena to non-symmetric real-world environments using three interacting learners: the \textbf{Agent}, the adversarial \textbf{Tweaker} (PPO with Beta policy and Differentiable Knapsack Projection), and the \textbf{Balancer} (DDPG/TD3 Meta-Controller with Twin Critics) acting as the ``judge'' that regulates the Tweaker's limits and budget so environmental difficulty co-evolves at a balanced $50\%$ Win/Loss equilibrium.
+                \item \textbf{Kinematic Limb-Attachment Morphological Head:} Represents every joint/limb via its torso-relative 3D attachment position (axial/radial distances) and instantaneous pointing direction $(\phi_{\text{yaw}}, \phi_{\text{pitch}})$, combining this geometric query with the main model's overall latent representation to output per-limb actuation probability distributions.
+            \end{enumerate}
+            \item \textbf{Proven Achievements (Ongoing Validation @ $\sim 708,000$ Steps across 3 Seeds):} Trained \emph{exclusively} on a 4-legged creature under adversarial BRL perturbations, a \textbf{single unified model} achieves zero-shot 1,000-step full-horizon survival and sustained forward locomotion across 5 distinct morphologies and extreme physics regimes: \textbf{Zero-Shot 6-Legged Hexapod} ($+12.00\,\text{m}$ distance, $2.587\,\text{m/s}$ peak speed, $189$ full-horizon survivals), \textbf{Zero-Shot 3-Legged Tripod} ($+9.21\,\text{m}$ distance, $+4.28$ peak return, $221$ full-horizon survivals), \textbf{Heavy-Ice Quadruped} ($+23.06\,\text{m}$ on $0.2\times$ friction and $1.5\times$ mass, $310$ full-horizon survivals), and \textbf{Spider-Ant} ($+21.15\,\text{m}$ distance). \emph{(Note: Multi-seed training to 3,000 episodes is currently in progress; final converged metrics and visual recordings will be appended upon completion.)}
+        \end{itemize}
+    }%
+}
+\vspace{1em}
+
+\section{Introduction and Motivation}
+
+2016 was a big year for Reinforcement Learning, as the scientists from DeepMind reached a milestone by creating an RL algorithm that beat the Korean World Champion in Go (AlphaGo) \cite{silver2016mastering,silver2017mastering}. This demonstrated that Reinforcement Learning can achieve problem-solving abilities that are genuinely superhuman. Many expected that Reinforcement Learning would revolutionize the algorithms we use across all domains. And in certain areas, it did: for example, major achievements were made in autonomous driving, legged locomotion (such as quadrupedal dog robots), and other areas in science and medicine.
+
+But did they really achieve far superhuman performance, as in 2016 with AlphaGo? We dare to claim: not exactly. Many applications come near human performance, or slightly above human performance---such as humanoid robots that recently ran a half-marathon faster than a human. But are they really performing better than a human? Or are they performing slightly better only under optimal, tightly controlled conditions? What if, during the marathon, there were a sudden, large unexpected obstacle or an icy patch of road? Could that running robot still handle it? Hardly.
+
+This is precisely the fundamental problem with contemporary RL algorithms: they solve narrow subproblems efficiently---one can train an algorithm to execute a specific trajectory or gait very efficiently---but they usually have a very hard time reacting to unexpected, untrained, or unusual conditions. Why? If we recognize that the game of Go can consist of vast numbers of unexpected or unusual board situations, why could AlphaGo reach a performance that is superhuman, whereas real-life RL agents cannot be trained effectively to react to unseen or unexpected physical situations?
+
+Of course, the key to this question is the different magnitude in complexity between the discrete rules of Go and the continuous rules of real life. Because of that gap, the core techniques that made AlphaGo superhuman could not be directly applied to real-life physical problems.
+
+This paper introduces two core techniques which, until now, could not be adapted to continuous state and action spaces, but now---with specific architectural adaptations---can be applied directly to real-life problems. Our reference implementation on a continuous legged locomotion problem demonstrates the effectiveness of these techniques:
+\begin{enumerate}
+    \item \textbf{Latent-Monte-Carlo-Tree-Search (LA-MCTS)}
+    \item \textbf{Balanced Reinforcement Learning (BRL)}
+\end{enumerate}
+The following sections show how they work and why they are effective. As an additional improvement in the area of locomotion, this paper introduces the representation of joints and limbs as attachments to bodies with a specific 3D position and instantaneous angle; this plays seamlessly together with LA-MCTS and BRL, bringing a breakthrough improvement in zero-shot morphology, as our case study emphasizes.
+
+\section{Latent-Monte-Carlo-Tree-Search (LA-MCTS)}
+
+\subsection{Why Standard MCTS Struggles in Real-Life Continuous Domains}
+Monte Carlo Tree Search (MCTS) was one of the key elements in the AlphaGo architecture that greatly contributed to its superhuman success \cite{silver2016mastering,schrittwieser2020mastering}. To be able to use the Monte Carlo search technique, an agent must be able to simulate future steps---like simulating a forward model---in order to plan accordingly. The tree simulates many optional paths, estimating the expected return of each leaf, and then selects the next optimal step according to these simulated trajectories.
+
+It is not complicated to simulate moves in the future in the game of Go, where the state transitions are exact and deterministic on a $19 \times 19$ grid. But what is the case with real-life problems? Are we capable of simulating future environment states multiple steps into the future with sufficient accuracy? Imagine a robot equipped with visual or high-dimensional proprioceptive sensors. How accurately can it estimate the exact input image 2, 3, or 4 seconds into the future? Achieving that requires extraordinary engineering complexity, which is a primary reason why Monte Carlo search trees have rarely been used in real-life continuous control scenarios.
+
+\subsection{Eliminating Observation Reconstruction Error via Latent Rollouts}
+Let us assume we attempted to solve the visual-robot tree search problem naively. How would a conventional Monte Carlo search tree work? Let us look at the dynamics of the nodes when expanding the tree at a leaf node:
+At step $N$, we have the estimated image (or raw observation), run the image through our model, and sample some candidate optimal actions---say, $K_{\text{act}} = 16$ continuous actions. When we want to expand the tree further below that node, we take each chosen action, and based on the image at step $N$ \emph{and} the action chosen, we generate an estimated next image at step $N+1$, run that generated image through the encoder model again, and derive 16 actions below it.
+
+Even if we use the internal latent representation of the model at step $N$ to generate the ``next'' image at layer $N+1$, look at the resulting computational chain:
+\begin{equation}
+    \text{Image}(N) \xrightarrow{\text{Model}} \text{LatentRep}(N) \xrightarrow{+\text{Action}(N)} \widehat{\text{Image}}(N+1) \xrightarrow{\text{Model}} \text{LatentRep}(N+1)
+\end{equation}
+This pipeline introduces severe, compounding error sources: when processing the observation through the encoder model and then reconstructing the high-dimensional observation only to re-encode it again, both steps are approximations. Accumulated reconstruction drift quickly destroys multi-step planning accuracy.
+
+However, when we examine the information flow of Equation (1), we can derive a crucial insight: \textbf{we do not need the subsequent reconstructed images/observations inside the search tree at all---we can eliminate them completely:}
+\begin{equation}
+    \text{Latent}(N) \times \text{Action}(N) \xrightarrow{\text{Lightweight Dynamics Model } g_\psi} \text{Latent}(N+1) \xrightarrow{\text{Actor/Critic}} \text{Action}(N+1) \to \dots
+\end{equation}
+This is the \textbf{Latent-Monte-Carlo-Tree-Search (LA-MCTS)} architecture: inside the search tree, a dedicated lightweight latent dynamics model directly maps $(\text{representation}, \text{action})$ pairs to subsequent representations and instantaneous rewards. This technique enables Monte Carlo Tree Search to operate in real-life tasks where both state and action spaces are continuous and high-dimensional. The validity of this theory is proven by the case study of our implemented locomotion example.
+
+\section{Balanced Reinforcement Learning (BRL)}
+
+\subsection{Adapting AlphaGo's Self-Play Arena to Real-World Environments}
+Let us examine the second foundational feature that made AlphaGo successful: \textbf{the continuous improvement of the environment it was in}.
+Because AlphaGo mainly played against itself in an arena-like setting, each time the agent improved, its ``environment''---namely, its opponent---improved at the exact same pace. This property enabled the agent to converge toward a true Nash equilibrium, where each player's strategy is sufficient and robust against the best possible counter-strategies, rather than overfitting to a weak, static opponent.
+
+How can we adapt this self-play strategy to real-life single-agent problems where there is no symmetric board-game opponent? We need a mechanism that makes the physical and perceptual environment ``more challenging'' in direct proportion to the current capability of the learning agent. This is where \textbf{Balanced Reinforcement Learning (BRL)} comes into play.
+
+\subsection{The Three Core Elements of BRL}
+Balanced Reinforcement Learning consists of three main interacting elements:
+
+\begin{enumerate}
+    \item \textbf{First: The Agent.} This is the primary problem-solving agent (which can be any reinforcement learning agent; in our framework, the LA-MCTS solver).
+    \item \textbf{Second: The ``Tweaker''.} This is an adversarial reinforcement learning agent whose goal is to make the life of the First Agent as hard as possible---by actively tweaking the physical environment (e.g., limb geometry, payload mass, ground friction, joint damping, actuator weakness, turbulent wind, terrain unevenness) and degrading the perception accuracy of the agent (e.g., sensor noise, latency, dropout, and morphological miscalibration). It is basically the ``opponent'' if we draw the connection to AlphaGo.
+\end{enumerate}
+
+Of course, if we stopped here (as in standard unconstrained minimax adversarial RL), this would bring no useful results. How hard would it be in a real-life scenario to make the environment or perception accuracy so extreme that the agent could never reach its goal? It would be trivial: in a locomotion example, simply barricade the agent with walls, reduce ground friction to zero, or blind its sensors completely, and it will be unable to move or learn anything.
+
+That is where the third element comes into play:
+\begin{enumerate}[resume]
+    \item \textbf{Third: The ``Balancer''.} The Balancer is basically the \textbf{``judge''} of this game: it defines and dynamically adjusts the rules of engagement. It is a meta-controller agent whose goal is to ensure that the Win/Loss ratio between the First Agent and the Tweaker remains as \textbf{balanced} as possible (targeting a $50\%$ equilibrium win rate, $\rho^* = 0.50$). It achieves this by regulating the possibilities of the Tweaker: specifically, how much the Tweaker is allowed to worsen any single property at all (per-parameter upper limits $L_e \in \mathbb{R}^P$), how much each perturbation costs ($C_e \in \mathbb{R}^P$), and how many total ``worsening points'' (overall perturbation budget $B_e \in \mathbb{R}_+$) the Tweaker has at its disposal:
+    \begin{equation}
+        0 \le w_{e,i} \le L_{e,i}, \quad \sum_{i=1}^P C_{e,i}\, w_{e,i} \le B_e
+    \end{equation}
+\end{enumerate}
+This tri-agent feedback loop guarantees that the difficulty of the perceived and physical environment improves smoothly as the agent improves, keeping the agent permanently inside its Zone of Proximal Development (ZPD).
+
+\section{Universal Kinematic Limb-Attachment Representation for Zero-Shot Morphology}
+
+Additionally, to enable true morphological generalization across creatures with varying numbers and configurations of limbs, the representation of a ``limb'' is viewed within the agent through its geometric attachment to the torso: specifically, its 3D body-relative attachment position $\mathbf{p}_i = (x_i, y_i, z_i)$ (capturing axial and radial distances to the torso center) and the instantaneous 3D direction $(\phi_{\text{yaw},i}, \phi_{\text{pitch},i})$ in which the limb is pointing at the moment.
+
+Instead of a monolithic output layer tied to a fixed number of joints, the main Agent's backbone model returns an overall latent representation $z_t \in [0, 1]^d$ of the creature's global state. A secondary universal limb network $f_\phi(z_t, \mathbf{k}_i(t))$ takes both:
+\begin{enumerate}
+    \item the limb position and angle configuration embedding $\mathbf{k}_i(t) = \text{HarmonicEmbed}(x_i, y_i, z_i, \phi_{\text{yaw},i}, \phi_{\text{pitch},i}) \in \mathbb{R}^8$, and
+    \item the returned overall representation $z_t$ of the main agent's model,
+\end{enumerate}
+to retrieve the multi-peak Gaussian Mixture probability distribution $(\boldsymbol{\mu}_i, \boldsymbol{\sigma}_i)$ for the joints of each individual limb $i$:
+\begin{equation}
+    (\boldsymbol{\mu}_i, \log \boldsymbol{\sigma}_i) = f_\phi\!\left(z_t,\, \left[x_i, y_i, z_i, \phi_{\text{yaw},i}, \cos(2\pi\phi_{\text{yaw},i}), \sin(2\pi\phi_{\text{yaw},i}), \phi_{\text{pitch},i}, \sin(\pi\phi_{\text{pitch},i})\right]\right)
+\end{equation}
+This decoupled formulation enables true zero-shot morphological adaptability: for example, achieving zero-shot 6-legged (Hexapod) and 3-legged (Tripod) locomotion success while trained \emph{exclusively} on a 4-legged topology, even under difficult and changing environments such as asymmetric limb scaling, heavy payloads, or icy and uneven ground enforced by the Tweaker. Achieving zero-shot morphological transfer \emph{and} active disturbance rejection simultaneously within a single unified model is unique in the scientific literature \cite{pinto2017robust,kumar2021rma,wang2018nervenet}.
+
+\section{Technologies Used and Full Reproducibility Specification}
+
+To ensure that any researcher or engineer can reproduce similar performance from scratch—even without direct access to our source code—this section specifies the exact mathematical building blocks, neural network architectures, and optimization algorithms used across all three agents.
+
+\subsection{Agent Architecture: LA-MCTS Solver}
+\begin{itemize}
+    \item \textbf{Sub-State Tokenizer \& Pre-LN Transformer Backbone:} Continuous observations $s_t \in \mathbb{R}^{D_s}$ ($D_s = 27$ for canonical Ant proprioception) are projected into $K_{\text{tok}} = 8$ feature tokens of dimension $d_{\text{model}} = 256$. Two additional conditioning tokens are concatenated: (1) a normalized environmental context token ($w_e / 1000 \in \mathbb{R}^{18}$) projected via a 2-layer SiLU MLP, and (2) a rolling transition history token covering the last $H = 4$ observation-action pairs. The token sequence is processed by $L_{\text{enc}} = 3$ Pre-LayerNorm Multi-Head Self-Attention (MHSA) blocks ($n_{\text{heads}} = 4$, $4\times$ GELU feed-forward expansion), followed by attention-weighted pooling, a linear projection, and row-wise Min-Max normalization mapping the global latent state strictly into the unit hypercube:
+    \begin{equation}
+        z_t = \frac{\tilde{z}_t - \min(\tilde{z}_t)}{\max(\tilde{z}_t) - \min(\tilde{z}_t) + \epsilon} \in [0, 1]^{256}
+    \end{equation}
+    \item \textbf{Multi-Peak Tanh-GMM Actor Head with Universal Limb Network:} Parameterizes a $M = 5$ component Gaussian Mixture Model squashed through $\tanh(\cdot)$ into $[-1, 1]^N$ with exact Jacobian-corrected log-density:
+    \begin{equation}
+        \log \pi_\theta(a \mid z_t) = \log \sum_{m=1}^M \pi_m(z_t)\, \mathcal{N}(\text{atanh}(a);\, \boldsymbol{\mu}_m, \boldsymbol{\sigma}_m^2) - \sum_{j=1}^N \log(1 - a_j^2 + \epsilon)
+    \end{equation}
+    where per-limb means $\boldsymbol{\mu}_m = 5\tanh(\boldsymbol{\mu}_{\text{raw},m}/5)$ and bounded log-standard deviations $\log \boldsymbol{\sigma}_m \in [-3.0, 2.0]$ are generated in parallel across all active limbs by the shared 2-layer SiLU MLP ($128$ hidden units, LayerNorm) of the \texttt{MorphologicalLimbHead}.
+    \item \textbf{Categorical Support Value Critic:} Rather than regressing unbounded scalars, the critic predicts a categorical distribution over $B = 601$ discrete support bins spanning $[-300, 300]$ under an invertible symmetric logarithmic transform $h(x) = \text{sign}(x)(\sqrt{|x|+1} - 1 + 10^{-3}x)$, trained via two-hot cross-entropy loss.
+    \item \textbf{Action-Conditioned FiLM Latent Dynamics \& SimSiam Consistency:} The lightweight latent transition model $g_\psi(z_t, a_t) \to (\hat{z}_{t+1}, \hat{r}_t)$ encodes the continuous action $a_t$ into Feature-wise Linear Modulation (FiLM) scale and shift vectors $(\boldsymbol{\gamma}_a, \boldsymbol{\beta}_a)$ across $L_{\text{dyn}} = 3$ residual LayerNorm-SiLU blocks:
+    \begin{equation}
+        h^{(\ell)} = h^{(\ell-1)} + W_2\,\text{SiLU}\!\left((1 + \boldsymbol{\gamma}_a) \odot \text{LN}(W_1 h^{(\ell-1)}) + \boldsymbol{\beta}_a\right)
+    \end{equation}
+    To prevent representation collapse during $K = 5$-step unrolled training without requiring observation reconstruction, we employ a \textbf{SimSiam self-supervised consistency head} \cite{chen2021exploring} (projector MLP $256 \to 512 \to 512$, predictor MLP $512 \to 256 \to 512$) minimizing combined negative cosine similarity and stop-gradient MSE against the true encoded latent state $z_{t+k} = \text{Backbone}(s_{t+k})$.
+    \item \textbf{Sampled Continuous PUCT Search \& MuZero Reanalyze:} At each decision step, the agent expands $N_{\text{sim}} = 50$ MCTS simulations using virtual-loss leaf batching (batch size $16$). At each node, $K_{\text{act}} = 16$ continuous candidate actions are sampled from a temperature-scaled proposal distribution $\beta(\cdot \mid z)$, weighted by importance ratio priors, and selected via Sampled PUCT \cite{hubert2021learning} with tree-wide Min-Max $Q$-value normalization ($c_1 = 1.25, c_2 = 19652$). Off-policy trajectories stored in a prioritized replay buffer (capacity $50,000$ steps, $5$-step TD bootstrapping with $\gamma = 0.99$) are periodically refreshed via \textbf{MuZero Reanalyze} and optimized with AdamW ($\text{lr} = 3 \times 10^{-4}$, gradient norm clip $5.0$, loss weights $\lambda_v = 0.5, \lambda_p = 1.0, \lambda_r = 1.0, \lambda_{\text{rep}} = 4.0$).
+\end{itemize}
+
+\subsection{Tweaker Architecture: Constrained PPO with Beta Policy \& Differentiable Knapsack Layer}
+\begin{itemize}
+    \item \textbf{Stochastic Beta Actor-Critic (PPO):} Receives state $s_e^{\text{twk}} \in \mathbb{R}^{3P+5}$ (normalized limits $L_e$, budget $B_e$, costs $C_e$, Pearson failure correlations $\boldsymbol{\rho}_{\text{fail}}$, and rolling agent velocity/termination/energy/win-rate metrics, where $P = 18$). A 2-layer SiLU MLP ($256$ units, LayerNorm) outputs concentration parameters $\alpha_i, \beta_i = \text{softplus}(\cdot) + 1.05$ defining an independent $\text{Beta}(\alpha, \beta)$ distribution on $(0, 1)^P$, updated via Clipped Proximal Policy Optimization (PPO, $\epsilon_{\text{clip}} = 0.2$, $\text{lr} = 3 \times 10^{-4}$) \cite{schulman2017proximal}.
+    \item \textbf{Differentiable Bounded Knapsack Projection:} Raw tweaks $w_{\text{raw}} = L_e \odot u_e$ are projected onto the Balancer's feasible polytope by solving the quadratic program:
+    \begin{equation}
+        w_e = \arg\min_{w} \frac{1}{2}\|w - w_{\text{raw}}\|_2^2 \quad \text{s.t.} \quad 0 \le w_i \le L_{e,i}, \quad \sum_{i=1}^P C_{e,i} w_i \le B_e
+    \end{equation}
+    Forward evaluation locates the exact Karush-Kuhn-Tucker (KKT) Lagrange multiplier $\lambda^* \ge 0$ via 25 vectorized bisection iterations followed by closed-form active hyperplane projection; backward pass computes exact analytical implicit gradients along the active set $\mathcal{I}_{\text{act}} = \{i : 0 < w_{e,i} < L_{e,i}\}$.
+    \item \textbf{18D Adversarial Perturbation Space:} Covers 12 physical/morphological dimensions ($w_1..w_3$: front/back/asymmetric leg length scaling; $w_4$: limb 4 amputation; $w_5$: torso mass up to $4.5\times$; $w_6$: sliding friction down to $\exp(-3.1)\approx 0.045\times$; $w_7$: torsional/rolling friction; $w_8$: joint damping/stiffness; $w_9$: up to $60\%$ actuator weakening; $w_{10}$: proprioceptive Gaussian noise; $w_{11}$: Ornstein-Uhlenbeck 3D turbulent wind gusts up to $35\,\text{N}$; $w_{12}$: heightfield terrain waves up to $0.18\,\text{m}$) plus 6 perception distortion dimensions ($w_{13}..w_{18}$: observation bias, sensor dropout, multi-step latency up to 4 steps, and morphological context miscalibration).
+\end{itemize}
+
+\subsection{Balancer Architecture: DDPG/TD3 Cybernetic Meta-Controller}
+\begin{itemize}
+    \item \textbf{Deterministic Actor \& Twin Q-Critics (DDPG/TD3):} Receives state $s_e^{\text{bal}} \in \mathbb{R}^{4P+6}$ encoding EMA win rate $\bar{W}_e$, instantaneous win indicator, dominance score, risk-adjusted return statistics, previous tweak vector, empirical Pearson correlation $\boldsymbol{\rho}_{\text{fail}} \in [-1, 1]^P$ between each parameter $w_i$ and episode failure, and previous constraints. A 3-layer LayerNorm-ReLU Actor MLP ($256$ units, Sigmoid output) emits $(L_e, B_e, C_e) \in \mathbb{R}^{2P+1}$, trained alongside Twin Q-Critics \cite{lillicrap2015continuous,fujimoto2018addressing} ($\text{lr}_{\text{actor}} = 10^{-4}, \text{lr}_{\text{critic}} = 2 \times 10^{-4}$, soft target polyak $\tau = 0.05$).
+    \item \textbf{Zone of Proximal Development (ZPD) Reward \& Cybernetic Self-Regulation:} The Balancer maximizes:
+    \begin{equation}
+        r_e^{\text{bal}} = -\alpha_{\text{eq}}(\bar{W}_e - \rho^*)^2 - \alpha_{\text{inst}}(D_e - \rho^*)^2 + \alpha_{\text{prog}} \exp\!\left(-\frac{(\bar{W}_e - \rho^*)^2}{2\sigma_{\text{zpd}}^2}\right)\!\left(\bar{w}_e + \lambda_H \mathcal{H}(p_{\text{spend}})\right)
+    \end{equation}
+    where $\rho^* = 0.50$ is the target Nash win-rate equilibrium and $\mathcal{H}(p_{\text{spend}})$ is the normalized Shannon entropy of the Tweaker's budget expenditure across parameters, preventing single-parameter exploits while steadily ratcheting difficulty upward whenever the Agent achieves a $50\%$ win rate.
+\end{itemize}
+
+\section{Case Study and Empirical Proofs: Zero-Shot Morphological Locomotion}
+
+\subsection{Experimental Protocol}
+To validate our theoretical claims, we train the unified LA-MCTS + BRL architecture on the MuJoCo \texttt{Ant-v5} continuous control benchmark. Crucially, during training the agent interacts \textbf{only with the 4-legged topology} under dynamic 18D perturbations controlled by the Tweaker and Balancer. Every 10 episodes, the policy is evaluated \textbf{zero-shot} (deterministically, without fine-tuning or weight updates) across five distinct morphological and physical regimes over a $1,000$-step horizon ($50\,\text{s}$ simulated time):
+\begin{enumerate}
+    \item \textbf{Standard-Ant-v5:} Canonical 4-legged quadruped (8 actuators).
+    \item \textbf{Tripod-Ant (Zero-Shot 3-Legged Amputation):} Asymmetric removal of one limb (6 active actuators), requiring immediate gait reconfiguration to prevent tipping.
+    \item \textbf{Spider-Ant (Zero-Shot Extended Kinematics):} 4 elongated limbs with altered leverage, center-of-mass height, and stride geometry.
+    \item \textbf{Heavy-Ice-Ant (Extreme Physics Disturbance):} Quadruped operating on low-friction ice ($0.2\times$ nominal sliding friction) while carrying $1.5\times$ torso payload mass.
+    \item \textbf{Hexapod-Ant (Zero-Shot 6-Legged OOD Topology):} Unseen 6-legged creature with 12 actuators queried dynamically via the \texttt{MorphologicalLimbHead} using each leg's 3D attachment coordinates and yaw/pitch angles.
+\end{enumerate}
+
+\subsection{Empirical Proofs from Ongoing Multi-Seed Validation ($\sim 708,000$ Steps)}
+Table~\ref{tab:results} summarizes the empirical milestones recorded up to approximately $708,000$ environment steps across three parallel random seeds (Seeds 42, 43, and 44).
+
+\begin{table}[htbp]
+\centering
+\caption{Zero-Shot Morphological and Adversarial Evaluation Milestones across Parallel Validation Seeds (Recorded up to $\sim 708,000$ Training Steps; Trained Exclusively on 4 Legs).}
+\label{tab:results}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+\textbf{Morphology / Regime} & \textbf{Topology} & \textbf{Peak Forward} & \textbf{Best Distance @} & \textbf{Peak Sprint} & \textbf{Full 1000-Step} \\
+\textbf{(Zero-Shot Eval)} & \textbf{(Legs / Act.)} & \textbf{Distance} & \textbf{1000/1000 Steps} & \textbf{Velocity} & \textbf{Survivals (3 Seeds)} \\
+\midrule
+\textbf{Standard-Ant-v5} & 4 Legs / 8 Act. & $+8.91\,\text{m}$ (S44) & $+8.91\,\text{m}$ (S44) & $+1.989\,\text{m/s}$ (S42) & $145$ episodes \\
+\textbf{Tripod-Ant (OOD)} & \textbf{3 Legs / 6 Act.} & $\mathbf{+9.21\,\text{m}}$ (S43) & $\mathbf{+9.21\,\text{m}}$ (S43) & $\mathbf{+1.517\,\text{m/s}}$ (S44) & $\mathbf{221}$ episodes \\
+\textbf{Spider-Ant (OOD)} & 4 Long / 8 Act. & $\mathbf{+21.15\,\text{m}}$ (S42) & $\mathbf{+20.62\,\text{m}}$ (S43) & $\mathbf{+1.979\,\text{m/s}}$ (S44) & $\mathbf{145}$ episodes \\
+\textbf{Heavy-Ice-Ant (OOD)} & 4 Legs / Ice+Mass & $\mathbf{+23.06\,\text{m}}$ (S44) & $\mathbf{+23.06\,\text{m}}$ (S44) & $\mathbf{+0.977\,\text{m/s}}$ (S44) & $\mathbf{310}$ episodes \\
+\textbf{Hexapod-Ant (OOD)} & \textbf{6 Legs / 12 Act.} & $\mathbf{+12.00\,\text{m}}$ (S44) & $\mathbf{+12.00\,\text{m}}$ (S44) & $\mathbf{+2.587\,\text{m/s}}$ (S44) & $\mathbf{189}$ episodes \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Key empirical proofs already established by the ongoing validation include:
+\begin{itemize}
+    \item \textbf{Proof of Zero-Shot 6-Legged (Hexapod) Generalization:} Despite never encountering a 6-legged body during training, the Universal Kinematic Limb-Attachment Head successfully coordinates all 12 actuators zero-shot. Across the three seeds, the Hexapod-Ant completes the full $1,000/1,000$-step horizon without falling \textbf{189 times}, achieving a continuous forward distance of $\mathbf{+12.00\,\text{m}}$ over $1,000$ steps (Seed 44), $\mathbf{+8.84\,\text{m}}$ at $+0.405\,\text{m/s}$ (Seed 42), and peak sprint velocities reaching $\mathbf{+2.587\,\text{m/s}}$ (Seed 44) and $\mathbf{+2.503\,\text{m/s}}$ (Seed 42).
+    \item \textbf{Proof of Extreme Disturbance Rejection on Heavy-Ice:} Under simultaneous $1.5\times$ torso mass loading and $0.2\times$ icy sliding friction, the policy achieves $\mathbf{+23.06\,\text{m}}$ of stable forward travel over the full $1,000$ steps (Seed 44) and $\mathbf{+12.08\,\text{m}}$ (Seed 42), completing the full $1,000$-step horizon in \textbf{310 out of 429} evaluation episodes ($72.3\%$ full-horizon survival rate).
+    \item \textbf{Proof of Zero-Shot Amputation Recovery (Tripod-Ant) and Kinematic Scaling (Spider-Ant):} When one leg is amputated (Tripod-Ant), the agent maintains dynamic balance for all $1,000$ steps in \textbf{221 evaluation episodes}, traveling up to $\mathbf{+9.21\,\text{m}}$ (Seed 43) and achieving positive net episode return ($\mathbf{+4.28}$ at $+1.517\,\text{m/s}$ on Seed 44). On elongated Spider-Ant geometry, the same network reaches $\mathbf{+21.15\,\text{m}}$ (Seed 42) and $\mathbf{+20.62\,\text{m}}$ over $1,000$ steps (Seed 43) with positive return ($\mathbf{+1.11}$ on Seed 44).
+    \item \textbf{The ``Endurance Paradox'' and Torque Refinement Phase:} In standard Gymnasium \texttt{Ant-v5}, each step incurs a quadratic motor torque penalty ($-0.5 \sum_i a_i^2$). Agents that fall after 20 steps accumulate near-zero negative return ($\approx -30$), whereas agents surviving all $1,000$ steps under strong adversarial wind and friction initially expend high stabilization torques ($\approx -1500$ to $-2100$ total return) while mastering full-horizon balance, before progressively refining torque efficiency into high-velocity locomotion.
+\end{itemize}
+
+\noindent\emph{[Note: Multi-seed training to 3,000 episodes is currently in progress. Final learning curves, converged benchmark tables, and visual trajectory captures will be inserted here upon run completion.]}
+
+\section{Conclusion}
+
+By identifying why the superhuman mechanisms of AlphaGo could not previously be transferred to continuous physical control, this work introduced \textbf{Latent-Monte-Carlo-Tree-Search (LA-MCTS)}, \textbf{Balanced Reinforcement Learning (BRL)}, and the \textbf{Universal Kinematic Limb-Attachment Representation}. Eliminating intermediate observation reconstruction inside continuous tree search while co-evolving environmental difficulty through a cybernetic Agent--Tweaker--Balancer game enables a single policy to achieve zero-shot morphological transfer (3, 4, and 6 legs) and robust locomotion under severe physical and perceptual disturbances.
+
+\section*{Authorship, Attribution, and Disclosure}
+The theoretical inventions, mathematical concepts, and system architectures presented in this paper---specifically \textbf{Latent-Monte-Carlo-Tree-Search (LA-MCTS)}, \textbf{Balanced Reinforcement Learning (BRL)} (the Agent--Tweaker--Balancer triad), and the \textbf{Universal Kinematic Limb-Attachment Representation} for zero-shot morphological control---are the original intellectual work of \textbf{Peter Szakony} (\textbf{Resilient Coder PS e.U.}, Austria; \texttt{peter.szakony@hotmail.com}). AI coding and documentation assistants were utilized to implement the proof-of-concept simulation codebase, automated evaluation pipelines, and formatting of the manuscript and technical documentation.
+
+\bibliographystyle{plain}
+\bibliography{references}
+
+\end{document}
