@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from dataclasses import replace
 import numpy as np
 import torch
+
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+os.environ.setdefault("PYTHONUTF8", "1")
 
 from config import load_config
 from experiments.train_ant_brl import load_training_checkpoint, main as run_train_main
