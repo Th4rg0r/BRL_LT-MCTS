@@ -283,6 +283,46 @@ def test_filter_validation_scenarios():
         filter_validation_scenarios(ant_scens, "flying_ant_42")
 
 
+def test_harsh_scenario_full_perception():
+    """Verifies that --scenario harsh generates harsh physical tweaks with 100% exact perception."""
+    import gymnasium as gym
+    from ant_morph_env.wrapper import MorphologicalAntBRLWrapper
+    from experiments.video_recorder import filter_validation_scenarios, get_validation_scenarios
+
+    for env_type, noise_idx in [("ant", 9), ("dog", 10), ("humanoid", 10)]:
+        scens = get_validation_scenarios(env_type)
+        harsh_filtered = filter_validation_scenarios(scens, "harsh", env_type=env_type)
+        assert list(harsh_filtered.keys()) == ["harsh_random"]
+        spec = harsh_filtered["harsh_random"]
+        tweak = spec["tweak"]
+        assert tweak.shape == (18,)
+        # Subset (3..5) of physical dims in [100, 250], 4 legs intact, 0 perception distortion
+        active_phys = np.nonzero(tweak[:12])[0]
+        assert 3 <= len(active_phys) <= 5
+        assert float(tweak[active_phys].min()) >= 100.0
+        assert float(tweak[:12].max()) <= 250.0
+        assert float(tweak[3]) == 0.0
+        assert float(tweak[noise_idx]) == 0.0
+        assert np.all(tweak[12:18] == 0.0)
+        if env_type == "ant":
+            assert spec["num_legs"] == 4
+        elif env_type == "dog":
+            assert spec["disabled_leg"] is None
+
+    # Verify Ant wrapper reports 100% exact perception under harsh_random
+    ant_harsh = filter_validation_scenarios(get_validation_scenarios("ant"), "harsh", env_type="ant")["harsh_random"]
+    base = gym.make("Ant-v5")
+    env = MorphologicalAntBRLWrapper(env=base)
+    try:
+        opts = {"tweak_vector": ant_harsh["tweak"], "num_legs": ant_harsh["num_legs"]}
+        _, info = env.reset(options=opts)
+        perc = info["perception_metrics"]
+        assert perc["perception_correctness"] == pytest.approx(1.0, abs=1e-6)
+        assert perc["obs_rmse"] == pytest.approx(0.0, abs=1e-6)
+    finally:
+        env.close()
+
+
 def test_track_camera_centering(tmp_path: Path):
     """Verifies that track_camera centers viewer camera on the creature."""
     import gymnasium as gym
