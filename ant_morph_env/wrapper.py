@@ -290,14 +290,13 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
             model.jnt_stiffness[1:] = 2.0 * (w8_n**1.5)
 
         # w_9: Global actuator weakening g_act = g_0 * (1 - 0.60 * w_9 / 1000)
+        # Scale actuator_gear only (gainprm remains at nominal 1.0) so torque scales linearly, not quadratically.
         act_scale = 1.0 - 0.60 * (float(w[8]) / 1000.0)
-        model.actuator_gainprm[:, 0] = self._nom_actuator_gainprm[:, 0] * act_scale
         model.actuator_gear[:, 0] = self._nom_actuator_gear[:, 0] * act_scale
 
         # w_4: Limb 4 deactivation / amputation gain_leg4 = g_0 * (1 - w_4 / 1000)
         leg4_scale = max(0.0, 1.0 - float(w[3]) / 1000.0)
         if model.nu >= 8:
-            model.actuator_gainprm[6:8, 0] *= leg4_scale
             model.actuator_gear[6:8, 0] *= leg4_scale
 
         # w_12: Terrain unevenness / heightfield elevation h_max = 0.18 * (w_12 / 1000) m

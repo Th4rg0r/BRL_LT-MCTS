@@ -179,3 +179,29 @@ def test_hexapod_all_legs_point_downward() -> None:
         f"Leg 5 (rel_z={rel_z_5:.4f}) and Leg 6 (rel_z={rel_z_6:.4f}) are not vertically symmetric!"
     )
 
+
+def test_actuator_weakening_scales_linearly() -> None:
+    """Verifies w_9 and w_4 scale effective actuator torque linearly (not quadratically)."""
+    wrapper = MorphologicalAntBRLWrapper(max_action_capacity=12, fixed_action_space=True)
+    nom_gear = wrapper._nom_actuator_gear[:, 0].copy()
+    nom_gain = wrapper._nom_actuator_gainprm[:, 0].copy()
+
+    # w_9 = 1000 -> act_scale = 0.40 (must not become 0.16 via gainprm * gear)
+    tweak_w9 = np.zeros(18, dtype=np.float32)
+    tweak_w9[8] = 1000.0
+    wrapper.reset(seed=42, options={"tweak_vector": tweak_w9})
+    model = wrapper.mj_model
+    np.testing.assert_allclose(model.actuator_gainprm[:, 0], nom_gain, rtol=1e-6)
+    np.testing.assert_allclose(model.actuator_gear[:, 0], nom_gear * 0.40, rtol=1e-6)
+
+    # w_4 = 500 + w_9 = 1000 -> leg 4 gear = 0.40 * 0.50 = 0.20 * nom_gear
+    tweak_both = np.zeros(18, dtype=np.float32)
+    tweak_both[3] = 500.0
+    tweak_both[8] = 1000.0
+    wrapper.reset(seed=42, options={"tweak_vector": tweak_both})
+    model = wrapper.mj_model
+    np.testing.assert_allclose(model.actuator_gainprm[:, 0], nom_gain, rtol=1e-6)
+    np.testing.assert_allclose(model.actuator_gear[:6, 0], nom_gear[:6] * 0.40, rtol=1e-6)
+    np.testing.assert_allclose(model.actuator_gear[6:8, 0], nom_gear[6:8] * 0.20, rtol=1e-6)
+    wrapper.close()
+
