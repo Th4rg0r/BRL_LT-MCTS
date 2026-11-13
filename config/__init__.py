@@ -221,10 +221,12 @@ def config_to_dict(cfg: SystemConfig) -> Dict[str, Any]:
 
 
 def load_config(path: str | Path = "config/default_config.yaml") -> SystemConfig:
-    """Loads SystemConfig from a YAML file."""
+    """Loads SystemConfig from a YAML file. Raises FileNotFoundError if missing."""
     cfg_path = Path(path)
     if not cfg_path.exists():
-        return SystemConfig()
+        raise FileNotFoundError(
+            f"Config file not found: '{cfg_path}'. Please pass a valid YAML path (e.g. 'config/default_config.yaml')."
+        )
     with cfg_path.open("r", encoding="utf-8") as f:
         raw: Dict[str, Any] = yaml.safe_load(f) or {}
     return config_from_dict(raw)
