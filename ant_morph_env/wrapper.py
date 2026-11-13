@@ -39,7 +39,9 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         default_num_legs: int = 4,
         healthy_z_range: Tuple[float, float] = (0.2, 1.0),
         action_ema_alpha: float = 0.6,
-        action_smoothness_coef: float = 0.05,
+        action_smoothness_coef: float = 0.15,
+        action_smoothness_end_step: int = 500000,
+        action_smoothness_log_shape: float = 10.0,
     ) -> None:
         self.env_id = env_id
         if env is None:
@@ -66,6 +68,9 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         self.base_healthy_z_range = healthy_z_range
         self.action_ema_alpha = float(np.clip(action_ema_alpha, 0.05, 1.0))
         self.action_smoothness_coef = max(0.0, float(action_smoothness_coef))
+        self.action_smoothness_end_step = int(action_smoothness_end_step)
+        self.action_smoothness_log_shape = max(1e-6, float(action_smoothness_log_shape))
+        self.total_env_steps: int = 0
         self.canonical_obs_dim = 105 if self.use_contact_forces else 27
 
         self.xml_gen = ProceduralAntXMLGenerator()
@@ -370,6 +375,23 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
                 k_list.append([0.2 * math.cos(angle), 0.2 * math.sin(angle), 0.0, (angle / (2.0 * math.pi)) % 1.0, 0.5, 0.0, 0.0, 0.0])
         return np.array(k_list, dtype=np.float32)
 
+    def set_total_env_steps(self, total_env_steps: int) -> None:
+        """Synchronizes global training step counter used for logarithmic smoothness penalty decay."""
+        self.total_env_steps = max(0, int(total_env_steps))
+
+    def get_current_smoothness_coef(self) -> float:
+        """Computes the current action smoothness penalty coefficient along the logarithmic decay curve."""
+        if self.action_smoothness_coef <= 0.0:
+            return 0.0
+        if self.action_smoothness_end_step <= 0:
+            return self.action_smoothness_coef
+        if self.total_env_steps >= self.action_smoothness_end_step:
+            return 0.0
+        u = min(1.0, max(0.0, float(self.total_env_steps) / float(self.action_smoothness_end_step)))
+        k = max(1e-6, self.action_smoothness_log_shape)
+        decay = 1.0 - (math.log1p(k * u) / math.log1p(k))
+        return max(0.0, self.action_smoothness_coef * decay)
+
     def reset(
         self,
         *,
@@ -380,6 +402,8 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
             self._rng = np.random.default_rng(seed)
 
         opts = options or {}
+        if "total_env_steps" in opts and opts["total_env_steps"] is not None:
+            self.set_total_env_steps(int(opts["total_env_steps"]))
         if "tweak_vector" in opts and opts["tweak_vector"] is not None:
             w_in = np.asarray(opts["tweak_vector"], dtype=np.float64).flatten()
             if w_in.shape[0] < 18:
@@ -462,8 +486,9 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         else:
             act_env = act_arr[:nu].copy()
         act_raw = np.clip(act_env * morph_mask[:nu], -1.0, 1.0)
+        cur_smooth_coef = self.get_current_smoothness_coef()
         if self._prev_raw_action is not None and self._prev_raw_action.shape == act_raw.shape:
-            smooth_penalty = self.action_smoothness_coef * float(
+            smooth_penalty = cur_smooth_coef * float(
                 np.sum(np.square(act_raw - self._prev_raw_action))
             )
             act_env = np.clip(
@@ -480,6 +505,7 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
             act_env = act_raw.copy()
         self._prev_raw_action = act_raw.copy()
         self._prev_smoothed_action = act_env.copy()
+        self.total_env_steps += 1
 
         # w_11: Inject stochastic Ornstein-Uhlenbeck wind force into data.xfrc_applied[torso_id, :3]
         torso_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "torso")
@@ -548,6 +574,7 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         info["limb_kinematics"] = perc_kinematics
         info["true_limb_kinematics"] = true_kinematics
         info["perceived_limb_kinematics"] = perc_kinematics
+        info["action_smoothness_coef"] = float(cur_smooth_coef)
         info["brl_metrics"] = {
             "x_velocity": float(mean_x_vel),
             "total_distance": float(total_dist),
@@ -561,6 +588,7 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
             "perceived_leg_scales": np.asarray(self.perception_filter.perceived_leg_scales, dtype=np.float32),
             "perception_metrics": perc_metrics,
             "num_legs": int(self.current_num_legs),
+            "action_smoothness_coef": float(cur_smooth_coef),
         }
 
         return obs_distorted, float(reward), bool(terminated), bool(truncated), info

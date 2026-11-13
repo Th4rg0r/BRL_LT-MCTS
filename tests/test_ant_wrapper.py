@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from ant_morph_env.wrapper import MorphologicalAntBRLWrapper
 
@@ -204,4 +205,57 @@ def test_actuator_weakening_scales_linearly() -> None:
     np.testing.assert_allclose(model.actuator_gear[:6, 0], nom_gear[:6] * 0.40, rtol=1e-6)
     np.testing.assert_allclose(model.actuator_gear[6:8, 0], nom_gear[6:8] * 0.20, rtol=1e-6)
     wrapper.close()
+
+
+def test_logarithmic_smoothness_penalty_decay() -> None:
+    """Verifies logarithmic decay of action smoothness penalty from start coef down to exact 0.0 at end_step."""
+    w_gentle = MorphologicalAntBRLWrapper(
+        max_action_capacity=12,
+        fixed_action_space=True,
+        action_smoothness_coef=0.20,
+        action_smoothness_end_step=500000,
+        action_smoothness_log_shape=1.0,
+    )
+    w_steep = MorphologicalAntBRLWrapper(
+        max_action_capacity=12,
+        fixed_action_space=True,
+        action_smoothness_coef=0.20,
+        action_smoothness_end_step=500000,
+        action_smoothness_log_shape=50.0,
+    )
+    try:
+        # 1. Start penalty at step 0
+        assert w_gentle.get_current_smoothness_coef() == pytest.approx(0.20, abs=1e-9)
+        assert w_steep.get_current_smoothness_coef() == pytest.approx(0.20, abs=1e-9)
+
+        # 2. Logarithmic curve & shape control at midpoint (250k): steeper shape drops lower early
+        w_gentle.set_total_env_steps(250000)
+        w_steep.set_total_env_steps(250000)
+        mid_gentle = w_gentle.get_current_smoothness_coef()
+        mid_steep = w_steep.get_current_smoothness_coef()
+        assert 0.0 < mid_steep < mid_gentle < 0.10
+
+        # 3. Exact 0.0 at and after end_step
+        w_steep.set_total_env_steps(500000)
+        assert w_steep.get_current_smoothness_coef() == 0.0
+        w_steep.set_total_env_steps(750000)
+        assert w_steep.get_current_smoothness_coef() == 0.0
+
+        # 4. Verify step() telemetry and zero penalty beyond end_step vs non-zero penalty at step 0
+        w_steep.reset(seed=42, options={"total_env_steps": 500000})
+        a_pos = np.ones(12, dtype=np.float32) * 0.8
+        a_neg = -np.ones(12, dtype=np.float32) * 0.8
+        w_steep.step(a_pos)
+        _, _, _, _, info_end = w_steep.step(a_neg)
+        assert info_end["action_smoothness_coef"] == 0.0
+        assert w_steep.total_env_steps == 500002
+
+        w_steep.reset(seed=42, options={"total_env_steps": 0})
+        w_steep.step(a_pos)
+        _, _, _, _, info_start = w_steep.step(a_neg)
+        assert 0.19 < info_start["action_smoothness_coef"] <= 0.20
+    finally:
+        w_gentle.close()
+        w_steep.close()
+
 

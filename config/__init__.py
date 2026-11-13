@@ -112,6 +112,10 @@ class AntMorphConfig:
     healthy_z_range: Tuple[float, float] = (0.2, 1.0)
     max_action_capacity: int = 12
     default_num_legs: int = 4
+    action_ema_alpha: float = 0.6
+    action_smoothness_coef: float = 0.15
+    action_smoothness_end_step: int = 500000
+    action_smoothness_log_shape: float = 10.0
 
 
 @dataclass

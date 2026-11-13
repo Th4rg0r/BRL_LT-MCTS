@@ -428,6 +428,10 @@ def run_single_seed(
         fixed_action_space=True,
         default_num_legs=sys_cfg.ant_morph.default_num_legs,
         healthy_z_range=sys_cfg.ant_morph.healthy_z_range,
+        action_ema_alpha=sys_cfg.ant_morph.action_ema_alpha,
+        action_smoothness_coef=sys_cfg.ant_morph.action_smoothness_coef,
+        action_smoothness_end_step=sys_cfg.ant_morph.action_smoothness_end_step,
+        action_smoothness_log_shape=sys_cfg.ant_morph.action_smoothness_log_shape,
     )
 
     agent = LatentActionMCTSAgent(config=sys_cfg.la_mcts, device=device)
@@ -491,6 +495,7 @@ def run_single_seed(
             _, _, _, _, payload = load_training_checkpoint(ckpt_to_resume, device=device)
             completed_episodes = int(payload.get("episode", 0))
             total_env_steps = int(payload.get("total_env_steps", 0))
+            env.set_total_env_steps(total_env_steps)
             if payload.get("composite_score") is not None:
                 best_composite_score = float(payload["composite_score"])
             if (seed_ckpt_dir / "best_model.pt").exists():
@@ -705,6 +710,7 @@ def run_single_seed(
                         verbose=(verbose and not parallel_mode),
                         log_fn=lambda s: log_line(s, to_console=False),
                     )
+                    env.set_total_env_steps(total_env_steps)
                     ms_score = compute_composite_benchmark_score(ms_bench)
                     benchmark_evals[ep] = ms_bench
                     if seed_ckpt_dir is not None:
@@ -734,6 +740,7 @@ def run_single_seed(
                 verbose=(verbose and not parallel_mode),
                 log_fn=lambda s: log_line(s, to_console=False),
             )
+            env.set_total_env_steps(total_env_steps)
             benchmark_evals[ep] = eval_suite
             cur_comp_score = compute_composite_benchmark_score(eval_suite)
             is_new_best = False

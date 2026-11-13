@@ -88,6 +88,10 @@ ant_morph:
   healthy_z_range: [0.2, 1.0]
   max_action_capacity: 12
   default_num_legs: 4
+  action_ema_alpha: 0.6
+  action_smoothness_coef: 0.15
+  action_smoothness_end_step: 500000
+  action_smoothness_log_shape: 10.0
 
 # Run protocol defaults for experiments/train_ant_brl.py (CLI flags override; 0 = automatic)
 run:
