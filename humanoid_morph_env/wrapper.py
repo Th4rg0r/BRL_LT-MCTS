@@ -10,7 +10,11 @@ import mujoco
 import numpy as np
 
 from brl_core.interfaces import WinEvaluator
-from brl_core.perception import ModalitySliceSpec, PerceptionDistortionFilter
+from brl_core.perception import (
+    ModalitySliceSpec,
+    PerceptionDistortionFilter,
+    compute_torso_leg_angle_diff,
+)
 
 
 class MorphologicalHumanoidBRLWrapper(gym.Wrapper):
@@ -226,7 +230,7 @@ class MorphologicalHumanoidBRLWrapper(gym.Wrapper):
         k_list = []
         for name, a_name, d_name in specs:
             if a_name is None:
-                k_list.append([0.0, 0.0, 0.0, 0.5, 0.5])
+                k_list.append([0.0, 0.0, 0.0, 0.5, 0.5, 0.0, 0.0, 0.0])
             else:
                 a_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, a_name)
                 d_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, d_name)
@@ -237,9 +241,14 @@ class MorphologicalHumanoidBRLWrapper(gym.Wrapper):
                     u = v / max(float(np.linalg.norm(v)), 1e-6)
                     yaw = float((np.arctan2(u[1], u[0]) + np.pi) / (2.0 * np.pi)) % 1.0
                     pitch = float((np.arcsin(np.clip(u[2], -1.0, 1.0)) + np.pi / 2.0) / np.pi)
-                    k_list.append([float(a_pos[0]), float(a_pos[1]), float(a_pos[2]), yaw, pitch])
+                    diff_rx, diff_ry, diff_rz = compute_torso_leg_angle_diff(
+                        torso_xmat, data.xmat[d_id]
+                    )
+                    k_list.append(
+                        [float(a_pos[0]), float(a_pos[1]), float(a_pos[2]), yaw, pitch, diff_rx, diff_ry, diff_rz]
+                    )
                 else:
-                    k_list.append([0.0, 0.0, 0.0, 0.5, 0.5])
+                    k_list.append([0.0, 0.0, 0.0, 0.5, 0.5, 0.0, 0.0, 0.0])
         return np.array(k_list, dtype=np.float32)
 
     def _add_sensor_noise(self, obs: np.ndarray) -> np.ndarray:

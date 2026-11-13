@@ -17,20 +17,69 @@ from la_mcts.sampled_mcts import SampledContinuousMCTS
 
 
 def test_harmonic_kinematic_embedding():
-    """Verifies that encode_kinematics maps (x, y, z, yaw, pitch) to 8D with harmonic continuity."""
+    """Verifies that encode_kinematics maps (x, y, z, yaw, pitch, diff_rx, diff_ry, diff_rz) to 17D with harmonic continuity."""
     kin = torch.tensor([
-        [0.2, 0.2, 0.0, 0.0, 0.5],   # yaw = 0.0
-        [0.2, 0.2, 0.0, 1.0, 0.5],   # yaw = 1.0 (equivalent to 0.0)
+        [0.2, 0.2, 0.0, 0.0, 0.5, -1.0, 0.25, 0.5],   # yaw = 0.0, diff_rx = -1.0 (-pi)
+        [0.2, 0.2, 0.0, 1.0, 0.5,  1.0, 0.25, 0.5],   # yaw = 1.0, diff_rx = +1.0 (+pi)
     ], dtype=torch.float32)
 
     emb = MorphologicalLimbHead.encode_kinematics(kin)
-    assert emb.shape == (2, 8)
+    assert emb.shape == (2, 17)
 
     # cos(0) == cos(2pi) == 1, sin(0) == sin(2pi) == 0
     assert torch.allclose(emb[0, 4], emb[1, 4], atol=1e-5)  # cos(yaw)
     assert torch.allclose(emb[0, 5], emb[1, 5], atol=1e-5)  # sin(yaw)
     assert torch.allclose(emb[0, 6], emb[1, 6], atol=1e-5)  # pitch
     assert torch.allclose(emb[0, 7], emb[1, 7], atol=1e-5)  # sin(pitch)
+    # Periodic continuity across -pi / +pi boundary for diff_rx
+    assert torch.allclose(emb[0, 9], emb[1, 9], atol=1e-5)   # cos(pi * diff_rx)
+    assert torch.allclose(emb[0, 10], emb[1, 10], atol=1e-5) # sin(pi * diff_rx)
+    # Legacy 5D input backward compatibility
+    emb_legacy = MorphologicalLimbHead.encode_kinematics(kin[:, :5])
+    assert emb_legacy.shape == (2, 17)
+
+
+def test_torso_leg_xyz_angle_diff_in_transformer_embedding():
+    """Verifies X, Y, Z torso-to-leg angle difference math and its effect on Transformer leg embeddings."""
+    import math
+    from brl_core.perception import compute_torso_leg_angle_diff
+
+    eye = np.eye(3, dtype=np.float64)
+    assert compute_torso_leg_angle_diff(eye, eye) == pytest.approx((0.0, 0.0, 0.0), abs=1e-6)
+
+    # 90 deg rotation around Z axis
+    rz90 = np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+    dx, dy, dz = compute_torso_leg_angle_diff(rz90, eye)
+    assert dx == pytest.approx(0.0, abs=1e-6)
+    assert dy == pytest.approx(0.0, abs=1e-6)
+    assert dz == pytest.approx(0.5, abs=1e-6)
+
+    # 45 deg rotation around X axis
+    a = math.pi / 4.0
+    rx45 = np.array([[1.0, 0.0, 0.0], [0.0, math.cos(a), -math.sin(a)], [0.0, math.sin(a), math.cos(a)]], dtype=np.float64)
+    dx, dy, dz = compute_torso_leg_angle_diff(rx45, eye)
+    assert dx == pytest.approx(0.25, abs=1e-6)
+    assert dy == pytest.approx(0.0, abs=1e-6)
+    assert dz == pytest.approx(0.0, abs=1e-6)
+
+    # 60 deg rotation around Y axis
+    b = math.pi / 3.0
+    ry60 = np.array([[math.cos(b), 0.0, math.sin(b)], [0.0, 1.0, 0.0], [-math.sin(b), 0.0, math.cos(b)]], dtype=np.float64)
+    dx, dy, dz = compute_torso_leg_angle_diff(ry60, eye)
+    assert dx == pytest.approx(0.0, abs=1e-6)
+    assert dy == pytest.approx(1.0 / 3.0, abs=1e-6)
+    assert dz == pytest.approx(0.0, abs=1e-6)
+
+    # Transformer leg head output must respond to diff_rx, diff_ry, diff_rz
+    head = MorphologicalLimbHead(latent_dim=64, num_peaks=3, max_joints_per_limb=2, hidden_dim=32)
+    z_t = torch.randn(2, 64)
+    kin_a = torch.zeros(4, 8)
+    kin_b = kin_a.clone()
+    kin_b[:, 5:8] = torch.tensor([[0.25, -0.3, 0.5]] * 4)
+    w_a, mu_a, _ = head.forward_all_limbs(z_t, kin_a, return_weights=True)
+    w_b, mu_b, _ = head.forward_all_limbs(z_t, kin_b, return_weights=True)
+    assert not torch.allclose(mu_a, mu_b)
+    assert not torch.allclose(w_a, w_b)
 
 
 def test_limb_head_single_limb_query():
@@ -160,30 +209,33 @@ def test_env_wrappers_provide_limb_kinematics():
     obs_ant, info_ant = ant_env.reset()
     assert "limb_kinematics" in info_ant
     kin_ant = info_ant["limb_kinematics"]
-    assert kin_ant.shape == (4, 5)
+    assert kin_ant.shape == (4, 8)
+    assert np.all(np.abs(kin_ant[:, 5:8]) <= 1.0 + 1e-6)
     _, _, _, _, step_info_ant = ant_env.step(np.zeros(8, dtype=np.float32))
     assert "limb_kinematics" in step_info_ant
-    assert step_info_ant["limb_kinematics"].shape == (4, 5)
+    assert step_info_ant["limb_kinematics"].shape == (4, 8)
 
     # Dog
     dog_env = MorphologicalDogBRLWrapper()
     obs_dog, info_dog = dog_env.reset()
     assert "limb_kinematics" in info_dog
     kin_dog = info_dog["limb_kinematics"]
-    assert kin_dog.shape == (4, 5)
+    assert kin_dog.shape == (4, 8)
+    assert np.all(np.abs(kin_dog[:, 5:8]) <= 1.0 + 1e-6)
     _, _, _, _, step_info_dog = dog_env.step(np.zeros(12, dtype=np.float32))
     assert "limb_kinematics" in step_info_dog
-    assert step_info_dog["limb_kinematics"].shape == (4, 5)
+    assert step_info_dog["limb_kinematics"].shape == (4, 8)
 
     # Humanoid
     hum_env = MorphologicalHumanoidBRLWrapper()
     obs_hum, info_hum = hum_env.reset()
     assert "limb_kinematics" in info_hum
     kin_hum = info_hum["limb_kinematics"]
-    assert kin_hum.shape == (5, 5)
+    assert kin_hum.shape == (5, 8)
+    assert np.all(np.abs(kin_hum[:, 5:8]) <= 1.0 + 1e-6)
     _, _, _, _, step_info_hum = hum_env.step(np.zeros(17, dtype=np.float32))
     assert "limb_kinematics" in step_info_hum
-    assert step_info_hum["limb_kinematics"].shape == (5, 5)
+    assert step_info_hum["limb_kinematics"].shape == (5, 8)
 
 
 def test_agent_get_limb_movement():

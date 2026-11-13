@@ -11,7 +11,11 @@ import numpy as np
 
 from ant_morph_env.xml_gen import ProceduralAntXMLGenerator
 from brl_core.interfaces import WinEvaluator
-from brl_core.perception import ModalitySliceSpec, PerceptionDistortionFilter
+from brl_core.perception import (
+    ModalitySliceSpec,
+    PerceptionDistortionFilter,
+    compute_torso_leg_angle_diff,
+)
 
 
 class MorphologicalAntBRLWrapper(gym.Wrapper):
@@ -355,10 +359,15 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
                 u = v / max(float(np.linalg.norm(v)), 1e-6)
                 yaw = float((np.arctan2(u[1], u[0]) + np.pi) / (2.0 * np.pi)) % 1.0
                 pitch = float((np.arcsin(np.clip(u[2], -1.0, 1.0)) + np.pi / 2.0) / np.pi)
-                k_list.append([float(a_pos[0]), float(a_pos[1]), float(a_pos[2]), yaw, pitch])
+                diff_rx, diff_ry, diff_rz = compute_torso_leg_angle_diff(
+                    torso_xmat, data.xmat[f_id]
+                )
+                k_list.append(
+                    [float(a_pos[0]), float(a_pos[1]), float(a_pos[2]), yaw, pitch, diff_rx, diff_ry, diff_rz]
+                )
             else:
                 angle = (float(i - 1) / float(self.current_num_legs)) * 2.0 * math.pi
-                k_list.append([0.2 * math.cos(angle), 0.2 * math.sin(angle), 0.0, (angle / (2.0 * math.pi)) % 1.0, 0.5])
+                k_list.append([0.2 * math.cos(angle), 0.2 * math.sin(angle), 0.0, (angle / (2.0 * math.pi)) % 1.0, 0.5, 0.0, 0.0, 0.0])
         return np.array(k_list, dtype=np.float32)
 
     def reset(

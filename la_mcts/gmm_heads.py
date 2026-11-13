@@ -159,9 +159,12 @@ class MorphologicalLimbHead(nn.Module):
         self.log_std_bounds = log_std_bounds
         self.n_heads = n_heads
 
-        # 8D geometric query embedding:
-        # [x, y, z, yaw, cos(2*pi*yaw), sin(2*pi*yaw), pitch, sin(pi*pitch)]
-        self.geom_dim = 8
+        # 17D geometric query embedding:
+        # [x, y, z, yaw, cos(2*pi*yaw), sin(2*pi*yaw), pitch, sin(pi*pitch),
+        #  diff_rx, cos(pi*diff_rx), sin(pi*diff_rx),
+        #  diff_ry, cos(pi*diff_ry), sin(pi*diff_ry),
+        #  diff_rz, cos(pi*diff_rz), sin(pi*diff_rz)]
+        self.geom_dim = 17
 
         # Project global latent z_t and per-limb kinematics into shared token dimension
         self.global_proj = nn.Sequential(
@@ -221,7 +224,7 @@ class MorphologicalLimbHead(nn.Module):
 
     @staticmethod
     def encode_kinematics(kinematics: torch.Tensor) -> torch.Tensor:
-        """Projects (..., 5) [x, y, z, yaw, pitch] into (..., 8) harmonic kinematic representation."""
+        """Projects (..., 8) [x, y, z, yaw, pitch, diff_rx, diff_ry, diff_rz] (or legacy 5D) into (..., 17) harmonic kinematic representation."""
         x = kinematics[..., 0:1]
         y = kinematics[..., 1:2]
         z = kinematics[..., 2:3]
@@ -235,7 +238,30 @@ class MorphologicalLimbHead(nn.Module):
         sin_yaw = torch.sin(two_pi_yaw)
         sin_pitch = torch.sin(pi_pitch)
 
-        return torch.cat([x, y, z, yaw, cos_yaw, sin_yaw, pitch, sin_pitch], dim=-1)
+        if kinematics.shape[-1] >= 8:
+            diff_rx = kinematics[..., 5:6]
+            diff_ry = kinematics[..., 6:7]
+            diff_rz = kinematics[..., 7:8]
+        else:
+            diff_rx = torch.zeros_like(x)
+            diff_ry = torch.zeros_like(x)
+            diff_rz = torch.zeros_like(x)
+
+        pi_rx = math.pi * diff_rx
+        pi_ry = math.pi * diff_ry
+        pi_rz = math.pi * diff_rz
+
+        return torch.cat(
+            [
+                x, y, z,
+                yaw, cos_yaw, sin_yaw,
+                pitch, sin_pitch,
+                diff_rx, torch.cos(pi_rx), torch.sin(pi_rx),
+                diff_ry, torch.cos(pi_ry), torch.sin(pi_ry),
+                diff_rz, torch.cos(pi_rz), torch.sin(pi_rz),
+            ],
+            dim=-1,
+        )
 
     def _encode_and_decode(
         self,
@@ -282,6 +308,7 @@ class MorphologicalLimbHead(nn.Module):
         num_joints: Optional[int] = None,
         all_limbs_kinematics: Optional[torch.Tensor] = None,
         return_weights: bool = False,
+        angle_diff: Optional[Tuple[float, float, float] | Sequence[float] | torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, ...]:
         """Computes per-peak (mu, log_std) [and weight when return_weights=True] for a single limb."""
         device = z_t.device
@@ -299,8 +326,15 @@ class MorphologicalLimbHead(nn.Module):
         else:
             pitch_t = pitch.to(device=device, dtype=dtype).view(-1)
 
-        kin_5d = torch.cat([anchor_t.view(-1, 3), yaw_t.view(-1, 1), pitch_t.view(-1, 1)], dim=-1)
-        geom = self.encode_kinematics(kin_5d).unsqueeze(1)  # (B_or_1, 1, 8)
+        if angle_diff is None:
+            diff_t = torch.zeros(anchor_t.view(-1, 3).shape[0], 3, dtype=dtype, device=device)
+        elif not torch.is_tensor(angle_diff):
+            diff_t = torch.tensor(angle_diff, dtype=dtype, device=device).view(-1, 3)
+        else:
+            diff_t = angle_diff.to(device=device, dtype=dtype).view(-1, 3)
+
+        kin_8d = torch.cat([anchor_t.view(-1, 3), yaw_t.view(-1, 1), pitch_t.view(-1, 1), diff_t], dim=-1)
+        geom = self.encode_kinematics(kin_8d).unsqueeze(1)  # (B_or_1, 1, 17)
 
         if z_t.dim() == 1:
             z_t_in = z_t.unsqueeze(0)
@@ -348,18 +382,19 @@ class MorphologicalLimbHead(nn.Module):
         z_flat = z_t.view(-1, self.latent_dim)
         bsz = z_flat.shape[0]
 
+        kin_dim = limb_kinematics.shape[-1]
         if limb_kinematics.dim() == 2:
             n_limbs = limb_kinematics.shape[0]
-            kin_flat = limb_kinematics.unsqueeze(0).expand(bsz, n_limbs, 5)
+            kin_flat = limb_kinematics.unsqueeze(0).expand(bsz, n_limbs, kin_dim)
         elif limb_kinematics.dim() >= 3:
             n_limbs = limb_kinematics.shape[-2]
-            kin_flat = limb_kinematics.reshape(-1, n_limbs, 5)
+            kin_flat = limb_kinematics.reshape(-1, n_limbs, kin_dim)
             if kin_flat.shape[0] == 1 and bsz > 1:
-                kin_flat = kin_flat.expand(bsz, n_limbs, 5)
+                kin_flat = kin_flat.expand(bsz, n_limbs, kin_dim)
         else:
             raise ValueError(f"Unsupported limb_kinematics shape: {limb_kinematics.shape}")
 
-        geom_emb = self.encode_kinematics(kin_flat)  # (bsz, n_limbs, 8)
+        geom_emb = self.encode_kinematics(kin_flat)  # (bsz, n_limbs, 17)
         h = self._encode_and_decode(z_flat, query_geom=geom_emb)  # (bsz, num_peaks, n_limbs, hidden_dim)
         limb_weights = self.weight_head(h).squeeze(-1)  # (bsz, num_peaks, n_limbs)
         mu_limbs = self.mu_head(h)  # (bsz, num_peaks, n_limbs, max_joints_per_limb)

@@ -20,6 +20,40 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 
+def _xmat_to_euler_xyz(xmat: np.ndarray) -> Tuple[float, float, float]:
+    """Extracts extrinsic XYZ (roll, pitch, yaw) Euler angles in radians from a 3x3 rotation matrix."""
+    m = np.asarray(xmat, dtype=np.float64).reshape(3, 3)
+    sy = math.sqrt(float(m[0, 0]) ** 2 + float(m[1, 0]) ** 2)
+    if sy > 1e-6:
+        rx = math.atan2(float(m[2, 1]), float(m[2, 2]))
+        ry = math.atan2(-float(m[2, 0]), sy)
+        rz = math.atan2(float(m[1, 0]), float(m[0, 0]))
+    else:
+        rx = math.atan2(-float(m[1, 2]), float(m[1, 1]))
+        ry = math.atan2(-float(m[2, 0]), sy)
+        rz = 0.0
+    return rx, ry, rz
+
+
+def _wrap_angle_norm(diff_rad: float) -> float:
+    """Wraps an angle difference in radians to [-pi, pi] and normalizes to [-1.0, 1.0]."""
+    wrapped = (diff_rad + math.pi) % (2.0 * math.pi) - math.pi
+    return float(wrapped / math.pi)
+
+
+def compute_torso_leg_angle_diff(
+    torso_xmat: np.ndarray, leg_xmat: np.ndarray
+) -> Tuple[float, float, float]:
+    """Computes normalized (X, Y, Z) world Euler angle differences: wrap(torso - leg) / pi in [-1, 1]."""
+    t_rx, t_ry, t_rz = _xmat_to_euler_xyz(torso_xmat)
+    l_rx, l_ry, l_rz = _xmat_to_euler_xyz(leg_xmat)
+    return (
+        _wrap_angle_norm(t_rx - l_rx),
+        _wrap_angle_norm(t_ry - l_ry),
+        _wrap_angle_norm(t_rz - l_rz),
+    )
+
+
 @dataclass
 class ModalitySliceSpec:
     """Specifies observation indices corresponding to distinct sensor modalities."""
@@ -173,6 +207,7 @@ class PerceptionDistortionFilter:
         # Limb position & pointing perception calibration
         self._limb_pos_bias: Optional[np.ndarray] = None
         self._limb_rot_bias: Optional[np.ndarray] = None
+        self._limb_angle_diff_bias: Optional[np.ndarray] = None
         self._limb_pos_bias_std: float = 0.0
         self._limb_rot_bias_std: float = 0.0
         self._step_limb_pos_noise_std: float = 0.0
@@ -340,6 +375,7 @@ class PerceptionDistortionFilter:
 
         self._limb_pos_bias = None
         self._limb_rot_bias = None
+        self._limb_angle_diff_bias = None
         self.limb_pos_rmse = 0.0
         self.limb_pointing_rmse = 0.0
         self.limb_kinematics_exactness = 1.0
@@ -482,6 +518,14 @@ class PerceptionDistortionFilter:
             else:
                 self._limb_rot_bias = np.zeros((n_limbs, 2), dtype=np.float32)
 
+        if self._limb_angle_diff_bias is None or self._limb_angle_diff_bias.shape[0] != n_limbs:
+            if self._limb_rot_bias_std > 1e-6:
+                self._limb_angle_diff_bias = self._rng.normal(
+                    0.0, self._limb_rot_bias_std, size=(n_limbs, 3)
+                ).astype(np.float32)
+            else:
+                self._limb_angle_diff_bias = np.zeros((n_limbs, 3), dtype=np.float32)
+
         distorted = kin.copy()
 
         # 1. Distort Limb Anchor Positions (x, y, z) via w[12]
@@ -493,7 +537,7 @@ class PerceptionDistortionFilter:
             )
             distorted[:, 0:3] = kin[:, 0:3] + self._limb_pos_bias + pos_noise
 
-        # 2. Distort Limb Pointing Direction (yaw, pitch) via w[13]
+        # 2. Distort Limb Pointing Direction (yaw, pitch) & Torso-Leg Angle Diffs (5:8) via w[13]
         if self._limb_rot_bias_std > 1e-6 or self._step_limb_rot_noise_std > 1e-6:
             rot_noise = (
                 self._rng.normal(0.0, self._step_limb_rot_noise_std, size=(n_limbs, 2)).astype(np.float32)
@@ -504,10 +548,19 @@ class PerceptionDistortionFilter:
             raw_pitch = kin[:, 4] + self._limb_rot_bias[:, 1] + rot_noise[:, 1]
             distorted[:, 3] = raw_yaw % 1.0
             distorted[:, 4] = np.clip(raw_pitch, 0.0, 1.0)
+            if kin.shape[1] >= 8:
+                diff_noise = (
+                    self._rng.normal(0.0, self._step_limb_rot_noise_std, size=(n_limbs, 3)).astype(np.float32)
+                    if self._step_limb_rot_noise_std > 1e-6
+                    else np.zeros((n_limbs, 3), dtype=np.float32)
+                )
+                raw_diff = kin[:, 5:8] + self._limb_angle_diff_bias + diff_noise
+                distorted[:, 5:8] = ((raw_diff + 1.0) % 2.0) - 1.0
 
         # Telemetry
         pos_sq_err = float(np.mean(np.square(distorted[:, 0:3] - kin[:, 0:3])))
-        rot_sq_err = float(np.mean(np.square(distorted[:, 3:5] - kin[:, 3:5])))
+        rot_end = 8 if kin.shape[1] >= 8 else 5
+        rot_sq_err = float(np.mean(np.square(distorted[:, 3:rot_end] - kin[:, 3:rot_end])))
         self.limb_pos_rmse = float(math.sqrt(pos_sq_err))
         self.limb_pointing_rmse = float(math.sqrt(rot_sq_err))
         self.limb_kinematics_exactness = float(
