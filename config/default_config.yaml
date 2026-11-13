@@ -7,7 +7,7 @@ la_mcts:
   l_enc: 2
   latent_dim: 256
   num_peaks: 4
-  log_std_bounds: [-0.8, 1.0]
+  log_std_bounds: [-1.0, 1.0]
   use_categorical_critic: true
   support_min: -150
   support_max: 150
@@ -23,7 +23,7 @@ la_mcts:
   lambda_v: 0.5
   lambda_r: 1.0
   lambda_p: 0.25
-  lambda_ent: 0.15
+  lambda_ent: 0.03
   c_reg: 0.0001
   n_sim: 32
   n_sim_eval: 64
@@ -37,7 +37,7 @@ la_mcts:
   tau_act_train: 1.0
   tau_act_eval: 0.05
   adaptive_exploration: true
-  min_policy_std_target: 0.55
+  min_policy_std_target: 0.40
   exploration_boost_max: 2.0
   lr: 0.00020
   batch_size: 128
