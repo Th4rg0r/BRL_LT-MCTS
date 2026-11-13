@@ -39,7 +39,7 @@ la_mcts:
   adaptive_exploration: true
   min_policy_std_target: 0.55
   exploration_boost_max: 2.0
-  lr: 0.00005
+  lr: 0.00020
   batch_size: 128
   buffer_capacity: 50000
   context_dim: 18
@@ -58,7 +58,7 @@ brl:
   target_win_rate: 0.50
   ema_beta_w: 0.05
   tau_s: 500.0
-  initial_r_ref: -900.0
+  initial_r_ref: -300.0
   benchmark_r_ref: 6169.54
   window_k_w: 20
   alpha_eq: 10.0
@@ -73,11 +73,11 @@ brl:
   beta_score: 1.0
   eta_viol: 2.0
   beta_ent: 0.01
-  warmup_episodes: 200
+  warmup_episodes: 300
   brl_episodes: 10000
   total_episodes: 10000
-  warmup_limit: 50.0
-  warmup_budget: 100.0
+  warmup_limit: 30.0
+  warmup_budget: 90.0
 
 ant_morph:
   env_id: "Ant-v5"
