@@ -34,6 +34,8 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         fixed_action_space: bool = False,
         default_num_legs: int = 4,
         healthy_z_range: Tuple[float, float] = (0.2, 1.0),
+        action_ema_alpha: float = 0.6,
+        action_smoothness_coef: float = 0.05,
     ) -> None:
         self.env_id = env_id
         if env is None:
@@ -58,6 +60,8 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         self.fixed_action_space = bool(fixed_action_space)
         self.default_num_legs = int(default_num_legs)
         self.base_healthy_z_range = healthy_z_range
+        self.action_ema_alpha = float(np.clip(action_ema_alpha, 0.05, 1.0))
+        self.action_smoothness_coef = max(0.0, float(action_smoothness_coef))
         self.canonical_obs_dim = 105 if self.use_contact_forces else 27
 
         self.xml_gen = ProceduralAntXMLGenerator()
@@ -87,6 +91,8 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         self._ep_energy = 0.0
         self._start_x = 0.0
         self._healthy_steps = 0
+        self._prev_raw_action: Optional[np.ndarray] = None
+        self._prev_smoothed_action: Optional[np.ndarray] = None
 
         self.observation_space = spaces.Box(
             low=-np.inf,
@@ -413,6 +419,8 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         self._ep_energy = 0.0
         self._healthy_steps = 0
         self._start_x = float(self.mj_data.qpos[0])
+        self._prev_raw_action = None
+        self._prev_smoothed_action = None
 
         canonical_obs = self._get_canonical_obs()
         obs_noisy = self._add_sensor_noise(canonical_obs)
@@ -445,7 +453,25 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
             act_env = np.pad(act_arr, (0, nu - act_arr.shape[0]))
         else:
             act_env = act_arr[:nu].copy()
-        act_env = np.clip(act_env * morph_mask[:nu], -1.0, 1.0)
+        act_raw = np.clip(act_env * morph_mask[:nu], -1.0, 1.0)
+        if self._prev_raw_action is not None and self._prev_raw_action.shape == act_raw.shape:
+            smooth_penalty = self.action_smoothness_coef * float(
+                np.sum(np.square(act_raw - self._prev_raw_action))
+            )
+            act_env = np.clip(
+                (
+                    self.action_ema_alpha * act_raw
+                    + (1.0 - self.action_ema_alpha) * self._prev_smoothed_action
+                )
+                * morph_mask[:nu],
+                -1.0,
+                1.0,
+            )
+        else:
+            smooth_penalty = 0.0
+            act_env = act_raw.copy()
+        self._prev_raw_action = act_raw.copy()
+        self._prev_smoothed_action = act_env.copy()
 
         # w_11: Inject stochastic Ornstein-Uhlenbeck wind force into data.xfrc_applied[torso_id, :3]
         torso_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "torso")
@@ -470,6 +496,7 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
             self.mj_data.xfrc_applied[torso_id, :3] = 0.0
 
         _, reward, terminated, truncated, info = self.env.step(act_env)
+        reward = float(reward) - smooth_penalty
 
         canonical_obs = self._get_canonical_obs()
         # Guard against non-finite physics states under extreme combined disturbances

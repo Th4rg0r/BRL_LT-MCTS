@@ -21,7 +21,7 @@ class LAMCTSConfig:
     l_enc: int = 2
     latent_dim: int = 256
     num_peaks: int = 4
-    log_std_bounds: Tuple[float, float] = (-3.0, 2.0)
+    log_std_bounds: Tuple[float, float] = (-1.5, 0.25)
     use_categorical_critic: bool = True
     support_min: int = -150
     support_max: int = 150
@@ -37,21 +37,21 @@ class LAMCTSConfig:
     lambda_v: float = 0.5
     lambda_r: float = 1.0
     lambda_p: float = 1.0
-    lambda_ent: float = 0.03
+    lambda_ent: float = 0.01
     c_reg: float = 1e-4
     n_sim: int = 32
     n_sim_eval: int = 64
     k_act: int = 16
     c_1: float = 1.25
     c_2: float = 19652.0
-    root_tau_beta: float = 1.25
-    inner_tau_beta: float = 1.0
+    root_tau_beta: float = 1.0
+    inner_tau_beta: float = 0.8
     root_dirichlet_alpha: float = 0.3
     root_exploration_fraction: float = 0.25
     tau_act_train: float = 1.0
     tau_act_eval: float = 0.05
     adaptive_exploration: bool = True
-    min_policy_std_target: float = 0.40
+    min_policy_std_target: float = 0.25
     exploration_boost_max: float = 2.0
     lr: float = 3e-4
     batch_size: int = 128
@@ -63,7 +63,7 @@ class LAMCTSConfig:
     train_every_steps: int = 50
     # MuZero Reanalyze every N episodes (0 = disabled) and number of states per Reanalyze pass
     reanalyze_every: int = 4
-    reanalyze_states: int = 8
+    reanalyze_states: int = 4
 
 
 @dataclass
