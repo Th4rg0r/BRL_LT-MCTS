@@ -63,7 +63,7 @@ class LAMCTSConfig:
     train_every_steps: int = 50
     # MuZero Reanalyze every N episodes (0 = disabled) and number of states per Reanalyze pass
     reanalyze_every: int = 4
-    reanalyze_states: int = 4
+    reanalyze_states: int = 8
 
 
 @dataclass

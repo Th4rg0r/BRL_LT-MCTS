@@ -47,7 +47,7 @@ la_mcts:
   reanalyze_ratio: 0.25
   train_every_steps: 25     # agent update every N env steps (0 = auto: max_steps // 2)
   reanalyze_every: 4        # Reanalyze every N episodes (0 = off)
-  reanalyze_states: 4       # states refreshed per Reanalyze pass
+  reanalyze_states: 8       # states refreshed per Reanalyze pass
 
 brl:
   num_params: 18
