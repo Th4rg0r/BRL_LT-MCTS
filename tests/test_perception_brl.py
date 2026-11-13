@@ -445,3 +445,74 @@ def test_balancer_mismatched_tweak_failure_correlations() -> None:
     )
     assert state.shape == (balancer.state_dim,)
 
+
+def test_orchestrator_post_warmup_calibration() -> None:
+    """Verifies ema_win_rate resets to 0.50 and r_ref calibrates to median(last 20 returns) after warmup."""
+    from brl_core.orchestrator import BRLTrainingOrchestrator
+    from brl_core.tweaker import StochasticTweakerActorCritic
+    from config import SystemConfig
+
+    class _DummyEnv:
+        def __init__(self, returns_seq: list[float]) -> None:
+            self._returns_seq = returns_seq
+            self._idx = 0
+
+        def reset(self, options=None):
+            return np.zeros(27, dtype=np.float32), {
+                "morphology_mask": np.ones(8, dtype=np.float32),
+                "perceived_tweak_vector": np.zeros(18, dtype=np.float32),
+            }
+
+        def step(self, action):
+            r = self._returns_seq[self._idx]
+            self._idx += 1
+            return (
+                np.zeros(27, dtype=np.float32),
+                r,
+                False,
+                True,
+                {"brl_metrics": {"x_velocity": 0.0, "total_distance": 0.0}},
+            )
+
+    class _DummyAgent:
+        def select_action(self, obs, deterministic=False, limb_kinematics=None):
+            return np.zeros(8, dtype=np.float32)
+
+        def observe_transition(self, *args, **kwargs):
+            pass
+
+        def train_step(self):
+            return {}
+
+    cfg = SystemConfig()
+    cfg.brl.warmup_episodes = 25
+    cfg.brl.brl_episodes = 100
+    cfg.ant_morph.max_episode_steps = 1
+
+    # 25 warmup episodes + 1 post-warmup episode (return=-190 -> should win vs median(-210) if moving, or test r_ref & ema)
+    warmup_rets = [-500.0] * 5 + [float(-220 + i) for i in range(20)]  # last 20: -220..-201, median = -210.5
+    post_ret = -190.0
+    env = _DummyEnv(warmup_rets + [post_ret])
+
+    tweaker = StochasticTweakerActorCritic(config=cfg.brl, device="cpu")
+    balancer = DDPGBalancer(config=cfg.brl, device="cpu")
+    orch = BRLTrainingOrchestrator(
+        env=env, agent=_DummyAgent(), tweaker=tweaker, balancer=balancer, config=cfg
+    )
+
+    for ep in range(1, 26):
+        orch.run_episode(episode_idx=ep, max_steps=1, train_agent_every=10)
+
+    # During warmup with x_velocity=0.0, all 25 episodes lost so ema_win_rate decayed well below 0.50
+    assert orch.win_evaluator.ema_win_rate < 0.20
+
+    # Transition to episode 26 (post-warmup): must calibrate before Balancer & evaluate against median(-210.5)
+    summary_26 = orch.run_episode(episode_idx=26, max_steps=1, train_agent_every=10)
+    assert orch._warmup_calibrated is True
+    # ema_win_rate was reset to 0.50 before episode 26 evaluation -> post_ret=-190.0 >= -210.5 is a WIN -> 0.525
+    assert summary_26["win_indicator"] == 1
+    assert abs(summary_26["ema_win_rate"] - 0.525) < 1e-6
+    # r_ref was calibrated to -210.5 and adapted slightly upward toward max(-210.5, -190*0.9=-171) since ema > 0.52
+    expected_r_ref = 0.98 * (-210.5) + 0.02 * (-171.0)
+    assert abs(summary_26["r_ref"] - expected_r_ref) < 1e-5
+

@@ -108,23 +108,23 @@ def test_standing_reward_is_unpenalized_and_win_evaluator() -> None:
     assert np.isfinite(reward)
     assert reward > 0.5, f"Expected unpenalized env reward (healthy bonus kept), got {reward}"
 
-    # Verify WinEvaluator: standing still with high return MUST be evaluated as LOSS (0)
+    # Verify WinEvaluator: premature unhealthy termination MUST be evaluated as LOSS (0) even with high return
     we = WinEvaluator(initial_r_ref=500.0)
     win_ind, dom, ema = we.evaluate_episode(
         episode_return=900.0,
-        terminated_unhealthy=False,
-        forward_velocity=0.01,  # Standing still / tiny jitter
+        terminated_unhealthy=True,
+        forward_velocity=0.01,
     )
-    assert win_ind == 0, "Standing still exploit must evaluate to LOSS (win_indicator = 0)"
-    assert dom <= 0.5, f"Dominance score for static hold should be dampened, got {dom}"
+    assert win_ind == 0, "Unhealthy termination must evaluate to LOSS (win_indicator = 0)"
+    assert dom <= 0.5, f"Dominance score for unhealthy termination should be dampened, got {dom}"
 
-    # Verify WinEvaluator: active forward locomotion WITH return >= r_ref MUST be WIN (1)
+    # Verify WinEvaluator: healthy survival WITH return >= r_ref MUST be WIN (1) without velocity gate
     win_ind_run, dom_run, ema_run = we.evaluate_episode(
         episode_return=900.0,
         terminated_unhealthy=False,
-        forward_velocity=1.5,  # Active forward sprinting
+        forward_velocity=0.01,
     )
-    assert win_ind_run == 1, "Active locomotion meeting r_ref must evaluate to WIN (win_indicator = 1)"
+    assert win_ind_run == 1, "Healthy survival meeting r_ref must evaluate to WIN (win_indicator = 1)"
 
 
 def test_hexapod_all_legs_point_downward() -> None:

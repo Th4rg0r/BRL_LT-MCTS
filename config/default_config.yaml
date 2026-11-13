@@ -73,7 +73,7 @@ brl:
   beta_score: 1.0
   eta_viol: 2.0
   beta_ent: 0.01
-  warmup_episodes: 300
+  warmup_episodes: 200
   brl_episodes: 10000
   total_episodes: 10000
   warmup_limit: 30.0

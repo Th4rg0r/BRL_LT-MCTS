@@ -44,6 +44,8 @@ class BRLTrainingOrchestrator:
         self.last_leg_length_exactness: float = 1.0
         self.last_obs_rmse: float = 0.0
         self.episode_history: List[Dict[str, Any]] = []
+        self._warmup_returns: List[float] = []
+        self._warmup_calibrated: bool = False
 
     def run_episode(
         self,
@@ -56,6 +58,21 @@ class BRLTrainingOrchestrator:
         brl_cfg = self.cfg.brl
         is_warmup = episode_idx <= brl_cfg.warmup_episodes
         is_consolidation = episode_idx > brl_cfg.brl_episodes
+
+        # On transition out of warmup, reset EMA win rate to 50% equilibrium
+        # and calibrate r_ref to the median of the last 20 warmup episode returns.
+        if not is_warmup and not self._warmup_calibrated:
+            self.win_evaluator.ema_win_rate = 0.50
+            if self._warmup_returns:
+                median_ret = float(np.median(self._warmup_returns[-20:]))
+                self.win_evaluator.r_ref = float(
+                    np.clip(
+                        median_ret,
+                        self.win_evaluator.min_floor_ref,
+                        self.win_evaluator.benchmark_r_ref,
+                    )
+                )
+            self._warmup_calibrated = True
 
         # 1. Balancer emits constraints (L_e, B_e, C_e)
         bal_state = self.balancer.build_state(
@@ -160,6 +177,10 @@ class BRLTrainingOrchestrator:
 
         unhealthy_term = bool(terminated and steps < step_limit)
         x_vel = float(brl_info.get("x_velocity", ep_return / max(steps, 1)))
+        if is_warmup:
+            self._warmup_returns.append(float(ep_return))
+            if len(self._warmup_returns) > 20:
+                self._warmup_returns = self._warmup_returns[-20:]
         win_ind, dom_score, ema_win = self.win_evaluator.evaluate_episode(
             episode_return=ep_return,
             terminated_unhealthy=unhealthy_term,
