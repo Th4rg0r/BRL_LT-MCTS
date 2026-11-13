@@ -23,22 +23,22 @@ la_mcts:
   lambda_v: 0.5
   lambda_r: 1.0
   lambda_p: 0.25
-  lambda_ent: 0.01
+  lambda_ent: 0.015
   c_reg: 0.0001
   n_sim: 32
   n_sim_eval: 64
   k_act: 16
-  c_1: 1.25
+  c_1: 1.50
   c_2: 19652.0
   root_tau_beta: 1.0
   inner_tau_beta: 0.8
   root_dirichlet_alpha: 0.3
-  root_exploration_fraction: 0.25
+  root_exploration_fraction: 0.30
   tau_act_train: 1.0
   tau_act_eval: 0.05
   adaptive_exploration: true
-  min_policy_std_target: 0.25
-  exploration_boost_max: 2.0
+  min_policy_std_target: 0.30
+  exploration_boost_max: 2.25
   lr: 0.00020
   batch_size: 128
   buffer_capacity: 50000
