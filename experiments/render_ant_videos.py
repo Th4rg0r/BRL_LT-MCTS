@@ -41,7 +41,7 @@ def main() -> None:
         "-s",
         type=str,
         default=None,
-        help="Specific validation scenario to render (e.g. 'standard', 'icy' / 'heavy_ice', 'tripod', 'spider', 'hexapod'). Default: all scenarios.",
+        help="Specific validation scenario to render (e.g. 'standard', 'icy' / 'heavy_ice', 'tripod', 'spider', 'hexapod', 'harsh'). Default: all scenarios.",
     )
     parser.add_argument(
         "--max-steps",

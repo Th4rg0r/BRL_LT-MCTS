@@ -76,8 +76,8 @@ def test_torso_leg_xyz_angle_diff_in_transformer_embedding():
     kin_a = torch.zeros(4, 8)
     kin_b = kin_a.clone()
     kin_b[:, 5:8] = torch.tensor([[0.25, -0.3, 0.5]] * 4)
-    w_a, mu_a, _ = head.forward_all_limbs(z_t, kin_a, return_weights=True)
-    w_b, mu_b, _ = head.forward_all_limbs(z_t, kin_b, return_weights=True)
+    w_a, mu_a, _, _ = head.forward_all_limbs(z_t, kin_a, return_weights=True)
+    w_b, mu_b, _, _ = head.forward_all_limbs(z_t, kin_b, return_weights=True)
     assert not torch.allclose(mu_a, mu_b)
     assert not torch.allclose(w_a, w_b)
 

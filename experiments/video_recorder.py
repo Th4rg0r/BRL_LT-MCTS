@@ -121,15 +121,66 @@ def get_validation_scenarios(env_type: str) -> Dict[str, Dict[str, Any]]:
     raise ValueError(f"Unknown env_type '{env_type}'. Expected 'ant', 'humanoid', or 'dog'.")
 
 
+def build_harsh_scenario(
+    env_type: str,
+    rng: Optional[np.random.Generator] = None,
+) -> Dict[str, Any]:
+    """Builds a moderately harsh random physical/morphological scenario with full perception.
+
+    Randomly selects a subset (3 to 5) of physical/morphological dimensions and samples
+    them in [100, 250], keeping 4 legs intact and zeroing all perception distortion
+    and sensor-noise dimensions.
+    """
+    env_key = env_type.lower().strip()
+    gen = rng if rng is not None else np.random.default_rng()
+
+    tweak = np.zeros(18, dtype=np.float32)
+    if env_key == "ant":
+        phys_indices = [0, 1, 2, 4, 5, 6, 7, 8, 10, 11]  # excludes w[3] (amputation) and w[9] (sensor noise)
+    elif env_key in ("humanoid", "dog", "unitree_go1", "go1"):
+        phys_indices = [0, 1, 2, 4, 5, 6, 7, 8, 9, 11]  # excludes w[3] and w[10] (sensor noise)
+    else:
+        raise ValueError(f"Unknown env_type '{env_type}'. Expected 'ant', 'humanoid', or 'dog'.")
+
+    n_active = int(gen.integers(3, 6))  # 3 to 5 dimensions active, not every dimension
+    chosen = gen.choice(phys_indices, size=n_active, replace=False)
+    for idx in chosen:
+        tweak[int(idx)] = float(gen.uniform(100.0, 250.0))
+
+    # All PerceptionDistortionFilter controls strictly zeroed -> 100% exact perception
+    tweak[12:18] = 0.0
+
+    spec: Dict[str, Any] = {
+        "display_name": "Harsh Random (Full Perception)",
+        "tweak": tweak,
+    }
+    if env_key == "ant":
+        spec["num_legs"] = 4
+    elif env_key in ("dog", "unitree_go1", "go1"):
+        spec["disabled_leg"] = None
+    return spec
+
+
 def filter_validation_scenarios(
     scenarios: Dict[str, Dict[str, Any]],
     scenario_query: Optional[str] = None,
+    env_type: Optional[str] = None,
 ) -> Dict[str, Dict[str, Any]]:
-    """Filters validation scenarios by exact key or alias/keyword (e.g. 'icy', 'standard', 'spider')."""
+    """Filters validation scenarios by exact key or alias/keyword (e.g. 'icy', 'standard', 'harsh')."""
     if not scenario_query:
         return scenarios
 
     q = scenario_query.lower().strip()
+    if q in ("harsh", "harsh_random", "random_harsh"):
+        inferred = env_type
+        if not inferred:
+            if "standard_humanoid" in scenarios:
+                inferred = "humanoid"
+            elif "standard_dog" in scenarios:
+                inferred = "dog"
+            else:
+                inferred = "ant"
+        return {"harsh_random": build_harsh_scenario(inferred)}
     alias_map = {
         "ice": "ice",
         "icy": "ice",
@@ -551,11 +602,15 @@ def run_batch_video_rendering(
 
     # 2. Get scenario specs & filter
     all_scenarios = get_validation_scenarios(env_type)
-    scenarios = filter_validation_scenarios(all_scenarios, scenario)
+    scenarios = filter_validation_scenarios(all_scenarios, scenario, env_type=env_type)
     if scenario:
         print(f"Filtered Scenario ({len(scenarios)} of {len(all_scenarios)}): {', '.join(scenarios.keys())}")
     else:
         print(f"Validation Scenarios ({len(scenarios)}): {', '.join(scenarios.keys())}")
+    if "harsh_random" in scenarios:
+        h_spec = scenarios["harsh_random"]
+        h_tweak = np.round(h_spec["tweak"][:12], 1).tolist()
+        print(f"  Harsh Physical Tweak (w[0..11]): {h_tweak} | Full Perception (w[12..17]=0, noise=0)")
     print("-" * 80)
 
     # 3. Import appropriate checkpoint loader
