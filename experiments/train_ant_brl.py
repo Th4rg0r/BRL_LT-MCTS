@@ -667,11 +667,14 @@ def run_single_seed(
         budget_val = summary.get("budget", 0.0)
         tweak_val = summary.get("mean_tweak", 0.0)
         r_ref_val = summary.get("r_ref", 0.0)
+        dist_val = float(summary.get("total_distance", 0.0))
+        vel_val = float(summary.get("x_velocity", 0.0))
 
         if parallel_mode:
             line = (
                 f"[Seed {seed:2d} ({seed_idx + 1}/{total_seeds}) | Ep {ep:4d}/{episodes} | {total_env_steps:7,d} steps] "
-                f"Ret: {summary['episode_return']:+6.1f} | WinRate: {summary['ema_win_rate']:4.1%} [{win_tag}] | "
+                f"Ret: {summary['episode_return']:+6.1f} | Dist: {dist_val:+5.2f}m | Vel: {vel_val:+5.2f} m/s | "
+                f"WinRate: {summary['ema_win_rate']:4.1%} [{win_tag}] | "
                 f"Loss: {loss_str} | EpTime: {format_time_duration(ep_duration)} | ETA: {format_time_duration(seed_eta)}"
             )
             log_line(line, to_console=True)
@@ -680,6 +683,7 @@ def run_single_seed(
                 f"\r[Seed {seed_idx + 1}/{total_seeds} | Ep {ep:3d}/{episodes}] "
                 f"Steps: {summary['steps']:3d}/{max_steps} | "
                 f"Return: {summary['episode_return']:+6.1f} (R_ref: {r_ref_val:4.0f}) | "
+                f"Dist: {dist_val:+5.2f}m | Vel: {vel_val:+5.2f} m/s | "
                 f"WinRate: {summary['ema_win_rate']:4.1%} [{win_tag}] | "
                 f"Budget: {budget_val:5.0f} | "
                 f"Tweak: {tweak_val:4.1f} | "

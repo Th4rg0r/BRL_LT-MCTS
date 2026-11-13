@@ -47,17 +47,17 @@ class ProceduralAntXMLGenerator:
         # Define leg configurations:
         # (leg_idx, dx, dy, ankle_ax, ankle_ay, ankle_range, scale_factor, is_left)
         all_leg_specs = [
-            # Leg 1: Front-Left
+            # Leg 1: Front-Left (+x, +y)
             (1, 1.0, 1.0, -1.0, 1.0, "30 70", s_front * s_left, True),
-            # Leg 2: Front-Right
-            (2, -1.0, 1.0, 1.0, 1.0, "-70 -30", s_front * s_right, False),
-            # Leg 3: Back-Left
-            (3, -1.0, -1.0, -1.0, 1.0, "-70 -30", s_back * s_left, True),
-            # Leg 4: Back-Right
-            (4, 1.0, -1.0, 1.0, 1.0, "30 70", s_back * s_right, False),
-            # Leg 5: Middle-Left (Hexapod)
+            # Leg 2: Back-Left (-x, +y)
+            (2, -1.0, 1.0, 1.0, 1.0, "-70 -30", s_back * s_left, True),
+            # Leg 3: Back-Right (-x, -y)
+            (3, -1.0, -1.0, -1.0, 1.0, "-70 -30", s_back * s_right, False),
+            # Leg 4: Front-Right (+x, -y)
+            (4, 1.0, -1.0, 1.0, 1.0, "30 70", s_front * s_right, False),
+            # Leg 5: Middle-Left (Hexapod, +y)
             (5, 0.0, 1.25, -1.0, 0.0, "30 70", s_mid * s_left, True),
-            # Leg 6: Middle-Right (Hexapod)
+            # Leg 6: Middle-Right (Hexapod, -y)
             (6, 0.0, -1.25, 1.0, 0.0, "30 70", s_mid * s_right, False),
         ]
 

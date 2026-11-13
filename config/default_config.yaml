@@ -39,7 +39,7 @@ la_mcts:
   adaptive_exploration: true
   min_policy_std_target: 0.30
   exploration_boost_max: 2.25
-  lr: 0.00020
+  lr: 0.000025
   batch_size: 128
   buffer_capacity: 50000
   context_dim: 18
@@ -74,7 +74,7 @@ brl:
   beta_score: 1.0
   eta_viol: 2.0
   beta_ent: 0.01
-  warmup_episodes: 200
+  warmup_episodes: 50
   brl_episodes: 10000
   total_episodes: 10000
   warmup_limit: 30.0

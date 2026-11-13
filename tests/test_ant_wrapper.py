@@ -259,3 +259,35 @@ def test_logarithmic_smoothness_penalty_decay() -> None:
         w_steep.close()
 
 
+def test_front_back_left_right_leg_scaling() -> None:
+    """Verifies w[0] (s_front) scales +x legs (1, 4), w[1] (s_back) scales -x legs (2, 3), and w[2] scales +y/-y."""
+    wrapper = MorphologicalAntBRLWrapper(max_action_capacity=12, fixed_action_space=True)
+    try:
+        # 1. Front scaling w[0] = 800 -> Legs 1 (+x,+y) and 4 (+x,-y) elongate; Legs 2, 3 stay nominal
+        t_front = np.zeros(18, dtype=np.float32)
+        t_front[0] = 800.0
+        _, info_f = wrapper.reset(seed=42, options={"tweak_vector": t_front})
+        kin_f = info_f["true_limb_kinematics"]
+        # Anchor x/y norms: legs 1 & 4 should be > 0.5, legs 2 & 3 should be ~0.283 (sqrt(0.2^2 + 0.2^2))
+        norms_f = np.linalg.norm(kin_f[:, :2], axis=1)
+        assert norms_f[0] > 0.50 and norms_f[3] > 0.50
+        assert norms_f[1] < 0.35 and norms_f[2] < 0.35
+
+        # 2. Back scaling w[1] = 800 -> Legs 2 (-x,+y) and 3 (-x,-y) shrink; Legs 1, 4 stay nominal
+        t_back = np.zeros(18, dtype=np.float32)
+        t_back[1] = 800.0
+        _, info_b = wrapper.reset(seed=42, options={"tweak_vector": t_back})
+        norms_b = np.linalg.norm(info_b["true_limb_kinematics"][:, :2], axis=1)
+        assert norms_b[1] < 0.20 and norms_b[2] < 0.20
+        assert norms_b[0] > 0.25 and norms_b[3] > 0.25
+
+        # 3. Left/right scaling w[2] = 800 -> +y legs (1, 2) elongate; -y legs (3, 4) shrink
+        t_lr = np.zeros(18, dtype=np.float32)
+        t_lr[2] = 800.0
+        _, info_lr = wrapper.reset(seed=42, options={"tweak_vector": t_lr})
+        norms_lr = np.linalg.norm(info_lr["true_limb_kinematics"][:, :2], axis=1)
+        assert norms_lr[0] > norms_lr[3] and norms_lr[1] > norms_lr[2]
+    finally:
+        wrapper.close()
+
+
