@@ -163,6 +163,8 @@ class SampledContinuousMCTS:
         n_sim: Optional[int] = None,
         action_mask: Optional[torch.Tensor] = None,
         limb_kinematics: Optional[torch.Tensor] = None,
+        root_tau_beta: Optional[float] = None,
+        root_exploration_fraction: Optional[float] = None,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, MCTSNode]:
         """Executes N_sim MCTS simulations from z_root using virtual-loss leaf batching.
 
@@ -178,21 +180,27 @@ class SampledContinuousMCTS:
 
         num_simulations = n_sim if n_sim is not None else self.n_sim
         temp_act = (0.0 if deterministic else self.tau_act) if tau_act is None else tau_act
+        eff_root_tau_beta = self.root_tau_beta if root_tau_beta is None else float(root_tau_beta)
+        eff_root_exp = (
+            self.root_exploration_fraction
+            if root_exploration_fraction is None
+            else float(root_exploration_fraction)
+        )
 
         with torch.inference_mode():
             min_max_stats = MinMaxStats()
             root = self._expand_node(
                 z_root,
-                temperature=self.root_tau_beta,
+                temperature=eff_root_tau_beta,
                 value_prefix=0.0,
                 action_mask=action_mask,
                 limb_kinematics=limb_kinematics,
             )
-            if not deterministic and self.root_exploration_fraction > 0.0:
+            if not deterministic and eff_root_exp > 0.0:
                 noise = np.random.dirichlet([self.root_dirichlet_alpha] * self.k_act)
                 root.prior_weights = (
-                    (1.0 - self.root_exploration_fraction) * root.prior_weights
-                    + self.root_exploration_fraction * noise
+                    (1.0 - eff_root_exp) * root.prior_weights
+                    + eff_root_exp * noise
                 ).astype(np.float64)
             min_max_stats.update(root.v_value)
 

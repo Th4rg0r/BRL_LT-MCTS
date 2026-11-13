@@ -325,8 +325,8 @@ class MorphologicalLimbHead(nn.Module):
         n_j = num_joints if num_joints is not None else self.max_joints_per_limb
         mu_raw = mu_raw[..., :n_j]
         log_std_raw = log_std_raw[..., :n_j]
-        self.last_limb_weights = weight_raw.unsqueeze(-1)
-        self.last_peak_logits = weight_raw
+        self.last_limb_weights = weight_raw.unsqueeze(-1).detach()
+        self.last_peak_logits = weight_raw.detach()
         if z_t.dim() == 1:
             if return_weights:
                 return weight_raw.squeeze(0), mu_raw.squeeze(0), log_std_raw.squeeze(0)
@@ -402,8 +402,8 @@ class MorphologicalLimbHead(nn.Module):
             log_std_assembled = log_std_assembled.view(*orig_shape, self.num_peaks, log_std_assembled.shape[-1])
             peak_logits = peak_logits.view(*orig_shape, self.num_peaks)
             limb_weights = limb_weights.view(*orig_shape, self.num_peaks, n_limbs)
-        self.last_limb_weights = limb_weights
-        self.last_peak_logits = peak_logits
+        self.last_limb_weights = limb_weights.detach()
+        self.last_peak_logits = peak_logits.detach()
         if return_weights:
             return peak_logits, mu_assembled, log_std_assembled, limb_weights
         return mu_assembled, log_std_assembled
@@ -432,6 +432,7 @@ class MultiPeakGMMActorHead(nn.Module):
         self.num_peaks = num_peaks
         self.log_std_bounds = log_std_bounds
         self.use_morphological_limbs = use_morphological_limbs
+        self.joints_per_limb = joints_per_limb
 
         # Mixture mode selection logits net
         self.logits_net = nn.Linear(latent_dim, num_peaks)
@@ -453,7 +454,8 @@ class MultiPeakGMMActorHead(nn.Module):
             ], dtype=torch.float32)
         elif action_dim == 12:
             # Dog / Hexapod (4 legs * 3 joints, or 6 legs * 2 joints)
-            self.default_joint_counts = [3, 3, 3, 3]
+            j_lim = joints_per_limb if joints_per_limb is not None else 3
+            self.default_joint_counts = [j_lim] * 4
             max_j = 3
             def_kin = torch.tensor([
                 [ 0.188, -0.08, 0.0, 0.064, 0.286],
@@ -494,6 +496,9 @@ class MultiPeakGMMActorHead(nn.Module):
             hidden_dim=128,
             log_std_bounds=log_std_bounds,
         )
+        self.last_limb_weights: Optional[torch.Tensor] = None
+        nn.init.zeros_(self.limb_head.weight_head.weight)
+        nn.init.zeros_(self.limb_head.weight_head.bias)
 
     def get_distribution_params(
         self,
@@ -513,7 +518,12 @@ class MultiPeakGMMActorHead(nn.Module):
                 kin = torch.as_tensor(kin, dtype=torch.float32, device=z_t.device)
 
             n_limbs = kin.shape[-2]
-            counts = self.default_joint_counts if len(self.default_joint_counts) == n_limbs else None
+            if self.joints_per_limb is not None:
+                counts = [self.joints_per_limb] * n_limbs
+            elif len(self.default_joint_counts) == n_limbs:
+                counts = self.default_joint_counts
+            else:
+                counts = None
             peak_logits_limb, mu_raw, log_std_raw, limb_weights = (
                 self.limb_head.forward_all_limbs(
                     z_t,
@@ -524,7 +534,7 @@ class MultiPeakGMMActorHead(nn.Module):
                 )
             )
             logits = logits + peak_logits_limb
-            self.last_limb_weights = limb_weights
+            self.last_limb_weights = limb_weights.detach()
             mu = 5.0 * torch.tanh(mu_raw / 5.0)
             log_std = torch.clamp(
                 log_std_raw, min=self.log_std_bounds[0], max=self.log_std_bounds[1]
@@ -757,6 +767,64 @@ class MultiPeakGMMActorHead(nn.Module):
             lp = dist.log_prob(a_trans, action_mask=action_mask)  # (K_act, B)
             return lp.transpose(0, 1)  # (B, K_act)
         return dist.log_prob(actions, action_mask=action_mask)
+
+    def log_prob_pre_tanh(
+        self,
+        z_t: torch.Tensor,
+        actions: torch.Tensor,
+        action_mask: Optional[torch.Tensor] = None,
+        temperature: float = 1.0,
+        limb_kinematics: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Evaluates pre-tanh GMM log_prob(atanh(actions) | z_t), omitting the constant tanh Jacobian."""
+        logits, mu, std = self.get_distribution_params(
+            z_t, temperature=temperature, limb_kinematics=limb_kinematics
+        )
+        a_clamped = torch.clamp(actions, -1.0 + 1e-5, 1.0 - 1e-5)
+        u = torch.atanh(a_clamped)
+        if actions.dim() == z_t.dim():
+            u = u.unsqueeze(-2)
+            lp = self._fast_log_prob_u(u, logits, mu, std, action_mask=action_mask)
+            return lp.squeeze(-1)
+        return self._fast_log_prob_u(u, logits, mu, std, action_mask=action_mask)
+
+    def entropy_proxy(
+        self,
+        z_t: torch.Tensor,
+        limb_kinematics: Optional[torch.Tensor] = None,
+        action_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Differentiable entropy proxy combining peak mixture entropy and per-joint Gaussian entropy.
+
+        Returns:
+            total_entropy: (B,) peak_entropy + mean_per_joint_gaussian_entropy
+            peak_entropy: (B,) Categorical entropy over GMM peaks
+            mean_std: (B,) mixture-weighted mean action std across active joints
+        """
+        logits, _, std = self.get_distribution_params(
+            z_t, temperature=1.0, limb_kinematics=limb_kinematics
+        )
+        peak_probs = F.softmax(logits, dim=-1)
+        peak_log_probs = F.log_softmax(logits, dim=-1)
+        peak_entropy = -(peak_probs * peak_log_probs).sum(dim=-1)
+
+        comp_gauss_ent = 0.5 * math.log(2.0 * math.pi * math.e) + torch.log(std)
+        if action_mask is not None:
+            mask = (
+                action_mask.view(*([1] * (std.dim() - 1)), -1)
+                if action_mask.dim() == 1
+                else action_mask.unsqueeze(-2)
+            )
+            denom = mask.sum(dim=-1, keepdim=False).clamp_min(1.0)
+            if denom.dim() > peak_probs.dim() - 1:
+                denom = denom.squeeze(-1)
+            gauss_entropy = (peak_probs.unsqueeze(-1) * comp_gauss_ent * mask).sum(dim=(-2, -1)) / denom
+            mean_std = (peak_probs.unsqueeze(-1) * std * mask).sum(dim=(-2, -1)) / denom
+        else:
+            gauss_entropy = (peak_probs.unsqueeze(-1) * comp_gauss_ent).sum(dim=-2).mean(dim=-1)
+            mean_std = (peak_probs.unsqueeze(-1) * std).sum(dim=-2).mean(dim=-1)
+
+        return peak_entropy + gauss_entropy, peak_entropy, mean_std
 
 
 def symlog_transform(x: torch.Tensor, eps: float = 1e-3) -> torch.Tensor:

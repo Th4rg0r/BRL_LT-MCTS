@@ -277,6 +277,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             action_dim=self.cfg.max_action_dim,
             num_peaks=self.cfg.num_peaks,
             log_std_bounds=self.cfg.log_std_bounds,
+            joints_per_limb=(2 if self.cfg.obs_dim <= 35 else None),
         ).to(self.device)
 
         self.critic_head = SupportCriticHead(
@@ -349,6 +350,9 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             "td_error": 0.0,
             "loss_total": 0.0,
             "loss_rep": 0.0,
+            "policy_std": float(self.cfg.min_policy_std_target),
+            "policy_entropy": 0.0,
+            "exploration_scale": 1.0,
         }
 
     def set_episode_context(
@@ -433,7 +437,27 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
 
             z_root = self.backbone(obs_t, context=ctx_t, history=hist_t).squeeze(0)
             n_sim = self.cfg.n_sim_eval if deterministic else self.cfg.n_sim
-            tau_act = self.cfg.tau_act_eval if deterministic else self.cfg.tau_act_train
+            if deterministic:
+                tau_act = self.cfg.tau_act_eval
+                root_tau_beta = None
+                root_exp_frac = None
+            else:
+                explore_scale = 1.0
+                if self.cfg.adaptive_exploration:
+                    cur_std = float(
+                        self._diagnostics.get("policy_std", self.cfg.min_policy_std_target)
+                    )
+                    explore_scale = float(
+                        np.clip(
+                            self.cfg.min_policy_std_target / max(cur_std, 1e-3),
+                            1.0,
+                            self.cfg.exploration_boost_max,
+                        )
+                    )
+                self._diagnostics["exploration_scale"] = explore_scale
+                tau_act = self.cfg.tau_act_train * explore_scale
+                root_tau_beta = self.cfg.root_tau_beta * explore_scale
+                root_exp_frac = min(0.65, self.cfg.root_exploration_fraction * explore_scale)
 
             chosen_action, policy_weights, root_samples, root_value, _ = (
                 self.mcts.search(
@@ -443,6 +467,8 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                     n_sim=n_sim,
                     action_mask=mask_t,
                     limb_kinematics=kin_t,
+                    root_tau_beta=root_tau_beta,
+                    root_exploration_fraction=root_exp_frac,
                 )
             )
 
@@ -646,6 +672,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             lambda_p=self.cfg.lambda_p,
             lambda_r=self.cfg.lambda_r,
             lambda_rep=self.cfg.lambda_rep,
+            lambda_ent=self.cfg.lambda_ent,
             c_reg=self.cfg.c_reg,
         )
         total_loss.backward()

@@ -37,6 +37,7 @@ class LAMCTSConfig:
     lambda_v: float = 0.5
     lambda_r: float = 1.0
     lambda_p: float = 1.0
+    lambda_ent: float = 0.05
     c_reg: float = 1e-4
     n_sim: int = 32
     n_sim_eval: int = 64
@@ -49,6 +50,9 @@ class LAMCTSConfig:
     root_exploration_fraction: float = 0.25
     tau_act_train: float = 1.0
     tau_act_eval: float = 0.05
+    adaptive_exploration: bool = True
+    min_policy_std_target: float = 0.55
+    exploration_boost_max: float = 2.0
     lr: float = 3e-4
     batch_size: int = 128
     buffer_capacity: int = 50000

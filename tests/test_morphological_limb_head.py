@@ -317,3 +317,34 @@ def test_compositional_peak_pos_encoding_and_weights():
     assert selected_peak.shape == (3,)
     assert peak_probs.shape == (3, 5)
     assert torch.allclose(peak_probs.sum(dim=-1), torch.ones(3), atol=1e-5)
+
+
+def test_entropy_regularization_and_adaptive_exploration():
+    """Verifies differentiable policy entropy proxy and adaptive MCTS exploration scaling."""
+    actor = MultiPeakGMMActorHead(latent_dim=256, action_dim=8, num_peaks=4)
+    z_t = torch.randn(2, 256, requires_grad=True)
+    mask = torch.tensor([1, 1, 1, 1, 1, 1, 0, 0], dtype=torch.float32)
+    tot_ent, peak_ent, mean_std = actor.entropy_proxy(z_t, action_mask=mask)
+    assert tot_ent.shape == (2,)
+    assert peak_ent.shape == (2,)
+    assert mean_std.shape == (2,)
+    tot_ent.mean().backward()
+    assert z_t.grad is not None and torch.norm(z_t.grad) > 0
+
+    cfg = LAMCTSConfig(
+        obs_dim=27,
+        max_action_dim=8,
+        n_sim=4,
+        k_act=4,
+        unroll_steps=2,
+        batch_size=2,
+        adaptive_exploration=True,
+        min_policy_std_target=0.55,
+        exploration_boost_max=2.0,
+    )
+    agent = LatentActionMCTSAgent(config=cfg, device="cpu")
+    agent._diagnostics["policy_std"] = 0.275  # half of target -> boost should be 2.0
+    obs = np.zeros(27, dtype=np.float32)
+    _ = agent.select_action(obs, deterministic=False)
+    assert abs(agent.get_diagnostics()["exploration_scale"] - 2.0) < 1e-5
+

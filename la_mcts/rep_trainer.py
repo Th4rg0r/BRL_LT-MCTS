@@ -178,6 +178,7 @@ class ModelRepresentationTrainer(nn.Module):
         lambda_p: float = 1.0,
         lambda_r: float = 1.0,
         lambda_rep: float = 4.0,
+        lambda_ent: float = 0.05,
         c_reg: float = 1e-4,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """Computes K-step unrolled total loss with SimSiam representation consistency.
@@ -216,17 +217,25 @@ class ModelRepresentationTrainer(nn.Module):
 
         z_hat = z_true_all[:, 0, :]
 
-        # Step k = 0 value and policy loss
+        # Step k = 0 value and policy loss (per-active-dimension pre-tanh log-prob avoids negative Jacobian offset)
         kin_0 = (
             limb_kinematics[:, 0]
             if (limb_kinematics is not None and limb_kinematics.dim() == 4)
             else limb_kinematics
         )
+        if action_mask is not None:
+            active_dims = (
+                action_mask.sum().clamp_min(1.0)
+                if action_mask.dim() == 1
+                else action_mask.sum(dim=-1).clamp_min(1.0)
+            )
+        else:
+            active_dims = float(actor_head.action_dim)
         loss_v = critic_head.compute_loss(z_hat, target_value_seq[:, 0])
-        log_probs_0 = actor_head.log_prob(
+        log_probs_0 = actor_head.log_prob_pre_tanh(
             z_hat, mcts_policy_samples[:, 0], action_mask=action_mask, limb_kinematics=kin_0
         )  # (B, K_act)
-        loss_p = -torch.sum(mcts_policy_weights[:, 0] * log_probs_0, dim=-1).mean()
+        loss_p = (-torch.sum(mcts_policy_weights[:, 0] * log_probs_0, dim=-1) / active_dims).mean()
 
         loss_r = torch.tensor(0.0, device=obs_seq.device, dtype=obs_seq.dtype)
         loss_rep = torch.tensor(0.0, device=obs_seq.device, dtype=obs_seq.dtype)
@@ -246,12 +255,12 @@ class ModelRepresentationTrainer(nn.Module):
                 if (limb_kinematics is not None and limb_kinematics.dim() == 4)
                 else limb_kinematics
             )
-            log_probs_k = actor_head.log_prob(
+            log_probs_k = actor_head.log_prob_pre_tanh(
                 z_hat, mcts_policy_samples[:, k], action_mask=action_mask, limb_kinematics=kin_k
             )
             loss_p = (
                 loss_p
-                - torch.sum(mcts_policy_weights[:, k] * log_probs_k, dim=-1).mean()
+                + (-torch.sum(mcts_policy_weights[:, k] * log_probs_k, dim=-1) / active_dims).mean()
             )
 
         # Normalize over unroll horizon
@@ -269,11 +278,18 @@ class ModelRepresentationTrainer(nn.Module):
             for p in backbone.parameters():
                 reg_loss = reg_loss + p.pow(2).sum()
 
+        # Entropy regularization on root policy to prevent early std / peak collapse
+        policy_entropy, peak_entropy, mean_policy_std = actor_head.entropy_proxy(
+            z_true_all[:, 0, :], limb_kinematics=kin_0, action_mask=action_mask
+        )
+        loss_ent = policy_entropy.mean()
+
         total_loss = (
             lambda_v * loss_v
             + lambda_p * loss_p
             + lambda_r * loss_r
             + lambda_rep * loss_rep
+            - lambda_ent * loss_ent
             + c_reg * reg_loss
         )
 
@@ -283,5 +299,8 @@ class ModelRepresentationTrainer(nn.Module):
             "loss_p": float(loss_p.detach().item()),
             "loss_r": float(loss_r.detach().item()),
             "loss_rep": float(loss_rep.detach().item()),
+            "policy_entropy": float(loss_ent.detach().item()),
+            "peak_entropy": float(peak_entropy.mean().detach().item()),
+            "policy_std": float(mean_policy_std.mean().detach().item()),
         }
         return total_loss, metrics
