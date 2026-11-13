@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from la_mcts.backbone import min_max_normalize, SelfAttentionBackbone
+from la_mcts.backbone import min_max_normalize, SelfAttentionBackbone, combine_cumulative_rep
 from la_mcts.gmm_heads import MultiPeakGMMActorHead, SupportCriticHead
 
 
@@ -84,6 +84,7 @@ class ModelRepresentationTrainer(nn.Module):
         proj_dim: int = 512,
         pred_dim: int = 256,
         beta_mse: float = 1.0,
+        latent_ema_decay: float = 0.4,
     ) -> None:
         super().__init__()
         self.latent_dim = latent_dim
@@ -91,6 +92,7 @@ class ModelRepresentationTrainer(nn.Module):
         self.num_blocks = num_blocks
         self.proj_dim = proj_dim
         self.pred_dim = pred_dim
+        self.latent_ema_decay = float(latent_ema_decay)
 
         # Action encoder producing FiLM modulation parameters (gamma_a, beta_a)
         self.action_emb = nn.Sequential(
@@ -215,7 +217,13 @@ class ModelRepresentationTrainer(nn.Module):
                 )
         z_true_all = backbone(flat_obs, context=flat_ctx, history=flat_hist).view(bsz, k_plus_1, -1)
 
+        hist_0 = history[:, 0, :] if (history is not None and history.dim() == 3) else history
+        prev_cum_0 = backbone.compute_prev_cumulative(
+            context, hist_0, alpha=self.latent_ema_decay
+        )
         z_hat = z_true_all[:, 0, :]
+        cum_hat = combine_cumulative_rep(z_hat, prev_cum_0, alpha=self.latent_ema_decay)
+        cum_0 = cum_hat
 
         # Step k = 0 value and policy loss (per-active-dimension pre-tanh log-prob avoids negative Jacobian offset)
         kin_0 = (
@@ -231,9 +239,9 @@ class ModelRepresentationTrainer(nn.Module):
             )
         else:
             active_dims = float(actor_head.action_dim)
-        loss_v = critic_head.compute_loss(z_hat, target_value_seq[:, 0])
+        loss_v = critic_head.compute_loss(cum_hat, target_value_seq[:, 0])
         log_probs_0 = actor_head.log_prob_pre_tanh(
-            z_hat, mcts_policy_samples[:, 0], action_mask=action_mask, limb_kinematics=kin_0
+            cum_hat, mcts_policy_samples[:, 0], action_mask=action_mask, limb_kinematics=kin_0
         )  # (B, K_act)
         loss_p = (-torch.sum(mcts_policy_weights[:, 0] * log_probs_0, dim=-1) / active_dims).mean()
 
@@ -244,11 +252,12 @@ class ModelRepresentationTrainer(nn.Module):
             z_hat, r_hat = self.forward(z_hat, action_seq[:, k - 1])
             # MuZero / EfficientZero 0.5 gradient scaling across unroll steps
             z_hat = 0.5 * z_hat + 0.5 * z_hat.detach()
+            cum_hat = combine_cumulative_rep(z_hat, cum_hat, alpha=self.latent_ema_decay)
 
             z_target_k = z_true_all[:, k, :]
             loss_rep = loss_rep + self.consistency_head(z_hat, z_target_k)
             loss_r = loss_r + F.mse_loss(r_hat.squeeze(-1), reward_seq[:, k - 1])
-            loss_v = loss_v + critic_head.compute_loss(z_hat, target_value_seq[:, k])
+            loss_v = loss_v + critic_head.compute_loss(cum_hat, target_value_seq[:, k])
 
             kin_k = (
                 limb_kinematics[:, k]
@@ -256,7 +265,7 @@ class ModelRepresentationTrainer(nn.Module):
                 else limb_kinematics
             )
             log_probs_k = actor_head.log_prob_pre_tanh(
-                z_hat, mcts_policy_samples[:, k], action_mask=action_mask, limb_kinematics=kin_k
+                cum_hat, mcts_policy_samples[:, k], action_mask=action_mask, limb_kinematics=kin_k
             )
             loss_p = (
                 loss_p
@@ -280,7 +289,7 @@ class ModelRepresentationTrainer(nn.Module):
 
         # Entropy regularization on root policy to prevent early std / peak collapse
         policy_entropy, peak_entropy, mean_policy_std = actor_head.entropy_proxy(
-            z_true_all[:, 0, :], limb_kinematics=kin_0, action_mask=action_mask
+            cum_0, limb_kinematics=kin_0, action_mask=action_mask
         )
         loss_ent = policy_entropy.mean()
 

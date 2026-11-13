@@ -58,6 +58,7 @@ class LAMCTSConfig:
     buffer_capacity: int = 50000
     context_dim: int = 18
     history_len: int = 6
+    latent_ema_decay: float = 0.4
     reanalyze_ratio: float = 0.25
     # Agent gradient update every N env steps (0 = auto: max_steps // 2, the original behaviour)
     train_every_steps: int = 50

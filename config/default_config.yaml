@@ -44,6 +44,7 @@ la_mcts:
   buffer_capacity: 50000
   context_dim: 18
   history_len: 6
+  latent_ema_decay: 0.4
   reanalyze_ratio: 0.25
   train_every_steps: 25     # agent update every N env steps (0 = auto: max_steps // 2)
   reanalyze_every: 4        # Reanalyze every N episodes (0 = off)

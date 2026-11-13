@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
+from la_mcts.backbone import combine_cumulative_rep
 from la_mcts.gmm_heads import MultiPeakGMMActorHead, SupportCriticHead
 from la_mcts.rep_trainer import ModelRepresentationTrainer
 
@@ -16,6 +17,7 @@ class MCTSNode:
 
     __slots__ = (
         "z_state",
+        "z_cum_state",
         "value_prefix",
         "sampled_actions",
         "prior_weights",
@@ -35,8 +37,10 @@ class MCTSNode:
         sampled_actions: Optional[torch.Tensor] = None,
         prior_weights: Optional[np.ndarray] = None,
         v_value: float = 0.0,
+        z_cum_state: Optional[torch.Tensor] = None,
     ) -> None:
         self.z_state: torch.Tensor = z_state
+        self.z_cum_state: torch.Tensor = z_cum_state if z_cum_state is not None else z_state
         self.value_prefix: float = float(value_prefix)
         self.v_value: float = float(v_value)
 
@@ -98,6 +102,7 @@ class SampledContinuousMCTS:
         batch_leaf_eval: int = 16,
         root_dirichlet_alpha: float = 0.3,
         root_exploration_fraction: float = 0.25,
+        latent_ema_decay: float = 0.4,
     ) -> None:
         self.actor_head = actor_head
         self.critic_head = critic_head
@@ -113,6 +118,7 @@ class SampledContinuousMCTS:
         self.batch_leaf_eval = max(1, batch_leaf_eval)
         self.root_dirichlet_alpha = float(root_dirichlet_alpha)
         self.root_exploration_fraction = float(root_exploration_fraction)
+        self.latent_ema_decay = float(latent_ema_decay)
 
     def _select_action_idx(self, node: MCTSNode, min_max_stats: MinMaxStats) -> int:
         """Selects action index j* in {0, ..., K_act-1} maximizing Sampled PUCT."""
@@ -137,22 +143,25 @@ class SampledContinuousMCTS:
         value_prefix: float = 0.0,
         action_mask: Optional[torch.Tensor] = None,
         limb_kinematics: Optional[torch.Tensor] = None,
+        z_cum_state: Optional[torch.Tensor] = None,
     ) -> MCTSNode:
-        """Evaluates actor and critic heads on a single latent state to initialize an MCTSNode."""
+        """Evaluates actor and critic heads on cumulative latent state to initialize an MCTSNode."""
+        cum_state = z_cum_state if z_cum_state is not None else z_state
         sampled_actions, prior_weights_t = self.actor_head.sample_actions(
-            z_state,
+            cum_state,
             k_act=self.k_act,
             temperature=temperature,
             action_mask=action_mask,
             limb_kinematics=limb_kinematics,
         )
-        v_val = float(self.critic_head(z_state.unsqueeze(0)).squeeze().item())
+        v_val = float(self.critic_head(cum_state.unsqueeze(0)).squeeze().item())
         return MCTSNode(
             z_state=z_state,
             value_prefix=value_prefix,
             sampled_actions=sampled_actions,
             prior_weights=prior_weights_t.detach().cpu().numpy(),
             v_value=v_val,
+            z_cum_state=cum_state,
         )
 
     def search(
@@ -165,8 +174,12 @@ class SampledContinuousMCTS:
         limb_kinematics: Optional[torch.Tensor] = None,
         root_tau_beta: Optional[float] = None,
         root_exploration_fraction: Optional[float] = None,
+        prev_cum_state: Optional[torch.Tensor] = None,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, MCTSNode]:
         """Executes N_sim MCTS simulations from z_root using virtual-loss leaf batching.
+
+        Dynamics transitions map cur_rep -> next_rep (z_state) without cumulative smearing;
+        cumulative representations (z_cum_state) are computed on demand for actor/critic readout.
 
         Returns:
             chosen_action: Selected continuous action vector in [-1, 1]^N.
@@ -177,6 +190,8 @@ class SampledContinuousMCTS:
         """
         if z_root.dim() == 2:
             z_root = z_root.squeeze(0)
+        if prev_cum_state is not None and prev_cum_state.dim() == 2:
+            prev_cum_state = prev_cum_state.squeeze(0)
 
         num_simulations = n_sim if n_sim is not None else self.n_sim
         temp_act = (0.0 if deterministic else self.tau_act) if tau_act is None else tau_act
@@ -189,12 +204,16 @@ class SampledContinuousMCTS:
 
         with torch.inference_mode():
             min_max_stats = MinMaxStats()
+            z_cum_root = combine_cumulative_rep(
+                z_root, prev_cum_state, alpha=self.latent_ema_decay
+            )
             root = self._expand_node(
                 z_root,
                 temperature=eff_root_tau_beta,
                 value_prefix=0.0,
                 action_mask=action_mask,
                 limb_kinematics=limb_kinematics,
+                z_cum_state=z_cum_root,
             )
             if not deterministic and eff_root_exp > 0.0:
                 noise = np.random.dirichlet([self.root_dirichlet_alpha] * self.k_act)
@@ -211,6 +230,7 @@ class SampledContinuousMCTS:
                 batch_limit = min(self.batch_leaf_eval, num_simulations - sims_done)
                 pending_paths: List[List[Tuple[MCTSNode, int]]] = []
                 parent_states: List[torch.Tensor] = []
+                parent_cum_states: List[torch.Tensor] = []
                 chosen_actions: List[torch.Tensor] = []
                 seen_leaves: set[Tuple[int, int]] = set()
 
@@ -246,18 +266,26 @@ class SampledContinuousMCTS:
                     parent_node, edge_idx = search_path[-1]
                     pending_paths.append(search_path)
                     parent_states.append(parent_node.z_state)
+                    parent_cum_states.append(parent_node.z_cum_state)
                     chosen_actions.append(parent_node.sampled_actions[edge_idx])
 
                 if not pending_paths:
                     break
 
-                # Vectorized evaluation of rep_trainer, actor_head, and critic_head
+                # Vectorized transition cur_rep -> next_rep, plus on-demand next_cum_rep for Actor/Critic
                 z_batch = torch.stack(parent_states, dim=0)
+                z_cum_parent_batch = torch.stack(parent_cum_states, dim=0)
                 a_batch = torch.stack(chosen_actions, dim=0)
                 z_next_batch, r_hat_batch = self.rep_trainer(z_batch, a_batch)
-                v_next_batch = self.critic_head(z_next_batch).squeeze(-1)
-                sampled_acts_batch, prior_weights_batch = self.actor_head.sample_actions(
+                z_cum_next_batch = combine_cumulative_rep(
                     z_next_batch,
+                    z_cum_parent_batch,
+                    alpha=self.latent_ema_decay,
+                    assume_nonzero=True,
+                )
+                v_next_batch = self.critic_head(z_cum_next_batch).squeeze(-1)
+                sampled_acts_batch, prior_weights_batch = self.actor_head.sample_actions(
+                    z_cum_next_batch,
                     k_act=self.k_act,
                     temperature=self.inner_tau_beta,
                     action_mask=action_mask,
@@ -285,6 +313,7 @@ class SampledContinuousMCTS:
                         sampled_actions=sampled_acts_batch[b_idx],
                         prior_weights=priors_np[b_idx],
                         v_value=v_val,
+                        z_cum_state=z_cum_next_batch[b_idx],
                     )
                     parent_node.children[edge_idx] = child_node
 

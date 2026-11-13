@@ -6,10 +6,12 @@ import time
 import numpy as np
 import torch
 
-from la_mcts.backbone import SelfAttentionBackbone
+from la_mcts.backbone import SelfAttentionBackbone, combine_cumulative_rep
 from la_mcts.gmm_heads import MultiPeakGMMActorHead, SupportCriticHead
 from la_mcts.rep_trainer import ModelRepresentationTrainer
 from la_mcts.sampled_mcts import SampledContinuousMCTS
+from config import LAMCTSConfig
+from la_mcts.agent import LatentActionMCTSAgent
 
 
 def test_gate1_backbone_normalization_bounds() -> None:
@@ -208,4 +210,156 @@ def test_gate1_mcts_root_dirichlet_noise() -> None:
     for b in range(3):
         assert abs(float(np.sum(pi_weights[b])) - 1.0) <= 1e-5
         assert np.all(pi_weights[b] >= 0.0)
+
+
+def test_combine_cumulative_rep_bounds_and_fixed_point() -> None:
+    """Verifies combine_cumulative_rep normalization, fixed-point identity, and zero-history mask."""
+    torch.manual_seed(0)
+    cur = torch.rand(4, 32)
+    assert torch.equal(combine_cumulative_rep(cur, None, alpha=0.4), cur)
+    assert torch.equal(combine_cumulative_rep(cur, cur, alpha=0.0), cur)
+
+    # Fixed point: min_max_normalize(cur + 0.4 * cur) == min_max_normalize(cur)
+    # when cur is already min-max normalized in [0, 1]
+    c_min = cur.min(dim=-1, keepdim=True).values
+    c_max = cur.max(dim=-1, keepdim=True).values
+    cur_norm = (cur - c_min) / (c_max - c_min)
+    fp = combine_cumulative_rep(cur_norm, cur_norm, alpha=0.4)
+    torch.testing.assert_close(fp, cur_norm, atol=1e-5, rtol=1e-5)
+
+    # Zero prev row is skipped per batch item, non-zero row is combined & bounded in [0, 1]
+    prev = torch.rand(4, 32)
+    prev[1].zero_()
+    out = combine_cumulative_rep(cur, prev, alpha=0.4)
+    assert float(out.min().item()) >= 0.0
+    assert float(out.max().item()) <= 1.0
+    torch.testing.assert_close(out[1], cur[1])
+
+
+def test_compute_prev_cumulative_matches_sequential_ema() -> None:
+    """Verifies compute_prev_cumulative skips zero history and matches sequential accumulation."""
+    torch.manual_seed(7)
+    backbone = SelfAttentionBackbone(
+        obs_dim=10, max_action_dim=4, context_dim=6, k_tok=4, d_model=32, n_heads=2, l_enc=1, latent_dim=32, history_len=3
+    )
+    backbone.eval()
+
+    zero_hist = torch.zeros(2, 3 * (10 + 4))
+    ctx = torch.randn(2, 6)
+    assert backbone.compute_prev_cumulative(ctx, zero_hist, alpha=0.4) is None
+    assert backbone.compute_prev_cumulative(ctx, None, alpha=0.4) is None
+
+    # Populate batch 0 with 2 valid older steps (step index 1 and 2) and batch 1 empty
+    hist = torch.zeros(2, 3, 14)
+    hist[0, 1, :10] = torch.randn(10)
+    hist[0, 1, 10:] = torch.randn(4)
+    hist[0, 2, :10] = torch.randn(10)
+    hist[0, 2, 10:] = torch.randn(4)
+    flat_hist = hist.reshape(2, -1)
+
+    prev_cum = backbone.compute_prev_cumulative(ctx, flat_hist, alpha=0.4)
+    assert prev_cum is not None
+    assert prev_cum.shape == (2, 32)
+    torch.testing.assert_close(prev_cum[1], torch.zeros(32))
+
+    with torch.no_grad():
+        sub_hist_1 = torch.zeros_like(hist[0:1])
+        sub_hist_2 = torch.zeros_like(hist[0:1])
+        sub_hist_2[0, 2] = hist[0, 1]
+        z1 = backbone(hist[0:1, 1, :10], context=ctx[0:1], history=sub_hist_1.reshape(1, -1))
+        z2 = backbone(hist[0:1, 2, :10], context=ctx[0:1], history=sub_hist_2.reshape(1, -1))
+        expected_0 = combine_cumulative_rep(z2, z1, alpha=0.4).squeeze(0)
+    torch.testing.assert_close(prev_cum[0], expected_0, atol=1e-5, rtol=1e-5)
+    assert backbone.compute_prev_cumulative(ctx, flat_hist, alpha=0.0) is None
+
+
+def test_mcts_search_uses_on_demand_cumulative_rep_and_keeps_cur_rep_dynamics() -> None:
+    """Verifies MCTS keeps rep_trainer on cur_rep -> next_rep while feeding cum_rep to heads."""
+    torch.manual_seed(11)
+    actor_head = MultiPeakGMMActorHead(latent_dim=32, action_dim=4, num_peaks=3)
+    critic_head = SupportCriticHead(latent_dim=32, use_categorical=True, support_min=-50, support_max=50, num_bins=101)
+    rep_trainer = ModelRepresentationTrainer(
+        latent_dim=32, action_dim=4, num_blocks=1, proj_dim=32, pred_dim=32, latent_ema_decay=0.4
+    )
+    mcts = SampledContinuousMCTS(
+        actor_head=actor_head,
+        critic_head=critic_head,
+        rep_trainer=rep_trainer,
+        n_sim=10,
+        k_act=4,
+        latent_ema_decay=0.4,
+    )
+
+    z_root = torch.rand(32)
+    prev_cum = torch.rand(32)
+    _, _, _, _, root = mcts.search(z_root, deterministic=True, prev_cum_state=prev_cum)
+
+    assert root.z_state is not None
+    assert root.z_cum_state is not None
+    torch.testing.assert_close(root.z_state, z_root)
+    expected_root_cum = combine_cumulative_rep(z_root, prev_cum, alpha=0.4)
+    torch.testing.assert_close(root.z_cum_state, expected_root_cum)
+    assert not torch.allclose(root.z_cum_state, root.z_state)
+
+    expanded_children = list(root.children.values())
+    assert len(expanded_children) > 0
+    child = expanded_children[0]
+    assert child.z_state is not None and child.z_cum_state is not None
+    # Verify child.z_state was predicted from root.z_state (cur_rep), NOT root.z_cum_state
+    child_edge_idx = next(idx for idx, c in root.children.items() if c is child)
+    with torch.no_grad():
+        expected_child_z, _ = rep_trainer.forward(
+            root.z_state, root.sampled_actions[child_edge_idx]
+        )
+    torch.testing.assert_close(child.z_state, expected_child_z, atol=1e-5, rtol=1e-5)
+    expected_child_cum = combine_cumulative_rep(child.z_state, root.z_cum_state, alpha=0.4)
+    torch.testing.assert_close(child.z_cum_state, expected_child_cum, atol=1e-5, rtol=1e-5)
+
+
+def test_agent_train_step_with_latent_ema_decay() -> None:
+    """Verifies LatentActionMCTSAgent unroll training and reanalyze with latent_ema_decay=0.4."""
+    torch.manual_seed(19)
+    cfg = LAMCTSConfig(
+        obs_dim=12,
+        max_action_dim=4,
+        context_dim=6,
+        history_len=3,
+        k_tok=4,
+        d_model=32,
+        n_heads=2,
+        l_enc=1,
+        latent_dim=32,
+        l_dyn=1,
+        proj_dim=32,
+        pred_dim=32,
+        n_sim=8,
+        n_sim_eval=6,
+        k_act=4,
+        unroll_steps=2,
+        batch_size=2,
+        support_min=-20,
+        support_max=20,
+        num_bins=41,
+        latent_ema_decay=0.4,
+    )
+    agent = LatentActionMCTSAgent(cfg, device=torch.device("cpu"))
+    agent.set_episode_context(tweak_vector=np.zeros(6, dtype=np.float32), action_mask=np.ones(4, dtype=np.float32))
+
+    # Collect a short episode via select_action + observe_transition
+    obs = np.random.randn(12).astype(np.float32)
+    for step in range(8):
+        act = agent.select_action(obs, deterministic=False)
+        next_obs = np.random.randn(12).astype(np.float32)
+        agent.observe_transition(
+            obs, act, float(0.5), next_obs, terminated=(step == 7), truncated=False, info={}
+        )
+        obs = next_obs
+
+    metrics = agent.train_step()
+    assert "loss_total" in metrics
+    assert np.isfinite(metrics["loss_total"])
+    assert agent.rep_trainer.latent_ema_decay == 0.4
+    assert agent.mcts.latent_ema_decay == 0.4
+    agent.reanalyze_batch(num_states=2)
+
 

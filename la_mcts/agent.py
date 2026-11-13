@@ -11,7 +11,7 @@ import torch.optim as optim
 
 from brl_core.interfaces import AbstractBRLSolverAgent
 from config import LAMCTSConfig
-from la_mcts.backbone import SelfAttentionBackbone
+from la_mcts.backbone import SelfAttentionBackbone, combine_cumulative_rep
 from la_mcts.gmm_heads import MultiPeakGMMActorHead, SupportCriticHead
 from la_mcts.rep_trainer import ModelRepresentationTrainer
 from la_mcts.sampled_mcts import SampledContinuousMCTS
@@ -288,6 +288,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             num_bins=self.cfg.num_bins,
         ).to(self.device)
 
+        latent_ema_decay = float(getattr(self.cfg, "latent_ema_decay", 0.4))
         self.rep_trainer = ModelRepresentationTrainer(
             latent_dim=self.cfg.latent_dim,
             action_dim=self.cfg.max_action_dim,
@@ -295,6 +296,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             proj_dim=self.cfg.proj_dim,
             pred_dim=self.cfg.pred_dim,
             beta_mse=self.cfg.beta_mse,
+            latent_ema_decay=latent_ema_decay,
         ).to(self.device)
 
         self.mcts = SampledContinuousMCTS(
@@ -311,6 +313,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             tau_act=self.cfg.tau_act_train,
             root_dirichlet_alpha=getattr(self.cfg, "root_dirichlet_alpha", 0.3),
             root_exploration_fraction=getattr(self.cfg, "root_exploration_fraction", 0.25),
+            latent_ema_decay=latent_ema_decay,
         )
 
         params = (
@@ -436,6 +439,11 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             )
 
             z_root = self.backbone(obs_t, context=ctx_t, history=hist_t).squeeze(0)
+            ema_decay = float(getattr(self.cfg, "latent_ema_decay", 0.4))
+            prev_cum_t = self.backbone.compute_prev_cumulative(
+                ctx_t, hist_t, alpha=ema_decay
+            )
+            prev_cum_root = prev_cum_t.squeeze(0) if prev_cum_t is not None else None
             n_sim = self.cfg.n_sim_eval if deterministic else self.cfg.n_sim
             if deterministic:
                 tau_act = self.cfg.tau_act_eval
@@ -469,6 +477,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                     limb_kinematics=kin_t,
                     root_tau_beta=root_tau_beta,
                     root_exploration_fraction=root_exp_frac,
+                    prev_cum_state=prev_cum_root,
                 )
             )
 
@@ -499,6 +508,12 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             ).unsqueeze(0)
             hist_t = self._get_current_history_tensor()
             z_t = self.backbone(obs_t, context=ctx_t, history=hist_t).squeeze(0)
+            ema_decay = float(getattr(self.cfg, "latent_ema_decay", 0.4))
+            prev_cum_t = self.backbone.compute_prev_cumulative(
+                ctx_t, hist_t, alpha=ema_decay
+            )
+            prev_cum = prev_cum_t.squeeze(0) if prev_cum_t is not None else None
+            cum_z_t = combine_cumulative_rep(z_t, prev_cum, alpha=ema_decay)
             kin_t = (
                 torch.as_tensor(
                     self.current_limb_kinematics, dtype=torch.float32, device=self.device
@@ -507,7 +522,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                 else None
             )
             limb_act_t = self.actor_head.get_limb_action(
-                z_t,
+                cum_z_t,
                 anchor=anchor,
                 yaw=yaw,
                 pitch=pitch,
@@ -621,6 +636,11 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                     else None
                 )
                 z_root = self.backbone(obs_t, context=ctx_t, history=hist_t).squeeze(0)
+                ema_decay = float(getattr(self.cfg, "latent_ema_decay", 0.4))
+                prev_cum_t = self.backbone.compute_prev_cumulative(
+                    ctx_t, hist_t, alpha=ema_decay
+                )
+                prev_cum_root = prev_cum_t.squeeze(0) if prev_cum_t is not None else None
                 _, policy_weights, root_samples, root_value, _ = self.mcts.search(
                     z_root,
                     deterministic=False,
@@ -628,6 +648,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                     n_sim=max(16, self.cfg.n_sim // 2),
                     action_mask=mask_t,
                     limb_kinematics=kin_t,
+                    prev_cum_state=prev_cum_root,
                 )
                 traj.mcts_policy_samples[step] = root_samples
                 traj.mcts_policy_weights[step] = policy_weights

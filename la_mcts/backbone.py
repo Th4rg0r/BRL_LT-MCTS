@@ -16,6 +16,22 @@ def min_max_normalize(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return torch.clamp(normed, 0.0, 1.0)
 
 
+def combine_cumulative_rep(
+    cur_rep: torch.Tensor,
+    prev_cum_rep: Optional[torch.Tensor],
+    alpha: float = 0.4,
+    assume_nonzero: bool = False,
+) -> torch.Tensor:
+    """Combines cur_rep and prev_cum_rep on demand: min_max_normalize(cur_rep + alpha * prev_cum_rep)."""
+    if prev_cum_rep is None or alpha <= 0.0:
+        return cur_rep
+    combined = min_max_normalize(cur_rep + float(alpha) * prev_cum_rep, eps=1e-6)
+    if assume_nonzero:
+        return combined
+    has_prev = prev_cum_rep.abs().sum(dim=-1, keepdim=True) > 0
+    return torch.where(has_prev, combined, cur_rep)
+
+
 class SubStateTokenizer(nn.Module):
     """Tokenizes continuous observations into K_tok feature tokens with optional context."""
 
@@ -216,3 +232,60 @@ class SelfAttentionBackbone(nn.Module):
         if squeeze_out:
             return z_t.squeeze(0)
         return z_t
+
+    @torch.no_grad()
+    def compute_prev_cumulative(
+        self,
+        context: Optional[torch.Tensor],
+        history: Optional[torch.Tensor],
+        alpha: float = 0.4,
+    ) -> Optional[torch.Tensor]:
+        """Computes prev_cum_rep from past observations in history without mutating episode state."""
+        if history is None or alpha <= 0.0:
+            return None
+
+        hist_in = history.unsqueeze(0) if history.dim() == 1 else history
+        if hist_in.dim() == 3:
+            hist_in = hist_in.reshape(hist_in.shape[0], -1)
+        bsz = hist_in.shape[0]
+        hist_aligned = self.tokenizer._align_history_dim(hist_in)
+        hist_len = self.tokenizer.history_len
+        trans_dim = hist_aligned.shape[-1] // hist_len
+        hist_3d = hist_aligned.view(bsz, hist_len, trans_dim)
+
+        valid = hist_3d.abs().sum(dim=-1) > 0  # (B, H)
+        if not bool(valid.any().item()):
+            return None
+
+        hist_obs = hist_3d[..., : self.obs_dim]  # (B, H, obs_dim)
+        # Build shifted sub-histories for each historical slot h in 0..H-1
+        sub_hists = torch.zeros(
+            (bsz, hist_len, hist_len, trans_dim),
+            device=hist_3d.device,
+            dtype=hist_3d.dtype,
+        )
+        for h in range(1, hist_len):
+            sub_hists[:, h, hist_len - h :, :] = hist_3d[:, :h, :]
+
+        flat_obs = hist_obs.reshape(bsz * hist_len, self.obs_dim)
+        flat_hist = sub_hists.reshape(bsz * hist_len, hist_len * trans_dim)
+        flat_ctx = None
+        if context is not None:
+            ctx_in = context.unsqueeze(0) if context.dim() == 1 else context
+            flat_ctx = ctx_in.unsqueeze(1).expand(bsz, hist_len, -1).reshape(bsz * hist_len, -1)
+
+        z_hist = self.forward(flat_obs, context=flat_ctx, history=flat_hist).view(
+            bsz, hist_len, self.latent_dim
+        )
+
+        cum = torch.zeros((bsz, self.latent_dim), device=z_hist.device, dtype=z_hist.dtype)
+        has_any = torch.zeros((bsz, 1), dtype=torch.bool, device=z_hist.device)
+        for h in range(hist_len):
+            slot_valid = valid[:, h : h + 1]
+            z_h = z_hist[:, h, :]
+            blended = min_max_normalize(z_h + float(alpha) * cum, eps=1e-6)
+            next_cum = torch.where(has_any, blended, z_h)
+            cum = torch.where(slot_valid, next_cum, cum)
+            has_any = has_any | slot_valid
+
+        return cum.squeeze(0) if history.dim() == 1 else cum
