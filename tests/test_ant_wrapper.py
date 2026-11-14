@@ -211,16 +211,14 @@ def test_actuator_weakening_scales_linearly() -> None:
 
 
 def test_fixed_smoothness_and_velocity_curriculum_reward_blending() -> None:
-    """Verifies fixed smoothness coef, 1000-step gated target_vel curriculum, current_vel shift, and 2s upside-down penalty."""
+    """Verifies fixed smoothness coef, 1000-step gated target_vel curriculum, current_vel shift toward 6.0 m/s, and no upside-down penalty."""
     wrapper = MorphologicalAntBRLWrapper(
         max_action_capacity=12,
         fixed_action_space=True,
         action_smoothness_coef=0.15,
-        benchmark_vel_ref=5.17,
+        benchmark_vel_ref=6.0,
         vel_std_threshold=0.15,
         vel_shift_factor=3000.0,
-        upside_down_time_limit=2.0,
-        upside_down_penalty=50.0,
     )
     try:
         # 1. Smoothness coef is fixed regardless of total_env_steps
@@ -246,32 +244,16 @@ def test_fixed_smoothness_and_velocity_curriculum_reward_blending() -> None:
         # last 3 are [1.60, 1.70, 3.00], std > 0.15 -> min is 1.60
         assert wrapper.target_vel == pytest.approx(1.60, abs=1e-6)
 
-        # 5. Each step shifts current_vel toward target_vel by target_vel / 3000 and blends custom/raw reward
+        # 5. Each step shifts current_vel toward target_vel by target_vel / 3000 and scales only the smoothness penalty
         wrapper.reset(seed=42)
         expected_step_shift = 1.60 / 3000.0
-        _, rew, _, _, info_step = wrapper.step(np.zeros(12, dtype=np.float32))
+        _, rew, _, _, info_step = wrapper.step(np.ones(12, dtype=np.float32) * 0.5)
         assert wrapper.current_vel == pytest.approx(expected_step_shift, abs=1e-7)
-        alpha = expected_step_shift / 5.17
+        alpha = expected_step_shift / 6.0
         assert info_step["reward_blend_alpha"] == pytest.approx(alpha, abs=1e-7)
         expected_rew = (1.0 - alpha) * info_step["custom_reward"] + alpha * info_step["raw_env_reward"]
         assert rew == pytest.approx(expected_rew, abs=1e-5)
-
-        # 6. Upside-down torso for 2 seconds (40 steps at dt=0.05) triggers termination and loss penalty
-        wrapper.reset(seed=42)
-        wrapper.current_vel = 0.0
-        wrapper.target_vel = 0.0
-        # Set torso quaternion to 180-deg flip around X axis: [w=0, x=1, y=0, z=0] so torso z-axis points down
-        for step_i in range(40):
-            wrapper.mj_data.qpos[2] = 0.55
-            wrapper.mj_data.qpos[3:7] = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float64)
-            wrapper.mj_data.qvel[:] = 0.0
-            _, r_ud, term_ud, _, info_ud = wrapper.step(np.zeros(12, dtype=np.float32))
-            if step_i < 39:
-                assert not info_ud["upside_down_terminated"]
-            else:
-                assert term_ud is True
-                assert info_ud["upside_down_terminated"] is True
-                assert r_ud == pytest.approx(info_ud["custom_reward"] - 50.0, abs=1e-5)
+        assert not info_step["upside_down_terminated"]
     finally:
         wrapper.close()
 

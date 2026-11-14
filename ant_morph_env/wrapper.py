@@ -44,11 +44,11 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         action_smoothness_coef: float = 0.15,
         action_smoothness_end_step: int = 500000,
         action_smoothness_log_shape: float = 10.0,
-        benchmark_vel_ref: float = 5.17,
+        benchmark_vel_ref: float = 6.0,
         vel_std_threshold: float = 0.15,
         vel_shift_factor: float = 3000.0,
-        upside_down_time_limit: float = 2.0,
-        upside_down_penalty: float = 50.0,
+        upside_down_time_limit: float = 0.0,
+        upside_down_penalty: float = 0.0,
     ) -> None:
         self.env_id = env_id
         if env is None:
@@ -612,10 +612,8 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
             getattr(self.unwrapped, "frame_skip", 5)
         )
         step_x_vel = (cur_x - prev_x_step) / max(dt, 1e-6)
-        forward_reward = float(
-            info.get("reward_forward", info.get("x_velocity", step_x_vel))
-        )
-        custom_reward = forward_reward - smooth_penalty
+        # Raw Ant-v5 reward is kept as-is; curriculum scales only the added smoothness/torque penalty
+        custom_reward = raw_env_reward - smooth_penalty
 
         torso_up_z = float(self.mj_data.xmat[torso_id].reshape(3, 3)[2, 2])
         if torso_up_z < 0.0:
@@ -639,19 +637,7 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
                 self.current_vel = max(self.target_vel, self.current_vel - step_delta)
 
             blend_alpha = self.get_reward_blend_alpha()
-            agent_reward = (
-                1.0 - blend_alpha
-            ) * custom_reward + blend_alpha * raw_env_reward
-
-            if (
-                self.upside_down_time_limit > 0.0
-                and self._upside_down_time >= self.upside_down_time_limit
-                and blend_alpha < 1.0
-            ):
-                terminated = True
-                upside_down_terminated = True
-                agent_reward -= (1.0 - blend_alpha) * self.upside_down_penalty
-
+            agent_reward = raw_env_reward - (1.0 - blend_alpha) * smooth_penalty
             reward = agent_reward
 
         canonical_obs = self._get_canonical_obs()

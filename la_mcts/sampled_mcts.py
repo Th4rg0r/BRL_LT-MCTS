@@ -99,7 +99,7 @@ class SampledContinuousMCTS:
         root_tau_beta: float = 1.25,
         inner_tau_beta: float = 1.0,
         tau_act: float = 1.0,
-        batch_leaf_eval: int = 16,
+        batch_leaf_eval: int = 8,
         root_dirichlet_alpha: float = 0.3,
         root_exploration_fraction: float = 0.25,
         latent_ema_decay: float = 0.4,
@@ -130,10 +130,15 @@ class SampledContinuousMCTS:
         # For unvisited edges (N == 0), initialize Q to the node's value estimate
         q_raw = np.where(node.visit_counts > 0, node.q_values, node.v_value)
         q_norm = min_max_stats.normalize(q_raw)
+        # Standard MuZero virtual loss: discount normalized Q by visit_counts / (visit_counts + virtual_counts)
+        q_eff = np.where(
+            node.visit_counts > 0,
+            (node.visit_counts * q_norm) / np.maximum(1, eff_counts),
+            q_norm,
+        )
 
         u_score = c_puct * node.prior_weights * (sqrt_sum_n / (1.0 + eff_counts))
-        # Normalized virtual loss penalty ensures parallel batch trajectories explore distinct edges
-        scores = q_norm + u_score - 1.5 * node.virtual_counts
+        scores = q_eff + u_score
         unexpanded_busy = (node.visit_counts == 0) & (node.virtual_counts > 0)
         if not np.all(unexpanded_busy):
             scores = np.where(unexpanded_busy, -np.inf, scores)
@@ -334,22 +339,28 @@ class SampledContinuousMCTS:
 
                 sims_done += len(pending_paths)
 
-            # Compute normalized root visit distribution pi_t^MCTS
+            # Compute normalized root visit + Q-informed distribution pi_t^MCTS
             counts_f = root.visit_counts.astype(np.float64)
+            q_root_raw = np.where(root.visit_counts > 0, root.q_values, root.v_value)
+            q_root_norm = min_max_stats.normalize(q_root_raw)
             if deterministic or temp_act <= 1e-3:
-                best_idx = int(np.argmax(counts_f))
-                # Soft policy weights still reflect empirical visit fractions for training targets
-                total_c = np.sum(counts_f)
-                if total_c > 0:
-                    policy_weights = counts_f / total_c
-                else:
-                    policy_weights = np.full(self.k_act, 1.0 / self.k_act, dtype=np.float64)
+                best_idx = int(np.argmax(counts_f + 0.5 * q_root_norm))
+                # Soft policy weights combine empirical visit counts and normalized Q-advantage
+                logits_mcts = np.log(np.maximum(counts_f, 1e-8)) + 2.0 * q_root_norm
+                logits_mcts -= np.max(logits_mcts)
+                exp_w = np.exp(logits_mcts)
+                policy_weights = exp_w / np.sum(exp_w)
                 chosen_idx = best_idx
             else:
-                powered = np.power(counts_f, 1.0 / temp_act)
-                sum_pow = float(np.sum(powered))
+                eff_temp = max(float(temp_act), 0.1)
+                logits_mcts = (
+                    np.log(np.maximum(counts_f, 1e-8)) + 2.0 * q_root_norm
+                ) / eff_temp
+                logits_mcts -= np.max(logits_mcts)
+                exp_w = np.exp(logits_mcts)
+                sum_pow = float(np.sum(exp_w))
                 if sum_pow > 0.0:
-                    policy_weights = powered / sum_pow
+                    policy_weights = exp_w / sum_pow
                 else:
                     policy_weights = np.full(self.k_act, 1.0 / self.k_act, dtype=np.float64)
                 # Ensure exact normalization within floating-point precision

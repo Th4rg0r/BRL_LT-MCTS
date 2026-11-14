@@ -117,11 +117,11 @@ class AntMorphConfig:
     action_smoothness_coef: float = 0.15
     action_smoothness_end_step: int = 500000
     action_smoothness_log_shape: float = 10.0  # Deprecated/unused; kept for backward config compatibility
-    benchmark_vel_ref: float = 5.17
+    benchmark_vel_ref: float = 6.0
     vel_std_threshold: float = 0.15
     vel_shift_factor: float = 3000.0
-    upside_down_time_limit: float = 2.0
-    upside_down_penalty: float = 50.0
+    upside_down_time_limit: float = 0.0
+    upside_down_penalty: float = 0.0
 
 
 @dataclass

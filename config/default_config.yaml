@@ -92,11 +92,11 @@ ant_morph:
   action_ema_alpha: 0.6
   action_smoothness_coef: 0.15
   action_smoothness_end_step: 500000
-  benchmark_vel_ref: 5.17
+  benchmark_vel_ref: 6.0
   vel_std_threshold: 0.15
-  vel_shift_factor: 5000.0
-  upside_down_time_limit: 2.0
-  upside_down_penalty: 50.0
+  vel_shift_factor: 3000.0
+  upside_down_time_limit: 0.0
+  upside_down_penalty: 0.0
 
 # Run protocol defaults for experiments/train_ant_brl.py (CLI flags override; 0 = automatic)
 run:

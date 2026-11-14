@@ -269,7 +269,9 @@ class ModelRepresentationTrainer(nn.Module):
             loss_rep = loss_rep + self.consistency_head(
                 z_hat, z_target_k, target_projector=target_projector
             )
-            loss_r = loss_r + F.mse_loss(r_hat.squeeze(-1), reward_seq[:, k - 1])
+            loss_r = loss_r + F.smooth_l1_loss(
+                r_hat.squeeze(-1), reward_seq[:, k - 1], beta=1.0
+            )
 
         n_steps = unroll_k + 1
         cum_seq = torch.stack(cum_list, dim=1)  # (B, K+1, D)
@@ -328,11 +330,13 @@ class ModelRepresentationTrainer(nn.Module):
             for p in backbone.parameters():
                 reg_loss = reg_loss + p.pow(2).sum()
 
-        # Entropy regularization on root policy to prevent early std / peak collapse
+        # Entropy regularization on root policy: encourage peak diversity while keeping std in [0.35, 0.55]
         policy_entropy, peak_entropy, mean_policy_std = actor_head.entropy_proxy(
             cum_0, limb_kinematics=kin_0, action_mask=action_mask
         )
-        loss_ent = policy_entropy.mean()
+        std_floor_bonus = -F.relu(0.40 - mean_policy_std).mean() * 5.0
+        std_ceil_penalty = F.relu(mean_policy_std - 0.55).pow(2).mean() * 5.0
+        loss_ent = peak_entropy.mean() + std_floor_bonus - std_ceil_penalty
 
         total_loss = (
             lambda_v * loss_v
@@ -349,7 +353,7 @@ class ModelRepresentationTrainer(nn.Module):
             "loss_p": float(loss_p.detach().item()),
             "loss_r": float(loss_r.detach().item()),
             "loss_rep": float(loss_rep.detach().item()),
-            "policy_entropy": float(loss_ent.detach().item()),
+            "policy_entropy": float(policy_entropy.mean().detach().item()),
             "peak_entropy": float(peak_entropy.mean().detach().item()),
             "policy_std": float(mean_policy_std.mean().detach().item()),
         }
