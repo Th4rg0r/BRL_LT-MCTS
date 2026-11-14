@@ -99,7 +99,7 @@ class SampledContinuousMCTS:
         root_tau_beta: float = 1.25,
         inner_tau_beta: float = 1.0,
         tau_act: float = 1.0,
-        batch_leaf_eval: int = 8,
+        batch_leaf_eval: int = 16,
         root_dirichlet_alpha: float = 0.3,
         root_exploration_fraction: float = 0.25,
         latent_ema_decay: float = 0.4,
@@ -292,22 +292,28 @@ class SampledContinuousMCTS:
                     assume_nonzero=True,
                 )
                 v_next_batch = self.critic_head(z_cum_next_batch).squeeze(-1)
-                sampled_acts_batch, prior_weights_batch = self.actor_head.sample_actions(
-                    z_cum_next_batch,
-                    k_act=self.k_act,
-                    temperature=self.inner_tau_beta,
-                    action_mask=action_mask,
-                    limb_kinematics=limb_kinematics,
-                )
+                is_final_batch = (sims_done + len(pending_paths)) >= num_simulations
+                if not is_final_batch:
+                    sampled_acts_batch, prior_weights_batch = self.actor_head.sample_actions(
+                        z_cum_next_batch,
+                        k_act=self.k_act,
+                        temperature=self.inner_tau_beta,
+                        action_mask=action_mask,
+                        limb_kinematics=limb_kinematics,
+                    )
+                    priors_np = prior_weights_batch.detach().cpu().numpy()
+                else:
+                    sampled_acts_batch = None
+                    priors_np = None
 
                 r_np = r_hat_batch.squeeze(-1).detach().cpu().numpy()
                 v_np = v_next_batch.detach().cpu().numpy()
-                priors_np = prior_weights_batch.detach().cpu().numpy()
 
                 if r_np.ndim == 0:
                     r_np = np.array([float(r_np)])
                     v_np = np.array([float(v_np)])
-                    priors_np = priors_np[np.newaxis, :]
+                    if priors_np is not None:
+                        priors_np = priors_np[np.newaxis, :]
 
                 for b_idx, search_path in enumerate(pending_paths):
                     parent_node, edge_idx = search_path[-1]
@@ -315,15 +321,16 @@ class SampledContinuousMCTS:
                     v_val = float(v_np[b_idx])
                     parent_node.rewards[edge_idx] = r_val
 
-                    child_node = MCTSNode(
-                        z_state=z_next_batch[b_idx],
-                        value_prefix=parent_node.value_prefix + r_val,
-                        sampled_actions=sampled_acts_batch[b_idx],
-                        prior_weights=priors_np[b_idx],
-                        v_value=v_val,
-                        z_cum_state=z_cum_next_batch[b_idx],
-                    )
-                    parent_node.children[edge_idx] = child_node
+                    if not is_final_batch:
+                        child_node = MCTSNode(
+                            z_state=z_next_batch[b_idx],
+                            value_prefix=parent_node.value_prefix + r_val,
+                            sampled_actions=sampled_acts_batch[b_idx],
+                            prior_weights=priors_np[b_idx],
+                            v_value=v_val,
+                            z_cum_state=z_cum_next_batch[b_idx],
+                        )
+                        parent_node.children[edge_idx] = child_node
 
                     # Backpropagate bootstrapped L-k return and convert virtual visit to real visit
                     g_return = v_val

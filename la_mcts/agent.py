@@ -354,6 +354,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             maxlen=self.cfg.history_len
         )
         self._running_prev_cum: Optional[torch.Tensor] = None
+        self._pending_history_step: Optional[Tuple[np.ndarray, np.ndarray]] = None
         self.current_trajectory = EpisodeTrajectory(
             context=self.current_context.copy(),
             action_mask=self.current_action_mask.copy(),
@@ -394,6 +395,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
 
         self.episode_history_deque.clear()
         self._running_prev_cum = None
+        self._pending_history_step = None
         self.current_trajectory.context = self.current_context.copy()
         self.current_trajectory.action_mask = self.current_action_mask.copy()
         self.current_trajectory.limb_kinematics = (
@@ -428,6 +430,10 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
         limb_kinematics: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """Runs Sampled Continuous MCTS from z_t = backbone(obs, context, history) to choose an action."""
+        if self._pending_history_step is not None:
+            self.episode_history_deque.append(self._pending_history_step)
+            self._pending_history_step = None
+
         obs_aligned = self._align_obs(obs)
         active_kin = limb_kinematics if limb_kinematics is not None else self.current_limb_kinematics
         self._last_limb_kinematics = (
@@ -507,7 +513,15 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
         if len(self.current_trajectory) == 0:
             self._diagnostics["v_s0"] = float(root_value)
 
-        return chosen_action * self.current_action_mask
+        final_act = chosen_action * self.current_action_mask
+        act_arr = np.asarray(final_act, dtype=np.float32).flatten()
+        if act_arr.shape[0] < self.cfg.max_action_dim:
+            act_arr = np.pad(act_arr, (0, self.cfg.max_action_dim - act_arr.shape[0]))
+        else:
+            act_arr = act_arr[: self.cfg.max_action_dim]
+        self._pending_history_step = (obs_aligned, act_arr)
+
+        return final_act
 
     def get_limb_movement(
         self,
@@ -601,12 +615,14 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
         self._last_limb_kinematics = None
 
         # Record transition to rolling history
+        self._pending_history_step = None
         self.episode_history_deque.append((obs_aligned, act_arr))
 
         if terminated or truncated:
             self.replay_buffer.add_trajectory(self.current_trajectory)
             self.episode_history_deque.clear()
             self._running_prev_cum = None
+            self._pending_history_step = None
             self.current_trajectory = EpisodeTrajectory(
                 context=self.current_context.copy(),
                 action_mask=self.current_action_mask.copy(),

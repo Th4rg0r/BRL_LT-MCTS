@@ -40,7 +40,7 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         fixed_action_space: bool = False,
         default_num_legs: int = 4,
         healthy_z_range: Tuple[float, float] = (0.2, 1.0),
-        action_ema_alpha: float = 0.6,
+        action_ema_alpha: float = 1.0,
         action_smoothness_coef: float = 0.15,
         action_smoothness_end_step: int = 500000,
         action_smoothness_log_shape: float = 10.0,
@@ -378,7 +378,7 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
             f_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"foot_{i}")
             if a_id >= 0 and f_id >= 0:
                 a_pos = torso_xmat.T @ (data.xpos[a_id] - torso_xpos)
-                d_pos = torso_xmat.T @ (data.xpos[f_id] - torso_xpos)
+                d_pos = torso_xmat.T @ (data.xipos[f_id] - torso_xpos)
                 v = d_pos - a_pos
                 u = v / max(float(np.linalg.norm(v)), 1e-6)
                 yaw = float((np.arctan2(u[1], u[0]) + np.pi) / (2.0 * np.pi)) % 1.0
@@ -565,18 +565,9 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
             smooth_penalty = cur_smooth_coef * float(
                 np.sum(np.square(act_raw - self._prev_raw_action))
             )
-            act_env = np.clip(
-                (
-                    self.action_ema_alpha * act_raw
-                    + (1.0 - self.action_ema_alpha) * self._prev_smoothed_action
-                )
-                * morph_mask[:nu],
-                -1.0,
-                1.0,
-            )
         else:
             smooth_penalty = 0.0
-            act_env = act_raw.copy()
+        act_env = act_raw.copy()
         self._prev_raw_action = act_raw.copy()
         self._prev_smoothed_action = act_env.copy()
         self.total_env_steps += 1

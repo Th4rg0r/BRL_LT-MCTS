@@ -89,7 +89,7 @@ ant_morph:
   healthy_z_range: [0.2, 1.0]
   max_action_capacity: 12
   default_num_legs: 4
-  action_ema_alpha: 0.6
+  action_ema_alpha: 1.0
   action_smoothness_coef: 0.15
   action_smoothness_end_step: 500000
   benchmark_vel_ref: 6.0
@@ -105,7 +105,7 @@ run:
   episodes: 0          # 0 = brl.total_episodes
   max_steps: 0         # 0 = ant_morph.max_episode_steps
   device: "cuda"
-  eval_interval: 0     # 0 = min(10, episodes)
+  eval_interval: 25     # 0 = min(10, episodes)
   checkpoint_interval: 500 # Periodic milestone checkpoint interval in episodes
   parallel_seeds: 3
   gpu_mem_fraction: 0.0

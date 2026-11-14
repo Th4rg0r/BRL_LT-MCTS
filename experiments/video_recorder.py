@@ -409,7 +409,10 @@ def render_scenario_video(
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Configure reset options
-    reset_opts: Dict[str, Any] = {"tweak_vector": scenario_spec["tweak"]}
+    reset_opts: Dict[str, Any] = {
+        "tweak_vector": scenario_spec["tweak"],
+        "eval_mode": True,
+    }
     if "num_legs" in scenario_spec:
         reset_opts["num_legs"] = scenario_spec["num_legs"]
     if "disabled_leg" in scenario_spec:
@@ -504,7 +507,14 @@ def render_scenario_video(
                     frame = raw_frame
                 writer.append_data(frame)
 
-            action = agent.select_action(obs, deterministic=deterministic)
+            try:
+                action = agent.select_action(
+                    obs,
+                    deterministic=deterministic,
+                    limb_kinematics=last_info.get("limb_kinematics"),
+                )
+            except TypeError:
+                action = agent.select_action(obs, deterministic=deterministic)
             obs, reward, terminated, truncated, last_info = env.step(action)
             ep_return += float(reward)
             steps += 1
