@@ -96,6 +96,7 @@ def evaluate_benchmark_suite(
             options={
                 "tweak_vector": spec["tweak"],
                 "num_legs": spec["num_legs"],
+                "eval_mode": True,
             }
         )
         morph_mask = info.get(
@@ -116,7 +117,7 @@ def evaluate_benchmark_suite(
                 obs, deterministic=True, limb_kinematics=last_info.get("limb_kinematics")
             )
             obs, reward, terminated, truncated, last_info = env.step(action)
-            ep_return += float(reward)
+            ep_return += float(last_info.get("raw_env_reward", reward))
             steps += 1
             if terminated or truncated:
                 break
@@ -239,6 +240,13 @@ def save_training_checkpoint(
             "ema_win_rate": float(orchestrator.win_evaluator.ema_win_rate),
             "r_ref": float(orchestrator.win_evaluator.r_ref),
             "episodes_evaluated": int(orchestrator.win_evaluator.episodes_evaluated),
+        },
+        "vel_curriculum": {
+            "target_vel": float(getattr(orchestrator.env, "target_vel", 0.0)),
+            "current_vel": float(getattr(orchestrator.env, "current_vel", 0.0)),
+            "recent_ep_velocities": list(
+                getattr(orchestrator.env, "_recent_ep_velocities", [])
+            ),
         },
         "benchmark_metrics": benchmark_metrics or {},
         "composite_score": float(composite_score) if composite_score is not None else None,
@@ -432,6 +440,11 @@ def run_single_seed(
         action_smoothness_coef=sys_cfg.ant_morph.action_smoothness_coef,
         action_smoothness_end_step=sys_cfg.ant_morph.action_smoothness_end_step,
         action_smoothness_log_shape=sys_cfg.ant_morph.action_smoothness_log_shape,
+        benchmark_vel_ref=sys_cfg.ant_morph.benchmark_vel_ref,
+        vel_std_threshold=sys_cfg.ant_morph.vel_std_threshold,
+        vel_shift_factor=sys_cfg.ant_morph.vel_shift_factor,
+        upside_down_time_limit=sys_cfg.ant_morph.upside_down_time_limit,
+        upside_down_penalty=sys_cfg.ant_morph.upside_down_penalty,
     )
 
     agent = LatentActionMCTSAgent(config=sys_cfg.la_mcts, device=device)
@@ -519,6 +532,15 @@ def run_single_seed(
                 orchestrator.win_evaluator.ema_win_rate = float(we_d.get("ema_win_rate", orchestrator.win_evaluator.ema_win_rate))
                 orchestrator.win_evaluator.r_ref = float(we_d.get("r_ref", orchestrator.win_evaluator.r_ref))
                 orchestrator.win_evaluator.episodes_evaluated = int(we_d.get("episodes_evaluated", orchestrator.win_evaluator.episodes_evaluated))
+
+            if "vel_curriculum" in payload:
+                vc_d = payload["vel_curriculum"]
+                env.target_vel = float(vc_d.get("target_vel", env.target_vel))
+                env.current_vel = float(vc_d.get("current_vel", env.current_vel))
+                if "recent_ep_velocities" in vc_d:
+                    env._recent_ep_velocities.clear()
+                    for v_item in vc_d["recent_ep_velocities"]:
+                        env._recent_ep_velocities.append(float(v_item))
 
             if "balancer_meta" in payload:
                 bm = payload["balancer_meta"]

@@ -134,6 +134,9 @@ class SampledContinuousMCTS:
         u_score = c_puct * node.prior_weights * (sqrt_sum_n / (1.0 + eff_counts))
         # Normalized virtual loss penalty ensures parallel batch trajectories explore distinct edges
         scores = q_norm + u_score - 1.5 * node.virtual_counts
+        unexpanded_busy = (node.visit_counts == 0) & (node.virtual_counts > 0)
+        if not np.all(unexpanded_busy):
+            scores = np.where(unexpanded_busy, -np.inf, scores)
         return int(np.argmax(scores))
 
     def _expand_node(

@@ -17,26 +17,30 @@ from la_mcts.sampled_mcts import SampledContinuousMCTS
 
 
 def test_harmonic_kinematic_embedding():
-    """Verifies that encode_kinematics maps (x, y, z, yaw, pitch, diff_rx, diff_ry, diff_rz) to 17D with harmonic continuity."""
+    """Verifies that encode_kinematics maps 11D (anchor, yaw, pitch, diff_euler, world_euler) to 26D with harmonic continuity."""
     kin = torch.tensor([
-        [0.2, 0.2, 0.0, 0.0, 0.5, -1.0, 0.25, 0.5],   # yaw = 0.0, diff_rx = -1.0 (-pi)
-        [0.2, 0.2, 0.0, 1.0, 0.5,  1.0, 0.25, 0.5],   # yaw = 1.0, diff_rx = +1.0 (+pi)
+        [0.2, 0.2, 0.0, 0.0, 0.5, -1.0, 0.25, 0.5, -1.0, 0.1, -0.5],   # yaw = 0.0, diff_rx = -1.0, world_rx = -1.0
+        [0.2, 0.2, 0.0, 1.0, 0.5,  1.0, 0.25, 0.5,  1.0, 0.1, -0.5],   # yaw = 1.0, diff_rx = +1.0, world_rx = +1.0
     ], dtype=torch.float32)
 
     emb = MorphologicalLimbHead.encode_kinematics(kin)
-    assert emb.shape == (2, 17)
+    assert emb.shape == (2, 26)
 
     # cos(0) == cos(2pi) == 1, sin(0) == sin(2pi) == 0
     assert torch.allclose(emb[0, 4], emb[1, 4], atol=1e-5)  # cos(yaw)
     assert torch.allclose(emb[0, 5], emb[1, 5], atol=1e-5)  # sin(yaw)
     assert torch.allclose(emb[0, 6], emb[1, 6], atol=1e-5)  # pitch
     assert torch.allclose(emb[0, 7], emb[1, 7], atol=1e-5)  # sin(pitch)
-    # Periodic continuity across -pi / +pi boundary for diff_rx
+    # Periodic continuity across -pi / +pi boundary for diff_rx and world_rx
     assert torch.allclose(emb[0, 9], emb[1, 9], atol=1e-5)   # cos(pi * diff_rx)
     assert torch.allclose(emb[0, 10], emb[1, 10], atol=1e-5) # sin(pi * diff_rx)
-    # Legacy 5D input backward compatibility
-    emb_legacy = MorphologicalLimbHead.encode_kinematics(kin[:, :5])
-    assert emb_legacy.shape == (2, 17)
+    assert torch.allclose(emb[0, 18], emb[1, 18], atol=1e-5) # cos(pi * world_rx)
+    assert torch.allclose(emb[0, 19], emb[1, 19], atol=1e-5) # sin(pi * world_rx)
+    # Legacy 5D and 8D input backward compatibility
+    emb_legacy_5 = MorphologicalLimbHead.encode_kinematics(kin[:, :5])
+    assert emb_legacy_5.shape == (2, 26)
+    emb_legacy_8 = MorphologicalLimbHead.encode_kinematics(kin[:, :8])
+    assert emb_legacy_8.shape == (2, 26)
 
 
 def test_torso_leg_xyz_angle_diff_in_transformer_embedding():
@@ -70,16 +74,21 @@ def test_torso_leg_xyz_angle_diff_in_transformer_embedding():
     assert dy == pytest.approx(1.0 / 3.0, abs=1e-6)
     assert dz == pytest.approx(0.0, abs=1e-6)
 
-    # Transformer leg head output must respond to diff_rx, diff_ry, diff_rz
+    # Transformer leg head output must respond to diff_rx, diff_ry, diff_rz and world_rx, world_ry, world_rz
     head = MorphologicalLimbHead(latent_dim=64, num_peaks=3, max_joints_per_limb=2, hidden_dim=32)
     z_t = torch.randn(2, 64)
-    kin_a = torch.zeros(4, 8)
+    kin_a = torch.zeros(4, 11)
     kin_b = kin_a.clone()
     kin_b[:, 5:8] = torch.tensor([[0.25, -0.3, 0.5]] * 4)
+    kin_c = kin_a.clone()
+    kin_c[:, 8:11] = torch.tensor([[-0.4, 0.2, 0.6]] * 4)
     w_a, mu_a, _, _ = head.forward_all_limbs(z_t, kin_a, return_weights=True)
     w_b, mu_b, _, _ = head.forward_all_limbs(z_t, kin_b, return_weights=True)
+    w_c, mu_c, _, _ = head.forward_all_limbs(z_t, kin_c, return_weights=True)
     assert not torch.allclose(mu_a, mu_b)
     assert not torch.allclose(w_a, w_b)
+    assert not torch.allclose(mu_a, mu_c)
+    assert not torch.allclose(w_a, w_c)
 
 
 def test_limb_head_single_limb_query():
@@ -203,39 +212,39 @@ def test_actor_head_all_environments_shape():
 
 
 def test_env_wrappers_provide_limb_kinematics():
-    """Verifies that Ant, Dog, and Humanoid wrappers provide limb_kinematics in reset() and step()."""
+    """Verifies that Ant, Dog, and Humanoid wrappers provide 11D limb_kinematics in reset() and step()."""
     # Ant
     ant_env = MorphologicalAntBRLWrapper()
     obs_ant, info_ant = ant_env.reset()
     assert "limb_kinematics" in info_ant
     kin_ant = info_ant["limb_kinematics"]
-    assert kin_ant.shape == (4, 8)
-    assert np.all(np.abs(kin_ant[:, 5:8]) <= 1.0 + 1e-6)
+    assert kin_ant.shape == (4, 11)
+    assert np.all(np.abs(kin_ant[:, 5:11]) <= 1.0 + 1e-6)
     _, _, _, _, step_info_ant = ant_env.step(np.zeros(8, dtype=np.float32))
     assert "limb_kinematics" in step_info_ant
-    assert step_info_ant["limb_kinematics"].shape == (4, 8)
+    assert step_info_ant["limb_kinematics"].shape == (4, 11)
 
     # Dog
     dog_env = MorphologicalDogBRLWrapper()
     obs_dog, info_dog = dog_env.reset()
     assert "limb_kinematics" in info_dog
     kin_dog = info_dog["limb_kinematics"]
-    assert kin_dog.shape == (4, 8)
-    assert np.all(np.abs(kin_dog[:, 5:8]) <= 1.0 + 1e-6)
+    assert kin_dog.shape == (4, 11)
+    assert np.all(np.abs(kin_dog[:, 5:11]) <= 1.0 + 1e-6)
     _, _, _, _, step_info_dog = dog_env.step(np.zeros(12, dtype=np.float32))
     assert "limb_kinematics" in step_info_dog
-    assert step_info_dog["limb_kinematics"].shape == (4, 8)
+    assert step_info_dog["limb_kinematics"].shape == (4, 11)
 
     # Humanoid
     hum_env = MorphologicalHumanoidBRLWrapper()
     obs_hum, info_hum = hum_env.reset()
     assert "limb_kinematics" in info_hum
     kin_hum = info_hum["limb_kinematics"]
-    assert kin_hum.shape == (5, 8)
-    assert np.all(np.abs(kin_hum[:, 5:8]) <= 1.0 + 1e-6)
+    assert kin_hum.shape == (5, 11)
+    assert np.all(np.abs(kin_hum[:, 5:11]) <= 1.0 + 1e-6)
     _, _, _, _, step_info_hum = hum_env.step(np.zeros(17, dtype=np.float32))
     assert "limb_kinematics" in step_info_hum
-    assert step_info_hum["limb_kinematics"].shape == (5, 8)
+    assert step_info_hum["limb_kinematics"].shape == (5, 11)
 
 
 def test_agent_get_limb_movement():

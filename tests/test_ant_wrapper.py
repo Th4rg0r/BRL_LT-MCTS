@@ -105,9 +105,12 @@ def test_standing_reward_is_unpenalized_and_win_evaluator() -> None:
     obs, reward, term, trunc, step_info = wrapper.step(zero_action)
     wrapper.close()
 
-    # No stagnation penalty: standing still keeps the healthy bonus (~+1.0) from the environment
+    # Raw env reward keeps the healthy bonus (~+1.0), while initial training reward (alpha=0) is custom_reward
     assert np.isfinite(reward)
-    assert reward > 0.5, f"Expected unpenalized env reward (healthy bonus kept), got {reward}"
+    assert step_info["raw_env_reward"] > 0.5, (
+        f"Expected unpenalized raw_env_reward (healthy bonus kept), got {step_info['raw_env_reward']}"
+    )
+    assert reward == pytest.approx(step_info["custom_reward"], abs=1e-6)
 
     # Verify WinEvaluator: premature unhealthy termination MUST be evaluated as LOSS (0) even with high return
     we = WinEvaluator(initial_r_ref=500.0)
@@ -207,56 +210,70 @@ def test_actuator_weakening_scales_linearly() -> None:
     wrapper.close()
 
 
-def test_logarithmic_smoothness_penalty_decay() -> None:
-    """Verifies logarithmic decay of action smoothness penalty from start coef down to exact 0.0 at end_step."""
-    w_gentle = MorphologicalAntBRLWrapper(
+def test_fixed_smoothness_and_velocity_curriculum_reward_blending() -> None:
+    """Verifies fixed smoothness coef, 1000-step gated target_vel curriculum, current_vel shift, and 2s upside-down penalty."""
+    wrapper = MorphologicalAntBRLWrapper(
         max_action_capacity=12,
         fixed_action_space=True,
-        action_smoothness_coef=0.20,
-        action_smoothness_end_step=500000,
-        action_smoothness_log_shape=1.0,
-    )
-    w_steep = MorphologicalAntBRLWrapper(
-        max_action_capacity=12,
-        fixed_action_space=True,
-        action_smoothness_coef=0.20,
-        action_smoothness_end_step=500000,
-        action_smoothness_log_shape=50.0,
+        action_smoothness_coef=0.15,
+        benchmark_vel_ref=5.17,
+        vel_std_threshold=0.15,
+        vel_shift_factor=3000.0,
+        upside_down_time_limit=2.0,
+        upside_down_penalty=50.0,
     )
     try:
-        # 1. Start penalty at step 0
-        assert w_gentle.get_current_smoothness_coef() == pytest.approx(0.20, abs=1e-9)
-        assert w_steep.get_current_smoothness_coef() == pytest.approx(0.20, abs=1e-9)
+        # 1. Smoothness coef is fixed regardless of total_env_steps
+        assert wrapper.get_current_smoothness_coef() == pytest.approx(0.15, abs=1e-9)
+        wrapper.set_total_env_steps(500000)
+        assert wrapper.get_current_smoothness_coef() == pytest.approx(0.15, abs=1e-9)
 
-        # 2. Logarithmic curve & shape control at midpoint (250k): steeper shape drops lower early
-        w_gentle.set_total_env_steps(250000)
-        w_steep.set_total_env_steps(250000)
-        mid_gentle = w_gentle.get_current_smoothness_coef()
-        mid_steep = w_steep.get_current_smoothness_coef()
-        assert 0.0 < mid_steep < mid_gentle < 0.10
+        # 2. Episodes shorter than 1000 steps or unhealthy must NOT update target_vel or enter history
+        wrapper.update_velocity_curriculum(2.0, ep_steps=500, required_steps=1000, terminated_unhealthy=False)
+        wrapper.update_velocity_curriculum(2.5, ep_steps=1000, required_steps=1000, terminated_unhealthy=True)
+        assert len(wrapper._recent_ep_velocities) == 0
+        assert wrapper.target_vel == 0.0
 
-        # 3. Exact 0.0 at and after end_step
-        w_steep.set_total_env_steps(500000)
-        assert w_steep.get_current_smoothness_coef() == 0.0
-        w_steep.set_total_env_steps(750000)
-        assert w_steep.get_current_smoothness_coef() == 0.0
+        # 3. Low std across 3 full 1000-step episodes -> target_vel = mean(last 3)
+        wrapper.update_velocity_curriculum(1.50, ep_steps=1000, required_steps=1000, terminated_unhealthy=False)
+        wrapper.update_velocity_curriculum(1.60, ep_steps=1000, required_steps=1000, terminated_unhealthy=False)
+        wrapper.update_velocity_curriculum(1.70, ep_steps=1000, required_steps=1000, terminated_unhealthy=False)
+        assert len(wrapper._recent_ep_velocities) == 3
+        assert wrapper.target_vel == pytest.approx(1.60, abs=1e-6)
 
-        # 4. Verify step() telemetry and zero penalty beyond end_step vs non-zero penalty at step 0
-        w_steep.reset(seed=42, options={"total_env_steps": 500000})
-        a_pos = np.ones(12, dtype=np.float32) * 0.8
-        a_neg = -np.ones(12, dtype=np.float32) * 0.8
-        w_steep.step(a_pos)
-        _, _, _, _, info_end = w_steep.step(a_neg)
-        assert info_end["action_smoothness_coef"] == 0.0
-        assert w_steep.total_env_steps == 500002
+        # 4. High std across last 3 full 1000-step episodes -> target_vel = min(last 3)
+        wrapper.update_velocity_curriculum(3.00, ep_steps=1000, required_steps=1000, terminated_unhealthy=False)
+        # last 3 are [1.60, 1.70, 3.00], std > 0.15 -> min is 1.60
+        assert wrapper.target_vel == pytest.approx(1.60, abs=1e-6)
 
-        w_steep.reset(seed=42, options={"total_env_steps": 0})
-        w_steep.step(a_pos)
-        _, _, _, _, info_start = w_steep.step(a_neg)
-        assert 0.19 < info_start["action_smoothness_coef"] <= 0.20
+        # 5. Each step shifts current_vel toward target_vel by target_vel / 3000 and blends custom/raw reward
+        wrapper.reset(seed=42)
+        expected_step_shift = 1.60 / 3000.0
+        _, rew, _, _, info_step = wrapper.step(np.zeros(12, dtype=np.float32))
+        assert wrapper.current_vel == pytest.approx(expected_step_shift, abs=1e-7)
+        alpha = expected_step_shift / 5.17
+        assert info_step["reward_blend_alpha"] == pytest.approx(alpha, abs=1e-7)
+        expected_rew = (1.0 - alpha) * info_step["custom_reward"] + alpha * info_step["raw_env_reward"]
+        assert rew == pytest.approx(expected_rew, abs=1e-5)
+
+        # 6. Upside-down torso for 2 seconds (40 steps at dt=0.05) triggers termination and loss penalty
+        wrapper.reset(seed=42)
+        wrapper.current_vel = 0.0
+        wrapper.target_vel = 0.0
+        # Set torso quaternion to 180-deg flip around X axis: [w=0, x=1, y=0, z=0] so torso z-axis points down
+        for step_i in range(40):
+            wrapper.mj_data.qpos[2] = 0.55
+            wrapper.mj_data.qpos[3:7] = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float64)
+            wrapper.mj_data.qvel[:] = 0.0
+            _, r_ud, term_ud, _, info_ud = wrapper.step(np.zeros(12, dtype=np.float32))
+            if step_i < 39:
+                assert not info_ud["upside_down_terminated"]
+            else:
+                assert term_ud is True
+                assert info_ud["upside_down_terminated"] is True
+                assert r_ud == pytest.approx(info_ud["custom_reward"] - 50.0, abs=1e-5)
     finally:
-        w_gentle.close()
-        w_steep.close()
+        wrapper.close()
 
 
 def test_front_back_left_right_leg_scaling() -> None:

@@ -14,6 +14,7 @@ from brl_core.interfaces import WinEvaluator
 from brl_core.perception import (
     ModalitySliceSpec,
     PerceptionDistortionFilter,
+    compute_leg_world_euler_norm,
     compute_torso_leg_angle_diff,
 )
 
@@ -324,11 +325,26 @@ class MorphologicalDogBRLWrapper(gym.Env):
                 diff_rx, diff_ry, diff_rz = compute_torso_leg_angle_diff(
                     torso_xmat, self.data.xmat[f_id]
                 )
+                world_rx, world_ry, world_rz = compute_leg_world_euler_norm(
+                    self.data.xmat[f_id]
+                )
                 k_list.append(
-                    [float(a_pos[0]), float(a_pos[1]), float(a_pos[2]), yaw, pitch, diff_rx, diff_ry, diff_rz]
+                    [
+                        float(a_pos[0]),
+                        float(a_pos[1]),
+                        float(a_pos[2]),
+                        yaw,
+                        pitch,
+                        diff_rx,
+                        diff_ry,
+                        diff_rz,
+                        world_rx,
+                        world_ry,
+                        world_rz,
+                    ]
                 )
             else:
-                k_list.append([0.188, -0.08, 0.0, 0.064, 0.286, 0.0, 0.0, 0.0])
+                k_list.append([0.188, -0.08, 0.0, 0.064, 0.286, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
         return np.array(k_list, dtype=np.float32)
 
     def reset(

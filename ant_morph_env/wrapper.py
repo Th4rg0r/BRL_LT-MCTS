@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections import deque
 import math
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Deque, Dict, Optional, Tuple
 import gymnasium as gym
 from gymnasium import spaces
 import mujoco
@@ -14,6 +15,7 @@ from brl_core.interfaces import WinEvaluator
 from brl_core.perception import (
     ModalitySliceSpec,
     PerceptionDistortionFilter,
+    compute_leg_world_euler_norm,
     compute_torso_leg_angle_diff,
 )
 
@@ -42,6 +44,11 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         action_smoothness_coef: float = 0.15,
         action_smoothness_end_step: int = 500000,
         action_smoothness_log_shape: float = 10.0,
+        benchmark_vel_ref: float = 5.17,
+        vel_std_threshold: float = 0.15,
+        vel_shift_factor: float = 3000.0,
+        upside_down_time_limit: float = 2.0,
+        upside_down_penalty: float = 50.0,
     ) -> None:
         self.env_id = env_id
         if env is None:
@@ -70,6 +77,15 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         self.action_smoothness_coef = max(0.0, float(action_smoothness_coef))
         self.action_smoothness_end_step = int(action_smoothness_end_step)
         self.action_smoothness_log_shape = max(1e-6, float(action_smoothness_log_shape))
+        self.benchmark_vel_ref = max(1e-6, float(benchmark_vel_ref))
+        self.vel_std_threshold = max(0.0, float(vel_std_threshold))
+        self.vel_shift_factor = max(1.0, float(vel_shift_factor))
+        self.upside_down_time_limit = max(0.0, float(upside_down_time_limit))
+        self.upside_down_penalty = max(0.0, float(upside_down_penalty))
+        self._recent_ep_velocities: Deque[float] = deque(maxlen=3)
+        self.target_vel: float = 0.0
+        self.current_vel: float = 0.0
+        self._eval_mode: bool = False
         self.total_env_steps: int = 0
         self.canonical_obs_dim = 105 if self.use_contact_forces else 27
 
@@ -97,9 +113,12 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         self._rng = np.random.default_rng()
         self._ep_steps = 0
         self._ep_return = 0.0
+        self._ep_raw_return = 0.0
+        self._ep_agent_return = 0.0
         self._ep_energy = 0.0
         self._start_x = 0.0
         self._healthy_steps = 0
+        self._upside_down_time = 0.0
         self._prev_raw_action: Optional[np.ndarray] = None
         self._prev_smoothed_action: Optional[np.ndarray] = None
 
@@ -367,30 +386,81 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
                 diff_rx, diff_ry, diff_rz = compute_torso_leg_angle_diff(
                     torso_xmat, data.xmat[f_id]
                 )
+                world_rx, world_ry, world_rz = compute_leg_world_euler_norm(
+                    data.xmat[f_id]
+                )
                 k_list.append(
-                    [float(a_pos[0]), float(a_pos[1]), float(a_pos[2]), yaw, pitch, diff_rx, diff_ry, diff_rz]
+                    [
+                        float(a_pos[0]),
+                        float(a_pos[1]),
+                        float(a_pos[2]),
+                        yaw,
+                        pitch,
+                        diff_rx,
+                        diff_ry,
+                        diff_rz,
+                        world_rx,
+                        world_ry,
+                        world_rz,
+                    ]
                 )
             else:
                 angle = (float(i - 1) / float(self.current_num_legs)) * 2.0 * math.pi
-                k_list.append([0.2 * math.cos(angle), 0.2 * math.sin(angle), 0.0, (angle / (2.0 * math.pi)) % 1.0, 0.5, 0.0, 0.0, 0.0])
+                k_list.append(
+                    [
+                        0.2 * math.cos(angle),
+                        0.2 * math.sin(angle),
+                        0.0,
+                        (angle / (2.0 * math.pi)) % 1.0,
+                        0.5,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                    ]
+                )
         return np.array(k_list, dtype=np.float32)
 
     def set_total_env_steps(self, total_env_steps: int) -> None:
-        """Synchronizes global training step counter used for logarithmic smoothness penalty decay."""
+        """Synchronizes global training step counter."""
         self.total_env_steps = max(0, int(total_env_steps))
 
     def get_current_smoothness_coef(self) -> float:
-        """Computes the current action smoothness penalty coefficient along the logarithmic decay curve."""
-        if self.action_smoothness_coef <= 0.0:
-            return 0.0
-        if self.action_smoothness_end_step <= 0:
-            return self.action_smoothness_coef
-        if self.total_env_steps >= self.action_smoothness_end_step:
-            return 0.0
-        u = min(1.0, max(0.0, float(self.total_env_steps) / float(self.action_smoothness_end_step)))
-        k = max(1e-6, self.action_smoothness_log_shape)
-        decay = 1.0 - (math.log1p(k * u) / math.log1p(k))
-        return max(0.0, self.action_smoothness_coef * decay)
+        """Returns the fixed action smoothness penalty coefficient (scaled via custom-to-raw reward blend)."""
+        return max(0.0, float(self.action_smoothness_coef))
+
+    def get_reward_blend_alpha(self) -> float:
+        """Returns the current interpolation weight in [0, 1] for raw Ant-v5 reward vs. custom reward."""
+        return float(
+            np.clip(self.current_vel / max(self.benchmark_vel_ref, 1e-6), 0.0, 1.0)
+        )
+
+    def update_velocity_curriculum(
+        self,
+        ep_vel: float,
+        ep_steps: int = 1000,
+        required_steps: int = 1000,
+        terminated_unhealthy: bool = False,
+    ) -> Tuple[float, float]:
+        """Updates target_vel from the last 3 full (1000-step) episodes' mean forward velocities (m/s).
+
+        Only episodes that reach `required_steps` (default 1000) without unhealthy termination
+        are recorded and used to update `target_vel`. If the standard deviation of the last 3
+        qualifying velocities is <= `vel_std_threshold`, `target_vel` is set to their mean;
+        otherwise it is set to their minimum.
+        """
+        if int(ep_steps) < int(required_steps) or bool(terminated_unhealthy):
+            return self.target_vel, self.current_vel
+        self._recent_ep_velocities.append(float(ep_vel))
+        vals = np.asarray(self._recent_ep_velocities, dtype=np.float64)
+        std_v = float(np.std(vals)) if len(vals) >= 2 else 0.0
+        if std_v <= self.vel_std_threshold:
+            self.target_vel = max(0.0, float(np.mean(vals)))
+        else:
+            self.target_vel = max(0.0, float(np.min(vals)))
+        return self.target_vel, self.current_vel
 
     def reset(
         self,
@@ -402,6 +472,7 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
             self._rng = np.random.default_rng(seed)
 
         opts = options or {}
+        self._eval_mode = bool(opts.get("eval_mode", False))
         if "total_env_steps" in opts and opts["total_env_steps"] is not None:
             self.set_total_env_steps(int(opts["total_env_steps"]))
         if "tweak_vector" in opts and opts["tweak_vector"] is not None:
@@ -448,8 +519,11 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         self._ou_wind_state[:] = 0.0
         self._ep_steps = 0
         self._ep_return = 0.0
+        self._ep_raw_return = 0.0
+        self._ep_agent_return = 0.0
         self._ep_energy = 0.0
         self._healthy_steps = 0
+        self._upside_down_time = 0.0
         self._start_x = float(self.mj_data.qpos[0])
         self._prev_raw_action = None
         self._prev_smoothed_action = None
@@ -529,16 +603,70 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         else:
             self.mj_data.xfrc_applied[torso_id, :3] = 0.0
 
-        _, reward, terminated, truncated, info = self.env.step(act_env)
-        reward = float(reward) - smooth_penalty
+        prev_x_step = float(self.mj_data.qpos[0])
+        _, raw_reward, terminated, truncated, info = self.env.step(act_env)
+        raw_env_reward = float(raw_reward)
+
+        cur_x = float(self.mj_data.qpos[0])
+        dt = float(self.mj_model.opt.timestep) * int(
+            getattr(self.unwrapped, "frame_skip", 5)
+        )
+        step_x_vel = (cur_x - prev_x_step) / max(dt, 1e-6)
+        forward_reward = float(
+            info.get("reward_forward", info.get("x_velocity", step_x_vel))
+        )
+        custom_reward = forward_reward - smooth_penalty
+
+        torso_up_z = float(self.mj_data.xmat[torso_id].reshape(3, 3)[2, 2])
+        if torso_up_z < 0.0:
+            self._upside_down_time += dt
+        else:
+            self._upside_down_time = 0.0
+
+        upside_down_terminated = False
+        if self._eval_mode:
+            blend_alpha = 1.0
+            agent_reward = raw_env_reward
+            reward = raw_env_reward
+        else:
+            ref_mag = (
+                abs(self.target_vel) if self.target_vel > 0.0 else abs(self.current_vel)
+            )
+            step_delta = ref_mag / max(self.vel_shift_factor, 1.0)
+            if self.current_vel < self.target_vel:
+                self.current_vel = min(self.target_vel, self.current_vel + step_delta)
+            elif self.current_vel > self.target_vel:
+                self.current_vel = max(self.target_vel, self.current_vel - step_delta)
+
+            blend_alpha = self.get_reward_blend_alpha()
+            agent_reward = (
+                1.0 - blend_alpha
+            ) * custom_reward + blend_alpha * raw_env_reward
+
+            if (
+                self.upside_down_time_limit > 0.0
+                and self._upside_down_time >= self.upside_down_time_limit
+                and blend_alpha < 1.0
+            ):
+                terminated = True
+                upside_down_terminated = True
+                agent_reward -= (1.0 - blend_alpha) * self.upside_down_penalty
+
+            reward = agent_reward
 
         canonical_obs = self._get_canonical_obs()
         # Guard against non-finite physics states under extreme combined disturbances
-        if not np.all(np.isfinite(canonical_obs)) or not math.isfinite(float(reward)):
+        if (
+            not np.all(np.isfinite(canonical_obs))
+            or not math.isfinite(float(reward))
+            or not math.isfinite(float(raw_env_reward))
+        ):
             canonical_obs = np.nan_to_num(
                 canonical_obs, nan=0.0, posinf=10.0, neginf=-10.0
             ).astype(np.float32)
             reward = -10.0
+            raw_env_reward = -10.0
+            agent_reward = -10.0
             terminated = True
 
         obs_noisy = self._add_sensor_noise(canonical_obs)
@@ -548,25 +676,31 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         perc_metrics.update(kin_metrics)
 
         self._ep_steps += 1
-        self._ep_return += float(reward)
+        self._ep_raw_return += float(raw_env_reward)
+        self._ep_agent_return += float(agent_reward)
+        self._ep_return = self._ep_raw_return
         self._ep_energy += float(np.sum(np.square(act_env)))
         if not terminated:
             self._healthy_steps += 1
 
-        cur_x = float(self.mj_data.qpos[0])
         total_dist = cur_x - self._start_x
-        dt = float(self.mj_model.opt.timestep) * int(
-            getattr(self.unwrapped, "frame_skip", 5)
-        )
         mean_x_vel = total_dist / max(self._ep_steps * dt, 1e-6)
 
         win_ind, dom_score, ema_win = self.win_evaluator.evaluate_episode(
-            episode_return=self._ep_return,
+            episode_return=self._ep_raw_return,
             terminated_unhealthy=bool(terminated),
             forward_velocity=mean_x_vel,
             adapt_reference=False,
         )
 
+        info["raw_env_reward"] = float(raw_env_reward)
+        info["custom_reward"] = float(custom_reward)
+        info["agent_reward"] = float(agent_reward)
+        info["reward_blend_alpha"] = float(blend_alpha)
+        info["target_vel"] = float(self.target_vel)
+        info["current_vel"] = float(self.current_vel)
+        info["upside_down_time"] = float(self._upside_down_time)
+        info["upside_down_terminated"] = bool(upside_down_terminated)
         info["morphology_mask"] = morph_mask
         info["perception_metrics"] = perc_metrics
         info["perceived_tweak_vector"] = self.perception_filter.perceived_context_vector.astype(np.float32)
@@ -580,6 +714,12 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
             "total_distance": float(total_dist),
             "healthy_steps": int(self._healthy_steps),
             "energy_cost": float(self._ep_energy),
+            "raw_episode_return": float(self._ep_raw_return),
+            "agent_episode_return": float(self._ep_agent_return),
+            "reward_blend_alpha": float(blend_alpha),
+            "target_vel": float(self.target_vel),
+            "current_vel": float(self.current_vel),
+            "upside_down_terminated": bool(upside_down_terminated),
             "win_indicator": int(win_ind),
             "dominance_score": float(dom_score),
             "ema_win_rate": float(ema_win),

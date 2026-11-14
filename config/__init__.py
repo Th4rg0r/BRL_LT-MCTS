@@ -28,6 +28,7 @@ class LAMCTSConfig:
     num_bins: int = 301
     gamma: float = 0.99
     td_steps: int = 5
+    target_tau: float = 0.01
     l_dyn: int = 3
     proj_dim: int = 512
     pred_dim: int = 256
@@ -115,7 +116,12 @@ class AntMorphConfig:
     action_ema_alpha: float = 0.6
     action_smoothness_coef: float = 0.15
     action_smoothness_end_step: int = 500000
-    action_smoothness_log_shape: float = 10.0
+    action_smoothness_log_shape: float = 10.0  # Deprecated/unused; kept for backward config compatibility
+    benchmark_vel_ref: float = 5.17
+    vel_std_threshold: float = 0.15
+    vel_shift_factor: float = 3000.0
+    upside_down_time_limit: float = 2.0
+    upside_down_penalty: float = 50.0
 
 
 @dataclass

@@ -269,3 +269,99 @@ def test_parallel_multi_seed_logging(tmp_path) -> None:
     for s_key in ("42", "43", "44"):
         assert status_data["seeds"][s_key]["completed_episodes"] == 2
         assert status_data["seeds"][s_key]["total_env_steps"] > 0
+
+
+def test_agent_ema_target_networks() -> None:
+    """Verifies LatentActionMCTSAgent EMA target networks, n-step TD bootstrap, and checkpoints."""
+    from config import LAMCTSConfig
+    from la_mcts.agent import EpisodeTrajectory, LatentActionMCTSAgent
+
+    torch.manual_seed(7)
+    np.random.seed(7)
+    cfg = LAMCTSConfig(
+        obs_dim=27,
+        max_action_dim=8,
+        latent_dim=64,
+        d_model=64,
+        n_heads=2,
+        l_enc=1,
+        l_dyn=1,
+        proj_dim=64,
+        pred_dim=32,
+        unroll_steps=3,
+        td_steps=2,
+        gamma=0.9,
+        target_tau=0.05,
+        batch_size=4,
+        n_sim=4,
+        k_act=4,
+        lr=1e-2,
+    )
+    agent = LatentActionMCTSAgent(config=cfg, device="cpu")
+
+    # Target networks must be frozen (requires_grad=False, eval mode) and initially match online
+    for mod in (agent.target_backbone, agent.target_critic_head, agent.target_projector):
+        assert not mod.training
+        assert all(not p.requires_grad for p in mod.parameters())
+    for p_targ, p_on in zip(agent.target_backbone.parameters(), agent.backbone.parameters()):
+        assert torch.allclose(p_targ, p_on)
+
+    # Build a synthetic trajectory longer than td_steps + unroll_steps
+    T = 8
+    traj = EpisodeTrajectory(
+        obs=[np.random.randn(27).astype(np.float32) for _ in range(T)],
+        actions=[np.tanh(np.random.randn(8)).astype(np.float32) for _ in range(T)],
+        rewards=[1.0 for _ in range(T)],
+        mcts_values=[999.0 for _ in range(T)],  # Stale values intentionally extreme
+        mcts_policy_samples=[np.zeros((cfg.k_act, 8), dtype=np.float32) for _ in range(T)],
+        mcts_policy_weights=[np.full(cfg.k_act, 1.0 / cfg.k_act, dtype=np.float32) for _ in range(T)],
+        context=np.zeros(cfg.context_dim, dtype=np.float32),
+        action_mask=np.ones(8, dtype=np.float32),
+    )
+    agent.replay_buffer.add_trajectory(traj)
+
+    # _compute_target_td_values should use target critic rather than stale mcts_values (999.0),
+    # and handle terminal steps (step=7 -> boot_idx=9 >= T -> pure reward 1.0)
+    td_vals = agent._compute_target_td_values([(traj, 0), (traj, 6)])
+    assert td_vals.shape == (2, cfg.unroll_steps + 1)
+    assert torch.isfinite(td_vals).all()
+    assert float(td_vals[0, 0].abs().item()) < 50.0  # Not using stale 999.0
+    # Sample 1 starts at 6 -> k=1 reaches step 7 (last step), boot_idx=9 >= T -> exact reward 1.0
+    assert abs(float(td_vals[1, 1].item()) - 1.0) < 1e-5
+
+    bb_init = [p.clone() for p in agent.backbone.parameters()]
+    targ_init = [p.clone() for p in agent.target_backbone.parameters()]
+
+    metrics = agent.train_step()
+    assert "loss_total" in metrics
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in agent.backbone.parameters())
+
+    # Polyak EMA: target moved slowly toward updated online weights
+    moved_online = any(
+        not torch.allclose(p0, p1)
+        for p0, p1 in zip(bb_init, agent.backbone.parameters())
+    )
+    moved_target = any(
+        not torch.allclose(t0, t1)
+        for t0, t1 in zip(targ_init, agent.target_backbone.parameters())
+    )
+    assert moved_online and moved_target
+    for t0, t1, o1 in zip(targ_init, agent.target_backbone.parameters(), agent.backbone.parameters()):
+        expected = (1.0 - cfg.target_tau) * t0 + cfg.target_tau * o1
+        assert torch.allclose(t1, expected, atol=1e-6)
+
+    # Checkpoint round-trip and backward compatibility when target keys are absent
+    ckpt = agent.state_dict()
+    assert {"target_backbone", "target_critic_head", "target_projector"}.issubset(ckpt.keys())
+
+    agent2 = LatentActionMCTSAgent(config=cfg, device="cpu")
+    agent2.load_state_dict(ckpt)
+    for p1, p2 in zip(agent.target_backbone.parameters(), agent2.target_backbone.parameters()):
+        assert torch.allclose(p1, p2)
+
+    legacy_ckpt = {k: v for k, v in ckpt.items() if not k.startswith("target_")}
+    agent3 = LatentActionMCTSAgent(config=cfg, device="cpu")
+    agent3.load_state_dict(legacy_ckpt)
+    for p_on, p_t in zip(agent3.backbone.parameters(), agent3.target_backbone.parameters()):
+        assert torch.allclose(p_on, p_t)
+

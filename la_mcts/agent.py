@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from collections import deque
+import copy
 from dataclasses import dataclass, field
 from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.optim as optim
 
 from brl_core.interfaces import AbstractBRLSolverAgent
@@ -299,6 +301,16 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             latent_ema_decay=latent_ema_decay,
         ).to(self.device)
 
+        # EMA target networks for stable n-step TD bootstrapping and representation targets
+        self.target_backbone = copy.deepcopy(self.backbone).to(self.device)
+        self.target_critic_head = copy.deepcopy(self.critic_head).to(self.device)
+        self.target_projector = copy.deepcopy(
+            self.rep_trainer.consistency_head.projector
+        ).to(self.device)
+        for mod in (self.target_backbone, self.target_critic_head, self.target_projector):
+            mod.eval()
+            mod.requires_grad_(False)
+
         self.mcts = SampledContinuousMCTS(
             actor_head=self.actor_head,
             critic_head=self.critic_head,
@@ -341,6 +353,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
         self.episode_history_deque: Deque[Tuple[np.ndarray, np.ndarray]] = deque(
             maxlen=self.cfg.history_len
         )
+        self._running_prev_cum: Optional[torch.Tensor] = None
         self.current_trajectory = EpisodeTrajectory(
             context=self.current_context.copy(),
             action_mask=self.current_action_mask.copy(),
@@ -380,6 +393,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             self._last_limb_kinematics = self.current_limb_kinematics.copy()
 
         self.episode_history_deque.clear()
+        self._running_prev_cum = None
         self.current_trajectory.context = self.current_context.copy()
         self.current_trajectory.action_mask = self.current_action_mask.copy()
         self.current_trajectory.limb_kinematics = (
@@ -440,10 +454,18 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
 
             z_root = self.backbone(obs_t, context=ctx_t, history=hist_t).squeeze(0)
             ema_decay = float(getattr(self.cfg, "latent_ema_decay", 0.4))
-            prev_cum_t = self.backbone.compute_prev_cumulative(
-                ctx_t, hist_t, alpha=ema_decay
-            )
-            prev_cum_root = prev_cum_t.squeeze(0) if prev_cum_t is not None else None
+            if len(self.episode_history_deque) == 0:
+                prev_cum_root = None
+            elif self._running_prev_cum is not None:
+                prev_cum_root = self._running_prev_cum
+            else:
+                prev_cum_t = self.backbone.compute_prev_cumulative(
+                    ctx_t, hist_t, alpha=ema_decay
+                )
+                prev_cum_root = prev_cum_t.squeeze(0) if prev_cum_t is not None else None
+            self._running_prev_cum = combine_cumulative_rep(
+                z_root, prev_cum_root, alpha=ema_decay
+            ).detach()
             n_sim = self.cfg.n_sim_eval if deterministic else self.cfg.n_sim
             if deterministic:
                 tau_act = self.cfg.tau_act_eval
@@ -584,6 +606,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
         if terminated or truncated:
             self.replay_buffer.add_trajectory(self.current_trajectory)
             self.episode_history_deque.clear()
+            self._running_prev_cum = None
             self.current_trajectory = EpisodeTrajectory(
                 context=self.current_context.copy(),
                 action_mask=self.current_action_mask.copy(),
@@ -654,6 +677,150 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                 traj.mcts_policy_weights[step] = policy_weights
                 traj.mcts_values[step] = float(root_value)
 
+    def _target_pairs(self) -> List[Tuple[nn.Module, nn.Module]]:
+        """Returns (target_module, online_module) pairs tracked by Polyak EMA."""
+        return [
+            (self.target_backbone, self.backbone),
+            (self.target_critic_head, self.critic_head),
+            (self.target_projector, self.rep_trainer.consistency_head.projector),
+        ]
+
+    @torch.no_grad()
+    def _soft_update_target_networks(self, tau: Optional[float] = None) -> None:
+        """Polyak averages target networks toward online networks: theta- <- (1-tau)*theta- + tau*theta."""
+        alpha = float(getattr(self.cfg, "target_tau", 0.01) if tau is None else tau)
+        for target_mod, online_mod in self._target_pairs():
+            for p_targ, p_on in zip(target_mod.parameters(), online_mod.parameters()):
+                p_targ.data.lerp_(p_on.data, alpha)
+
+    @torch.no_grad()
+    def _compute_target_td_values(
+        self, refs: List[Tuple[EpisodeTrajectory, int]]
+    ) -> torch.Tensor:
+        """Computes fresh n_td-step bootstrapped target values using EMA target networks."""
+        K = self.cfg.unroll_steps
+        td_steps = self.cfg.td_steps
+        gamma = self.cfg.gamma
+        ema_decay = float(getattr(self.cfg, "latent_ema_decay", 0.4))
+
+        targets = np.zeros((len(refs), K + 1), dtype=np.float32)
+        H = self.cfg.history_len
+        unique_step_keys: Dict[Tuple[int, int], int] = {}
+        step_obs: List[np.ndarray] = []
+        step_ctx: List[np.ndarray] = []
+        step_hist: List[np.ndarray] = []
+        unique_boot_keys: Dict[Tuple[int, int], int] = {}
+        boot_chains: List[List[int]] = []
+        boot_links: List[Tuple[int, int, int, float]] = []
+
+        for b, (traj, start) in enumerate(refs):
+            T = len(traj)
+            traj_id = id(traj)
+            for k in range(K + 1):
+                step = min(start + k, T - 1)
+                n_ret = 0.0
+                discount = 1.0
+                for j in range(td_steps):
+                    s = step + j
+                    if s < T:
+                        n_ret += discount * float(traj.rewards[s])
+                        discount *= gamma
+                    else:
+                        break
+                targets[b, k] = n_ret
+
+                boot_idx = step + td_steps
+                if boot_idx < T:
+                    boot_key = (traj_id, boot_idx)
+                    q_idx = unique_boot_keys.get(boot_key)
+                    if q_idx is None:
+                        q_idx = len(boot_chains)
+                        unique_boot_keys[boot_key] = q_idx
+                        s_start = max(0, boot_idx - H)
+                        chain: List[int] = []
+                        for s_idx in range(s_start, boot_idx + 1):
+                            s_key = (traj_id, s_idx)
+                            u_idx = unique_step_keys.get(s_key)
+                            if u_idx is None:
+                                u_idx = len(step_obs)
+                                unique_step_keys[s_key] = u_idx
+                                step_obs.append(traj.obs[s_idx])
+                                step_ctx.append(traj.context)
+                                step_hist.append(
+                                    build_step_history(
+                                        traj,
+                                        s_idx,
+                                        H,
+                                        self.cfg.obs_dim,
+                                        self.cfg.max_action_dim,
+                                    )
+                                )
+                            chain.append(u_idx)
+                        boot_chains.append(chain)
+                    boot_links.append((b, k, q_idx, discount))
+
+        targets_t = torch.as_tensor(targets, dtype=torch.float32, device=self.device)
+        if boot_chains:
+            obs_t = torch.as_tensor(
+                np.stack(step_obs), dtype=torch.float32, device=self.device
+            )
+            ctx_t = torch.as_tensor(
+                np.stack(step_ctx), dtype=torch.float32, device=self.device
+            )
+            hist_t = torch.as_tensor(
+                np.stack(step_hist), dtype=torch.float32, device=self.device
+            )
+            z_all = self.target_backbone(obs_t, context=ctx_t, history=hist_t)
+
+            max_chain = H + 1
+            n_boot = len(boot_chains)
+            chain_idx_np = np.zeros((n_boot, max_chain), dtype=np.int64)
+            chain_start_np = np.zeros(n_boot, dtype=np.int64)
+            for q_i, ch in enumerate(boot_chains):
+                ch_len = len(ch)
+                start_col = max_chain - ch_len
+                chain_start_np[q_i] = start_col
+                chain_idx_np[q_i, start_col:] = ch
+
+            chain_idx_t = torch.as_tensor(
+                chain_idx_np, dtype=torch.long, device=self.device
+            )
+            chain_start_t = torch.as_tensor(
+                chain_start_np, dtype=torch.long, device=self.device
+            )
+            cum_boot = z_all[chain_idx_t[:, 0]]
+            for slot in range(max_chain):
+                z_slot = z_all[chain_idx_t[:, slot]]
+                if slot == 0:
+                    cum_boot = z_slot
+                else:
+                    combined = combine_cumulative_rep(
+                        z_slot, cum_boot, alpha=ema_decay
+                    )
+                    is_start = (chain_start_t == slot).unsqueeze(-1)
+                    Active = (chain_start_t <= slot).unsqueeze(-1)
+                    cum_boot = torch.where(
+                        is_start, z_slot, torch.where(Active, combined, cum_boot)
+                    )
+
+            v_boot = self.target_critic_head(cum_boot).squeeze(-1)
+
+            b_idx = torch.tensor(
+                [item[0] for item in boot_links], dtype=torch.long, device=self.device
+            )
+            k_idx = torch.tensor(
+                [item[1] for item in boot_links], dtype=torch.long, device=self.device
+            )
+            q_idx_t = torch.tensor(
+                [item[2] for item in boot_links], dtype=torch.long, device=self.device
+            )
+            disc_t = torch.tensor(
+                [item[3] for item in boot_links], dtype=torch.float32, device=self.device
+            )
+            targets_t[b_idx, k_idx] += disc_t * v_boot[q_idx_t]
+
+        return targets_t
+
     def train_step(self) -> Dict[str, float]:
         """Executes a K-step unrolled gradient update on the replay buffer."""
         if len(self.replay_buffer.trajectories) == 0:
@@ -664,22 +831,24 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             obs_seq,
             act_seq,
             rew_seq,
-            val_seq,
+            _stored_val_seq,
             samples_seq,
             weights_seq,
             ctx_batch,
             mask_batch,
             hist_batch,
             kin_batch,
-            _,
+            refs,
         ) = self.replay_buffer.sample_unroll_batch(bsz, self.device)
+
+        target_val_seq = self._compute_target_td_values(refs)
 
         self.optimizer.zero_grad()
         total_loss, metrics = self.rep_trainer.compute_unrolled_loss(
             obs_seq=obs_seq,
             action_seq=act_seq,
             reward_seq=rew_seq,
-            target_value_seq=val_seq,
+            target_value_seq=target_val_seq,
             mcts_policy_samples=samples_seq,
             mcts_policy_weights=weights_seq,
             backbone=self.backbone,
@@ -695,6 +864,8 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             lambda_rep=self.cfg.lambda_rep,
             lambda_ent=self.cfg.lambda_ent,
             c_reg=self.cfg.c_reg,
+            target_backbone=self.target_backbone,
+            target_projector=self.target_projector,
         )
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(
@@ -705,6 +876,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             max_norm=5.0,
         )
         self.optimizer.step()
+        self._soft_update_target_networks()
 
         self._diagnostics.update(metrics)
         self._diagnostics["td_error"] = float(metrics.get("loss_v", 0.0))
@@ -720,6 +892,9 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             "actor_head": self.actor_head.state_dict(),
             "critic_head": self.critic_head.state_dict(),
             "rep_trainer": self.rep_trainer.state_dict(),
+            "target_backbone": self.target_backbone.state_dict(),
+            "target_critic_head": self.target_critic_head.state_dict(),
+            "target_projector": self.target_projector.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "diagnostics": dict(self._diagnostics),
         }
@@ -729,11 +904,38 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
         if "backbone" in state:
             self.backbone.load_state_dict(state["backbone"])
         if "actor_head" in state:
-            self.actor_head.load_state_dict(state["actor_head"])
+            actor_state = dict(state["actor_head"])
+            w_key = "limb_head.kin_proj.0.weight"
+            if w_key in actor_state:
+                saved_w = actor_state[w_key]
+                cur_w = self.actor_head.state_dict()[w_key]
+                if saved_w.shape[1] < cur_w.shape[1]:
+                    pad_cols = cur_w.shape[1] - saved_w.shape[1]
+                    actor_state[w_key] = torch.nn.functional.pad(
+                        saved_w, (0, pad_cols)
+                    )
+            self.actor_head.load_state_dict(actor_state)
         if "critic_head" in state:
             self.critic_head.load_state_dict(state["critic_head"])
         if "rep_trainer" in state:
             self.rep_trainer.load_state_dict(state["rep_trainer"])
+        if "target_backbone" in state:
+            self.target_backbone.load_state_dict(state["target_backbone"])
+        elif "backbone" in state:
+            self.target_backbone.load_state_dict(self.backbone.state_dict())
+        if "target_critic_head" in state:
+            self.target_critic_head.load_state_dict(state["target_critic_head"])
+        elif "critic_head" in state:
+            self.target_critic_head.load_state_dict(self.critic_head.state_dict())
+        if "target_projector" in state:
+            self.target_projector.load_state_dict(state["target_projector"])
+        elif "rep_trainer" in state:
+            self.target_projector.load_state_dict(
+                self.rep_trainer.consistency_head.projector.state_dict()
+            )
+        for mod in (self.target_backbone, self.target_critic_head, self.target_projector):
+            mod.eval()
+            mod.requires_grad_(False)
         if "optimizer" in state:
             self.optimizer.load_state_dict(state["optimizer"])
         if "diagnostics" in state:

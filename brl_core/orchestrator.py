@@ -124,6 +124,7 @@ class BRLTrainingOrchestrator:
         # 4. Agent interacts with environment E(w_e)
         step_limit = max_steps or self.cfg.ant_morph.max_episode_steps
         ep_return = 0.0
+        agent_ep_return = 0.0
         steps = 0
         terminated = False
         truncated = False
@@ -138,7 +139,9 @@ class BRLTrainingOrchestrator:
             self.agent.observe_transition(
                 obs, action, float(reward), next_obs, terminated, truncated, info
             )
-            ep_return += float(reward)
+            raw_step_reward = float(info.get("raw_env_reward", reward))
+            ep_return += raw_step_reward
+            agent_ep_return += float(reward)
             steps += 1
             obs = next_obs
             last_info = info
@@ -177,6 +180,13 @@ class BRLTrainingOrchestrator:
 
         unhealthy_term = bool(terminated and steps < step_limit)
         x_vel = float(brl_info.get("x_velocity", ep_return / max(steps, 1)))
+        if hasattr(self.env, "update_velocity_curriculum"):
+            self.env.update_velocity_curriculum(
+                x_vel,
+                ep_steps=steps,
+                required_steps=step_limit,
+                terminated_unhealthy=unhealthy_term,
+            )
         if is_warmup:
             self._warmup_returns.append(float(ep_return))
             if len(self._warmup_returns) > 20:
@@ -246,9 +256,13 @@ class BRLTrainingOrchestrator:
         summary = {
             "episode": episode_idx,
             "episode_return": ep_return,
+            "agent_episode_return": agent_ep_return,
             "steps": steps,
             "total_distance": float(brl_info.get("total_distance", 0.0)),
             "x_velocity": float(brl_info.get("x_velocity", 0.0)),
+            "target_vel": float(getattr(self.env, "target_vel", brl_info.get("target_vel", 0.0))),
+            "current_vel": float(getattr(self.env, "current_vel", brl_info.get("current_vel", 0.0))),
+            "reward_blend_alpha": float(brl_info.get("reward_blend_alpha", 0.0)),
             "win_indicator": win_ind,
             "dominance_score": dom_score,
             "ema_win_rate": ema_win,

@@ -323,7 +323,7 @@ def test_humanoid_wrapper_perception_integration() -> None:
         assert "perceived_tweak_vector" in info
         assert "perception_metrics" in info
         assert "limb_kinematics" in info
-        assert info["limb_kinematics"].shape == (5, 8)
+        assert info["limb_kinematics"].shape == (5, 11)
         assert "limb_kinematics_exactness" in info["perception_metrics"]
         assert "brl_metrics" in info
 

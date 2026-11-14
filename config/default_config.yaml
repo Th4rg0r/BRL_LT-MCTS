@@ -14,6 +14,7 @@ la_mcts:
   num_bins: 301
   gamma: 0.99
   td_steps: 5
+  target_tau: 0.01
   l_dyn: 3
   proj_dim: 512
   pred_dim: 256
@@ -46,7 +47,7 @@ la_mcts:
   history_len: 6
   latent_ema_decay: 0.4
   reanalyze_ratio: 0.25
-  train_every_steps: 25     # agent update every N env steps (0 = auto: max_steps // 2)
+  train_every_steps: 50     # agent update every N env steps (0 = auto: max_steps // 2)
   reanalyze_every: 4        # Reanalyze every N episodes (0 = off)
   reanalyze_states: 4       # states refreshed per Reanalyze pass
 
@@ -91,7 +92,11 @@ ant_morph:
   action_ema_alpha: 0.6
   action_smoothness_coef: 0.15
   action_smoothness_end_step: 500000
-  action_smoothness_log_shape: 10.0
+  benchmark_vel_ref: 5.17
+  vel_std_threshold: 0.15
+  vel_shift_factor: 3000.0
+  upside_down_time_limit: 2.0
+  upside_down_penalty: 50.0
 
 # Run protocol defaults for experiments/train_ant_brl.py (CLI flags override; 0 = automatic)
 run:

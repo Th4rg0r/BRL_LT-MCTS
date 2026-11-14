@@ -159,12 +159,15 @@ class MorphologicalLimbHead(nn.Module):
         self.log_std_bounds = log_std_bounds
         self.n_heads = n_heads
 
-        # 17D geometric query embedding:
+        # 26D geometric query embedding:
         # [x, y, z, yaw, cos(2*pi*yaw), sin(2*pi*yaw), pitch, sin(pi*pitch),
         #  diff_rx, cos(pi*diff_rx), sin(pi*diff_rx),
         #  diff_ry, cos(pi*diff_ry), sin(pi*diff_ry),
-        #  diff_rz, cos(pi*diff_rz), sin(pi*diff_rz)]
-        self.geom_dim = 17
+        #  diff_rz, cos(pi*diff_rz), sin(pi*diff_rz),
+        #  world_rx, cos(pi*world_rx), sin(pi*world_rx),
+        #  world_ry, cos(pi*world_ry), sin(pi*world_ry),
+        #  world_rz, cos(pi*world_rz), sin(pi*world_rz)]
+        self.geom_dim = 26
 
         # Project global latent z_t and per-limb kinematics into shared token dimension
         self.global_proj = nn.Sequential(
@@ -224,7 +227,7 @@ class MorphologicalLimbHead(nn.Module):
 
     @staticmethod
     def encode_kinematics(kinematics: torch.Tensor) -> torch.Tensor:
-        """Projects (..., 8) [x, y, z, yaw, pitch, diff_rx, diff_ry, diff_rz] (or legacy 5D) into (..., 17) harmonic kinematic representation."""
+        """Projects (..., 11) [x, y, z, yaw, pitch, diff_rx..rz, world_rx..rz] (or legacy 5D/8D) into (..., 26) harmonic kinematic representation."""
         x = kinematics[..., 0:1]
         y = kinematics[..., 1:2]
         z = kinematics[..., 2:3]
@@ -247,9 +250,22 @@ class MorphologicalLimbHead(nn.Module):
             diff_ry = torch.zeros_like(x)
             diff_rz = torch.zeros_like(x)
 
+        if kinematics.shape[-1] >= 11:
+            world_rx = kinematics[..., 8:9]
+            world_ry = kinematics[..., 9:10]
+            world_rz = kinematics[..., 10:11]
+        else:
+            world_rx = torch.zeros_like(x)
+            world_ry = torch.zeros_like(x)
+            world_rz = torch.zeros_like(x)
+
         pi_rx = math.pi * diff_rx
         pi_ry = math.pi * diff_ry
         pi_rz = math.pi * diff_rz
+
+        pi_wrx = math.pi * world_rx
+        pi_wry = math.pi * world_ry
+        pi_wrz = math.pi * world_rz
 
         return torch.cat(
             [
@@ -259,6 +275,9 @@ class MorphologicalLimbHead(nn.Module):
                 diff_rx, torch.cos(pi_rx), torch.sin(pi_rx),
                 diff_ry, torch.cos(pi_ry), torch.sin(pi_ry),
                 diff_rz, torch.cos(pi_rz), torch.sin(pi_rz),
+                world_rx, torch.cos(pi_wrx), torch.sin(pi_wrx),
+                world_ry, torch.cos(pi_wry), torch.sin(pi_wry),
+                world_rz, torch.cos(pi_wrz), torch.sin(pi_wrz),
             ],
             dim=-1,
         )
@@ -309,6 +328,7 @@ class MorphologicalLimbHead(nn.Module):
         all_limbs_kinematics: Optional[torch.Tensor] = None,
         return_weights: bool = False,
         angle_diff: Optional[Tuple[float, float, float] | Sequence[float] | torch.Tensor] = None,
+        world_euler: Optional[Tuple[float, float, float] | Sequence[float] | torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, ...]:
         """Computes per-peak (mu, log_std) [and weight when return_weights=True] for a single limb."""
         device = z_t.device
@@ -326,15 +346,26 @@ class MorphologicalLimbHead(nn.Module):
         else:
             pitch_t = pitch.to(device=device, dtype=dtype).view(-1)
 
+        n_rows = anchor_t.view(-1, 3).shape[0]
         if angle_diff is None:
-            diff_t = torch.zeros(anchor_t.view(-1, 3).shape[0], 3, dtype=dtype, device=device)
+            diff_t = torch.zeros(n_rows, 3, dtype=dtype, device=device)
         elif not torch.is_tensor(angle_diff):
             diff_t = torch.tensor(angle_diff, dtype=dtype, device=device).view(-1, 3)
         else:
             diff_t = angle_diff.to(device=device, dtype=dtype).view(-1, 3)
 
-        kin_8d = torch.cat([anchor_t.view(-1, 3), yaw_t.view(-1, 1), pitch_t.view(-1, 1), diff_t], dim=-1)
-        geom = self.encode_kinematics(kin_8d).unsqueeze(1)  # (B_or_1, 1, 17)
+        if world_euler is None:
+            world_t = torch.zeros(n_rows, 3, dtype=dtype, device=device)
+        elif not torch.is_tensor(world_euler):
+            world_t = torch.tensor(world_euler, dtype=dtype, device=device).view(-1, 3)
+        else:
+            world_t = world_euler.to(device=device, dtype=dtype).view(-1, 3)
+
+        kin_11d = torch.cat(
+            [anchor_t.view(-1, 3), yaw_t.view(-1, 1), pitch_t.view(-1, 1), diff_t, world_t],
+            dim=-1,
+        )
+        geom = self.encode_kinematics(kin_11d).unsqueeze(1)  # (B_or_1, 1, 26)
 
         if z_t.dim() == 1:
             z_t_in = z_t.unsqueeze(0)
@@ -482,10 +513,10 @@ class MultiPeakGMMActorHead(nn.Module):
             self.default_joint_counts = [2, 2, 2, 2]
             max_j = 2
             def_kin = torch.tensor([
-                [ 0.2,  0.2, 0.0, 0.625, 0.50],
-                [-0.2,  0.2, 0.0, 0.875, 0.50],
-                [-0.2, -0.2, 0.0, 0.125, 0.50],
-                [ 0.2, -0.2, 0.0, 0.375, 0.50],
+                [ 0.2,  0.2, 0.0, 0.625, 0.50, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [-0.2,  0.2, 0.0, 0.875, 0.50, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [-0.2, -0.2, 0.0, 0.125, 0.50, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [ 0.2, -0.2, 0.0, 0.375, 0.50, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             ], dtype=torch.float32)
         elif action_dim == 12:
             # Dog / Hexapod (4 legs * 3 joints, or 6 legs * 2 joints)
@@ -493,21 +524,21 @@ class MultiPeakGMMActorHead(nn.Module):
             self.default_joint_counts = [j_lim] * 4
             max_j = 3
             def_kin = torch.tensor([
-                [ 0.188, -0.08, 0.0, 0.064, 0.286],
-                [ 0.188,  0.08, 0.0, 0.938, 0.260],
-                [-0.188, -0.08, 0.0, 0.060, 0.256],
-                [-0.188,  0.08, 0.0, 0.946, 0.261],
+                [ 0.188, -0.08, 0.0, 0.064, 0.286, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [ 0.188,  0.08, 0.0, 0.938, 0.260, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [-0.188, -0.08, 0.0, 0.060, 0.256, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [-0.188,  0.08, 0.0, 0.946, 0.261, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             ], dtype=torch.float32)
         elif action_dim == 17:
             # Humanoid (waist: 3, r_leg: 4, l_leg: 4, r_arm: 3, l_arm: 3)
             self.default_joint_counts = [3, 4, 4, 3, 3]
             max_j = 4
             def_kin = torch.tensor([
-                [ 0.000,  0.000,  0.000, 0.500, 0.500],
-                [-0.010, -0.100, -0.465, 0.741, 0.008],
-                [-0.008,  0.100, -0.465, 0.364, 0.004],
-                [ 0.000, -0.170,  0.060, 0.376, 0.303],
-                [ 0.000,  0.170,  0.060, 0.623, 0.302],
+                [ 0.000,  0.000,  0.000, 0.500, 0.500, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [-0.010, -0.100, -0.465, 0.741, 0.008, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [-0.008,  0.100, -0.465, 0.364, 0.004, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [ 0.000, -0.170,  0.060, 0.376, 0.303, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [ 0.000,  0.170,  0.060, 0.623, 0.302, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             ], dtype=torch.float32)
         else:
             j_per = max(1, action_dim // 4)
@@ -515,10 +546,10 @@ class MultiPeakGMMActorHead(nn.Module):
             self.default_joint_counts = [j_per, j_per, j_per, rem]
             max_j = max(j_per, rem)
             def_kin = torch.tensor([
-                [ 0.2,  0.2, 0.0, 0.125, 0.50],
-                [-0.2,  0.2, 0.0, 0.875, 0.50],
-                [-0.2, -0.2, 0.0, 0.375, 0.50],
-                [ 0.2, -0.2, 0.0, 0.625, 0.50],
+                [ 0.2,  0.2, 0.0, 0.125, 0.50, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [-0.2,  0.2, 0.0, 0.875, 0.50, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [-0.2, -0.2, 0.0, 0.375, 0.50, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [ 0.2, -0.2, 0.0, 0.625, 0.50, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             ], dtype=torch.float32)
 
         self.register_buffer("default_limb_kinematics", def_kin)
@@ -705,29 +736,35 @@ class MultiPeakGMMActorHead(nn.Module):
         """Vectorized GMM log-density in pre-tanh space without Distribution object overhead.
 
         Args:
-            u: (B, K_act, N)
-            logits: (B, M)
-            mu: (B, M, N)
-            std: (B, M, N)
+            u: (..., K_act, N)
+            logits: (..., M)
+            mu: (..., M, N)
+            std: (..., M, N)
         Returns:
-            log_p_u: (B, K_act)
+            log_p_u: (..., K_act)
         """
-        # u_exp: (B, K_act, 1, N), mu_exp/std_exp: (B, 1, M, N)
+        # u_exp: (..., K_act, 1, N), mu_exp/std_exp: (..., 1, M, N)
         u_exp = u.unsqueeze(-2)
-        mu_exp = mu.unsqueeze(1)
-        std_exp = std.unsqueeze(1)
+        mu_exp = mu.unsqueeze(-3)
+        std_exp = std.unsqueeze(-3)
         log_comp_dim = -0.5 * (
             ((u_exp - mu_exp) / std_exp).pow(2)
             + 2.0 * torch.log(std_exp)
             + math.log(2.0 * math.pi)
         )
         if action_mask is not None:
-            mask_exp = action_mask.view(1, 1, 1, -1) if action_mask.dim() == 1 else action_mask.unsqueeze(1).unsqueeze(1)
+            if action_mask.dim() == 1:
+                mask_exp = action_mask.view(*([1] * (log_comp_dim.dim() - 1)), -1)
+            else:
+                extra_ones = [1] * (log_comp_dim.dim() - action_mask.dim())
+                mask_exp = action_mask.view(
+                    *action_mask.shape[:-1], *extra_ones, action_mask.shape[-1]
+                )
             log_comp = torch.sum(log_comp_dim * mask_exp, dim=-1)
         else:
-            log_comp = torch.sum(log_comp_dim, dim=-1)  # (B, K_act, M)
-        log_mix = F.log_softmax(logits, dim=-1).unsqueeze(1)  # (B, 1, M)
-        return torch.logsumexp(log_mix + log_comp, dim=-1)  # (B, K_act)
+            log_comp = torch.sum(log_comp_dim, dim=-1)  # (..., K_act, M)
+        log_mix = F.log_softmax(logits, dim=-1).unsqueeze(-2)  # (..., 1, M)
+        return torch.logsumexp(log_mix + log_comp, dim=-1)  # (..., K_act)
 
     def sample_actions(
         self,
@@ -746,9 +783,22 @@ class MultiPeakGMMActorHead(nn.Module):
             z_t = z_t.unsqueeze(0)
 
         bsz = z_t.shape[0]
-        logits_prop, mu_prop, std_prop = self.get_distribution_params(
-            z_t, temperature=temperature, limb_kinematics=limb_kinematics
+        logits_targ, mu_targ, std_targ = self.get_distribution_params(
+            z_t, temperature=1.0, limb_kinematics=limb_kinematics
         )
+        if temperature != 1.0 and temperature > 0.0:
+            logits_prop = logits_targ / temperature
+            std_prop = torch.clamp(
+                std_targ * math.sqrt(temperature),
+                min=math.exp(self.log_std_bounds[0]),
+                max=math.exp(self.log_std_bounds[1]) * 2.0,
+            )
+            mu_prop = mu_targ
+        else:
+            logits_prop = logits_targ
+            mu_prop = mu_targ
+            std_prop = std_targ
+
         probs = F.softmax(logits_prop, dim=-1)  # (B, M)
         # Draw K_act mixture indices per batch item: (B, K_act)
         comp_indices = torch.multinomial(probs, num_samples=k_act, replacement=True)
@@ -769,9 +819,6 @@ class MultiPeakGMMActorHead(nn.Module):
                 dtype=z_t.dtype,
             )
         else:
-            logits_targ, mu_targ, std_targ = self.get_distribution_params(
-                z_t, temperature=1.0, limb_kinematics=limb_kinematics
-            )
             log_pi_u = self._fast_log_prob_u(
                 u, logits_targ, mu_targ, std_targ, action_mask=action_mask
             )

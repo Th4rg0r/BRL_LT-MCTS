@@ -43,12 +43,18 @@ class SimSiamConsistencyHead(nn.Module):
     def predict(self, p: torch.Tensor) -> torch.Tensor:
         return self.predictor(p)
 
-    def forward(self, z_hat: torch.Tensor, z_true: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        z_hat: torch.Tensor,
+        z_true: torch.Tensor,
+        target_projector: Optional[nn.Module] = None,
+    ) -> torch.Tensor:
         """Computes hybrid SimSiam negative cosine similarity + stop-gradient MSE loss."""
         p_hat = self.projector(z_hat)
         q_hat = self.predictor(p_hat)
+        proj = target_projector if target_projector is not None else self.projector
         with torch.no_grad():
-            p_true = self.projector(z_true.detach()).detach()
+            p_true = proj(z_true.detach()).detach()
 
         cos_sim = F.cosine_similarity(q_hat, p_true, dim=-1, eps=1e-8)
         cos_loss = (1.0 - cos_sim).mean()
@@ -182,6 +188,8 @@ class ModelRepresentationTrainer(nn.Module):
         lambda_rep: float = 4.0,
         lambda_ent: float = 0.05,
         c_reg: float = 1e-4,
+        target_backbone: Optional[SelfAttentionBackbone] = None,
+        target_projector: Optional[nn.Module] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """Computes K-step unrolled total loss with SimSiam representation consistency.
 
@@ -196,34 +204,41 @@ class ModelRepresentationTrainer(nn.Module):
         bsz, k_plus_1, obs_dim = obs_seq.shape
         unroll_k = k_plus_1 - 1
 
-        # Compute ground-truth representations z_{t+k}^0 for all k = 0, ..., K
-        flat_obs = obs_seq.reshape(bsz * k_plus_1, obs_dim)
-        flat_ctx = None
-        if context is not None:
-            flat_ctx = (
-                context.unsqueeze(1)
-                .expand(bsz, k_plus_1, -1)
-                .reshape(bsz * k_plus_1, -1)
-            )
-        flat_hist = None
-        if history is not None:
-            if history.dim() == 3:
-                flat_hist = history.reshape(bsz * k_plus_1, -1)
-            elif history.dim() == 2:
-                flat_hist = (
-                    history.unsqueeze(1)
-                    .expand(bsz, k_plus_1, -1)
-                    .reshape(bsz * k_plus_1, -1)
-                )
-        z_true_all = backbone(flat_obs, context=flat_ctx, history=flat_hist).view(bsz, k_plus_1, -1)
-
+        # Encode step k = 0 with online backbone so gradients flow into representation
         hist_0 = history[:, 0, :] if (history is not None and history.dim() == 3) else history
+        z_hat = backbone(obs_seq[:, 0], context=context, history=hist_0)
         prev_cum_0 = backbone.compute_prev_cumulative(
             context, hist_0, alpha=self.latent_ema_decay
         )
-        z_hat = z_true_all[:, 0, :]
         cum_hat = combine_cumulative_rep(z_hat, prev_cum_0, alpha=self.latent_ema_decay)
         cum_0 = cum_hat
+
+        # Encode k = 1..K target representations under no_grad using target_backbone when provided
+        z_target_seq: Optional[torch.Tensor] = None
+        if unroll_k > 0:
+            targ_bb = target_backbone if target_backbone is not None else backbone
+            with torch.no_grad():
+                flat_obs_targ = obs_seq[:, 1:].reshape(bsz * unroll_k, obs_dim)
+                flat_ctx_targ = (
+                    context.unsqueeze(1)
+                    .expand(bsz, unroll_k, -1)
+                    .reshape(bsz * unroll_k, -1)
+                    if context is not None
+                    else None
+                )
+                flat_hist_targ = None
+                if history is not None:
+                    if history.dim() == 3:
+                        flat_hist_targ = history[:, 1:].reshape(bsz * unroll_k, -1)
+                    elif history.dim() == 2:
+                        flat_hist_targ = (
+                            history.unsqueeze(1)
+                            .expand(bsz, unroll_k, -1)
+                            .reshape(bsz * unroll_k, -1)
+                        )
+                z_target_seq = targ_bb(
+                    flat_obs_targ, context=flat_ctx_targ, history=flat_hist_targ
+                ).view(bsz, unroll_k, -1)
 
         # Step k = 0 value and policy loss (per-active-dimension pre-tanh log-prob avoids negative Jacobian offset)
         kin_0 = (
@@ -235,42 +250,68 @@ class ModelRepresentationTrainer(nn.Module):
             active_dims = (
                 action_mask.sum().clamp_min(1.0)
                 if action_mask.dim() == 1
-                else action_mask.sum(dim=-1).clamp_min(1.0)
+                else action_mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
             )
         else:
             active_dims = float(actor_head.action_dim)
-        loss_v = critic_head.compute_loss(cum_hat, target_value_seq[:, 0])
-        log_probs_0 = actor_head.log_prob_pre_tanh(
-            cum_hat, mcts_policy_samples[:, 0], action_mask=action_mask, limb_kinematics=kin_0
-        )  # (B, K_act)
-        loss_p = (-torch.sum(mcts_policy_weights[:, 0] * log_probs_0, dim=-1) / active_dims).mean()
-
         loss_r = torch.tensor(0.0, device=obs_seq.device, dtype=obs_seq.dtype)
         loss_rep = torch.tensor(0.0, device=obs_seq.device, dtype=obs_seq.dtype)
+        cum_list = [cum_hat]
 
         for k in range(1, unroll_k + 1):
             z_hat, r_hat = self.forward(z_hat, action_seq[:, k - 1])
             # MuZero / EfficientZero 0.5 gradient scaling across unroll steps
             z_hat = 0.5 * z_hat + 0.5 * z_hat.detach()
             cum_hat = combine_cumulative_rep(z_hat, cum_hat, alpha=self.latent_ema_decay)
+            cum_list.append(cum_hat)
 
-            z_target_k = z_true_all[:, k, :]
-            loss_rep = loss_rep + self.consistency_head(z_hat, z_target_k)
+            z_target_k = z_target_seq[:, k - 1, :]
+            loss_rep = loss_rep + self.consistency_head(
+                z_hat, z_target_k, target_projector=target_projector
+            )
             loss_r = loss_r + F.mse_loss(r_hat.squeeze(-1), reward_seq[:, k - 1])
-            loss_v = loss_v + critic_head.compute_loss(cum_hat, target_value_seq[:, k])
 
-            kin_k = (
-                limb_kinematics[:, k]
-                if (limb_kinematics is not None and limb_kinematics.dim() == 4)
-                else limb_kinematics
+        n_steps = unroll_k + 1
+        cum_seq = torch.stack(cum_list, dim=1)  # (B, K+1, D)
+        cum_flat = cum_seq.reshape(bsz * n_steps, -1)
+        target_v_flat = target_value_seq[:, :n_steps].reshape(bsz * n_steps)
+        loss_v = critic_head.compute_loss(cum_flat, target_v_flat) * float(n_steps)
+
+        if limb_kinematics is None:
+            kin_flat = None
+        elif limb_kinematics.dim() == 4:
+            kin_flat = limb_kinematics[:, :n_steps].reshape(
+                bsz * n_steps, limb_kinematics.size(2), limb_kinematics.size(3)
             )
-            log_probs_k = actor_head.log_prob_pre_tanh(
-                cum_hat, mcts_policy_samples[:, k], action_mask=action_mask, limb_kinematics=kin_k
+        elif limb_kinematics.dim() == 3:
+            kin_flat = (
+                limb_kinematics.unsqueeze(1)
+                .expand(bsz, n_steps, limb_kinematics.size(1), limb_kinematics.size(2))
+                .reshape(bsz * n_steps, limb_kinematics.size(1), limb_kinematics.size(2))
             )
-            loss_p = (
-                loss_p
-                + (-torch.sum(mcts_policy_weights[:, k] * log_probs_k, dim=-1) / active_dims).mean()
+        else:
+            kin_flat = limb_kinematics
+
+        if action_mask is None or action_mask.dim() == 1:
+            mask_flat = action_mask
+        else:
+            mask_flat = (
+                action_mask.unsqueeze(1)
+                .expand(bsz, n_steps, action_mask.size(-1))
+                .reshape(bsz * n_steps, action_mask.size(-1))
             )
+
+        samples_flat = mcts_policy_samples[:, :n_steps].reshape(
+            bsz * n_steps, mcts_policy_samples.size(2), mcts_policy_samples.size(3)
+        )
+        log_probs_flat = actor_head.log_prob_pre_tanh(
+            cum_flat, samples_flat, action_mask=mask_flat, limb_kinematics=kin_flat
+        )
+        log_probs_seq = log_probs_flat.view(bsz, n_steps, -1)
+        weights_seq = mcts_policy_weights[:, :n_steps]
+        loss_p = (
+            -torch.sum(weights_seq * log_probs_seq, dim=-1) / active_dims
+        ).mean(dim=0).sum()
 
         # Normalize over unroll horizon
         loss_v = loss_v / float(k_plus_1)
